@@ -29,6 +29,7 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
+
 # ── UNIVERSE ──────────────────────────────────────────────────────────────────
 UNIVERSE_TICKERS = [
     "NVDA","META","AMD","TSLA","AMZN","MSFT","PLTR","SOFI","MSTR","JPM",
@@ -858,6 +859,7 @@ def scheduler():
         time.sleep(60)
 
 # ── MAIN ───────────────────────────────────────────────────────────────────────
+init_db()
 if __name__ == "__main__":
     if not ANTHROPIC_KEY:
         log.warning("No ANTHROPIC_API_KEY found in .env — audit engine will not work")
