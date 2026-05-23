@@ -816,10 +816,15 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
     database.close()
     open_long_tickers = set(t["ticker"] for t in open_trades if t["direction"] == "long")
     open_short_tickers = set(t["ticker"] for t in open_trades if t["direction"] == "short")
+    all_open_tickers = open_long_tickers | open_short_tickers
 
     scored_stocks = []
     for ticker in universe:
         if ticker not in price_data:
+            continue
+        # Skip tickers with open positions — they're already committed
+        # and don't need new recommendations while the trade is active
+        if ticker in all_open_tickers:
             continue
         stock_data = price_data[ticker]
         rsi = rsi_values.get(ticker, 50.0)
@@ -1577,6 +1582,95 @@ def api_scan_history():
     ).fetchall()]
     database.close()
     return jsonify(rows)
+
+@app.route("/api/open-positions-dynamic")
+def api_open_positions_dynamic():
+    """
+    Return open positions with dynamic confidence and estimate scores.
+    
+    Dynamic confidence: recalculated using current indicators (RSI, volume, etc.)
+    Dynamic estimate: predicted move from BUY PRICE to forced close, using current data
+    
+    Both are anchored to the buy price and the 2:45 PM forced close deadline,
+    making them directly comparable to the frozen entry values.
+    """
+    database = get_database()
+    open_positions = [dict(t) for t in database.execute(
+        "SELECT * FROM virtual_trades WHERE outcome='open'"
+    ).fetchall()]
+    database.close()
+
+    if not open_positions:
+        return jsonify([])
+
+    tickers = list(set(position["ticker"] for position in open_positions))
+    weights = get_signal_weights()
+
+    # Fetch current data for dynamic scoring
+    current_price_data = fetch_price_data(tickers)
+    current_rsi = calculate_rsi_batch(tickers)
+    earnings_soon = check_upcoming_earnings(tickers)
+
+    enriched_positions = []
+    for position in open_positions:
+        ticker = position["ticker"]
+        enriched = dict(position)
+
+        if ticker in current_price_data:
+            stock_data = current_price_data[ticker]
+            rsi = current_rsi.get(ticker, 50.0)
+            has_earnings = ticker in earnings_soon
+
+            # Dynamic confidence: how confident is the brain RIGHT NOW
+            # that this trade will hit the original target by forced close
+            dynamic_confidence = calculate_confidence_score(
+                ticker, stock_data, rsi, earnings_soon, weights, position["direction"]
+            )
+
+            # Dynamic estimate: predicted move from BUY PRICE to forced close
+            # using current indicator data (not current price as anchor)
+            dynamic_estimate = estimate_overnight_move(stock_data, dynamic_confidence, has_earnings)
+
+            # Current P&L
+            buy_price = position["buy_price"] or 0
+            current_price = stock_data["price"]
+            pnl_pct = (current_price - buy_price) / max(buy_price, 0.01) * 100
+            if position["direction"] == "short":
+                pnl_pct = -pnl_pct
+
+            enriched["dynamic_confidence"] = dynamic_confidence
+            enriched["dynamic_estimate"] = dynamic_estimate
+            enriched["current_price"] = current_price
+            enriched["current_pnl_percent"] = round(pnl_pct, 2)
+            enriched["current_rsi"] = round(rsi, 1)
+            enriched["current_volume_ratio"] = round(stock_data.get("volume_ratio", 1), 2)
+
+            # Generate first-person sentiment using frozen target
+            frozen_target = position["expected_move"] or 10
+            if pnl_pct >= frozen_target:
+                enriched["sentiment"] = f"Target exceeded. +{pnl_pct:.1f}% vs {frozen_target:.1f}% target. Considering early exit."
+                enriched["sentiment_icon"] = "flash"
+            elif pnl_pct >= frozen_target * 0.7:
+                enriched["sentiment"] = f"Approaching target. +{pnl_pct:.1f}% of {frozen_target:.1f}% target. Watching closely."
+                enriched["sentiment_icon"] = "flash"
+            elif pnl_pct >= 2:
+                enriched["sentiment"] = f"Holding. On track. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
+                enriched["sentiment_icon"] = "check"
+            elif pnl_pct >= 0:
+                enriched["sentiment"] = f"Watching. Weak move. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
+                enriched["sentiment_icon"] = "warning"
+            else:
+                enriched["sentiment"] = f"Watching for reversal. {pnl_pct:.1f}%. Consider exiting."
+                enriched["sentiment_icon"] = "x"
+        else:
+            enriched["dynamic_confidence"] = position.get("confidence", 0)
+            enriched["dynamic_estimate"] = position.get("expected_move", 0)
+            enriched["sentiment"] = "Monitoring. Waiting for data."
+            enriched["sentiment_icon"] = "warning"
+
+        enriched_positions.append(enriched)
+
+    return jsonify(enriched_positions)
 
 @app.route("/api/seed-friday", methods=["POST"])
 def api_seed_friday():
