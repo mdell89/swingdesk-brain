@@ -1,5 +1,6 @@
 """
-brain.py — Overnight Swing Desk Backend
+brain.py — Overnight Swing Desk Backend v3
+Foundation: cached picks, ~1500 tickers, scan schedule, schema upgrades
 """
 
 import os, json, sqlite3, time, logging, threading
@@ -11,7 +12,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
 ANTHROPIC_KEY   = os.getenv("ANTHROPIC_KEY") or os.getenv("ANTHROPIC_API_KEY")
 AV_KEY          = os.getenv("ALPHA_VANTAGE_KEY")
 DB_PATH         = Path(__file__).parent / "portfolio_brain.db"
@@ -26,29 +26,125 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
-UNIVERSE = [
-    "NVDA","META","AMD","TSLA","AMZN","MSFT","PLTR","SOFI","MSTR","JPM",
-    "BAC","COIN","GOOGL","AAPL","NFLX","PYPL","HOOD","RBLX","SNAP","UBER",
-    "LYFT","RIVN","LCID","GME","AMC","SMCI","IONQ","XOM","RGTI","INTC",
-    "MU","QCOM","ARM","AVGO","TSM","ORCL","CRM","SNOW","DDOG","NET",
-    "CRWD","ZS","PANW","SHOP","ROKU","SPOT","ABNB","DASH","BB","NOK",
-    "TLRY","SPY","QQQ","IWM","ARKK","ARKG",
-]
-UNIVERSE = list(dict.fromkeys(UNIVERSE))
+# ── UNIVERSE — ~1500 tickers ──────────────────────────────────────────────────
+def fetch_sp500():
+    """Fetch S&P 500 tickers from Wikipedia"""
+    try:
+        import urllib.request
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        with urllib.request.urlopen(url, timeout=10) as r:
+            html = r.read().decode()
+        tickers = []
+        rows = html.split("<tbody>")[1].split("</tbody>")[0].split("<tr>")
+        for row in rows[1:]:
+            cells = row.split("<td>")
+            if len(cells) > 1:
+                ticker = cells[1].split("</td>")[0].split(">")[-1].strip()
+                if ticker and ticker.isalpha():
+                    tickers.append(ticker.replace(".", "-"))
+        log.info(f"Fetched {len(tickers)} S&P 500 tickers")
+        return tickers
+    except Exception as e:
+        log.warning(f"Could not fetch S&P 500 list: {e}")
+        return []
 
+def fetch_nasdaq100():
+    """Fetch Nasdaq 100 tickers"""
+    try:
+        import urllib.request
+        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+        with urllib.request.urlopen(url, timeout=10) as r:
+            html = r.read().decode()
+        tickers = []
+        rows = html.split("<tbody>")[1].split("</tbody>")[0].split("<tr>")
+        for row in rows[1:]:
+            cells = row.split("<td>")
+            if len(cells) > 1:
+                ticker = cells[1].split("</td>")[0].split(">")[-1].strip()
+                if ticker and len(ticker) <= 5:
+                    tickers.append(ticker.replace(".", "-"))
+        log.info(f"Fetched {len(tickers)} Nasdaq 100 tickers")
+        return tickers
+    except Exception as e:
+        log.warning(f"Could not fetch Nasdaq 100 list: {e}")
+        return []
+
+# High-volatility additions that may not be in indices
+EXTRA_TICKERS = [
+    "GME","AMC","BB","NOK","SOFI","MSTR","CVNA","HOOD","RBLX","SNAP",
+    "RIVN","LCID","IONQ","RGTI","COIN","PLTR","SMCI","SNDL","TLRY",
+    "OPEN","CLOV","WISH","SPCE","LAZR","MARA","RIOT","BITF","HUT",
+    "UPST","AFRM","DKNG","PENN","RSI","STEM","PLUG","FCEL","BE",
+    "CHPT","BLNK","QS","GOEV","FSR","NKLA","WKHS","RIDE",
+    "SPY","QQQ","IWM","DIA","ARKK","ARKG","ARKF","ARKW",
+    "XLF","XLK","XLE","XLV","XLI","XLP","XLY","XLB","XLRE","XLC","XLU",
+    "SOXL","TQQQ","SQQQ","UVXY","VXX",
+]
+
+def build_universe():
+    """Build full ticker universe, cache it in DB"""
+    conn = get_db()
+    cached = conn.execute("SELECT value FROM app_state WHERE key='universe'").fetchone()
+    cache_date = conn.execute("SELECT value FROM app_state WHERE key='universe_date'").fetchone()
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if cached and cache_date and cache_date["value"] == today:
+        tickers = json.loads(cached["value"])
+        conn.close()
+        log.info(f"Using cached universe: {len(tickers)} tickers")
+        return tickers
+
+    sp500 = fetch_sp500()
+    ndx100 = fetch_nasdaq100()
+    combined = list(dict.fromkeys(sp500 + ndx100 + EXTRA_TICKERS))
+
+    if len(combined) < 100:
+        if cached:
+            combined = json.loads(cached["value"])
+            log.warning(f"Fetch failed, using previous cache: {len(combined)} tickers")
+        else:
+            combined = EXTRA_TICKERS
+            log.warning(f"No cache, using extras only: {len(combined)} tickers")
+    else:
+        conn.execute("INSERT OR REPLACE INTO app_state VALUES ('universe', ?)", [json.dumps(combined)])
+        conn.execute("INSERT OR REPLACE INTO app_state VALUES ('universe_date', ?)", [today])
+        conn.commit()
+
+    conn.close()
+    log.info(f"Universe built: {len(combined)} tickers")
+    return combined
+
+# Sector mapping — we'll expand this dynamically but start with known sectors
 SECTORS = {
-    "NVDA":"Tech","META":"Tech","AMD":"Tech","TSLA":"Tech","AMZN":"Consumer",
+    "NVDA":"Tech","META":"Tech","AMD":"Tech","TSLA":"Auto","AMZN":"Consumer",
     "MSFT":"Tech","PLTR":"Tech","SOFI":"Finance","MSTR":"Finance","JPM":"Finance",
-    "BAC":"Finance","COIN":"Finance","GOOGL":"Tech","AAPL":"Tech","NFLX":"Consumer",
-    "PYPL":"Finance","HOOD":"Finance","RBLX":"Consumer","SNAP":"Tech","UBER":"Consumer",
-    "LYFT":"Consumer","RIVN":"Tech","LCID":"Tech","GME":"Consumer","AMC":"Consumer",
-    "SMCI":"Tech","IONQ":"Tech","XOM":"Energy","RGTI":"Tech","INTC":"Tech",
-    "MU":"Tech","QCOM":"Tech","ARM":"Tech","AVGO":"Tech","TSM":"Tech",
-    "ORCL":"Tech","CRM":"Tech","SNOW":"Tech","DDOG":"Tech","NET":"Tech",
-    "CRWD":"Tech","ZS":"Tech","PANW":"Tech","SHOP":"Consumer","ROKU":"Tech",
-    "SPOT":"Consumer","ABNB":"Consumer","DASH":"Consumer","BB":"Tech","NOK":"Tech",
-    "TLRY":"Consumer","SPY":"ETF","QQQ":"ETF","IWM":"ETF","ARKK":"ETF","ARKG":"ETF",
+    "BAC":"Finance","COIN":"Crypto","GOOGL":"Tech","GOOG":"Tech","AAPL":"Tech",
+    "NFLX":"Consumer","PYPL":"Finance","HOOD":"Finance","RBLX":"Consumer",
+    "SNAP":"Tech","UBER":"Consumer","LYFT":"Consumer","RIVN":"Auto","LCID":"Auto",
+    "GME":"Consumer","AMC":"Consumer","SMCI":"Tech","IONQ":"Tech","XOM":"Energy",
+    "RGTI":"Tech","INTC":"Tech","MU":"Tech","QCOM":"Tech","ARM":"Tech",
+    "AVGO":"Tech","TSM":"Tech","ORCL":"Tech","CRM":"Tech","SNOW":"Tech",
+    "DDOG":"Tech","NET":"Tech","CRWD":"Tech","ZS":"Tech","PANW":"Tech",
+    "SHOP":"Consumer","ROKU":"Tech","SPOT":"Consumer","ABNB":"Consumer",
+    "DASH":"Consumer","BB":"Tech","NOK":"Tech","TLRY":"Consumer",
+    "SPY":"ETF","QQQ":"ETF","IWM":"ETF","DIA":"ETF","ARKK":"ETF","ARKG":"ETF",
+    "XLF":"ETF","XLK":"ETF","XLE":"ETF","XLV":"ETF","MARA":"Crypto",
+    "RIOT":"Crypto","DKNG":"Consumer","PLUG":"Energy","FCEL":"Energy",
+    "SOXL":"ETF","TQQQ":"ETF","SQQQ":"ETF","UVXY":"ETF",
+    "LLY":"Healthcare","UNH":"Healthcare","JNJ":"Healthcare","PFE":"Healthcare",
+    "ABBV":"Healthcare","MRK":"Healthcare","TMO":"Healthcare","ABT":"Healthcare",
+    "GILD":"Healthcare","VRTX":"Healthcare","REGN":"Healthcare","BIIB":"Healthcare",
+    "CVX":"Energy","SLB":"Energy","HAL":"Energy","BKR":"Energy","EOG":"Energy",
+    "V":"Finance","MA":"Finance","GS":"Finance","BLK":"Finance","WFC":"Finance",
+    "BK":"Finance","AIG":"Finance","AFL":"Finance",
+    "PG":"Consumer","KO":"Consumer","PEP":"Consumer","WMT":"Consumer","COST":"Consumer",
+    "HD":"Consumer","LOW":"Consumer","TGT":"Consumer","MCD":"Consumer","SBUX":"Consumer",
+    "BA":"Industrial","CAT":"Industrial","DE":"Industrial","GE":"Industrial",
+    "HON":"Industrial","UNP":"Industrial","RTX":"Defense","NOC":"Defense","LHX":"Defense","GD":"Defense",
 }
+
+def get_sector(ticker):
+    return SECTORS.get(ticker, "Other")
 
 # ── DATABASE ──────────────────────────────────────────────────────────────────
 def get_db():
@@ -74,7 +170,9 @@ def init_db():
             sell_price REAL, invested REAL DEFAULT 10.0, current_value REAL,
             conf INTEGER, expected_move REAL, actual_move REAL, gross_pnl REAL,
             net_pnl REAL, fee REAL DEFAULT 0.02, outcome TEXT DEFAULT 'open',
-            sector TEXT, reasoning TEXT
+            sector TEXT, reasoning TEXT, weekend_hold INTEGER DEFAULT 0,
+            sell_reason TEXT, sell_sentiment_history TEXT,
+            intraday_high REAL, intraday_low REAL
         );
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT,
@@ -89,11 +187,34 @@ def init_db():
             total_resolved INTEGER, audit_reasoning TEXT
         );
         CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT);
-        CREATE TABLE IF NOT EXISTS perf_history (
-            date TEXT PRIMARY KEY, virtual_gross REAL, virtual_net REAL,
-            daily_pnl REAL, daily_trades INTEGER
+        CREATE TABLE IF NOT EXISTS scan_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_time TEXT, scan_type TEXT, ticker_count INTEGER,
+            picks_json TEXT, all_scores_json TEXT
+        );
+        CREATE TABLE IF NOT EXISTS position_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_id TEXT, check_time TEXT, price REAL,
+            pnl_pct REAL, sentiment TEXT
         );
     """)
+    # Add new columns to virtual_trades if they don't exist
+    try:
+        conn.execute("ALTER TABLE virtual_trades ADD COLUMN weekend_hold INTEGER DEFAULT 0")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE virtual_trades ADD COLUMN sell_reason TEXT")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE virtual_trades ADD COLUMN sell_sentiment_history TEXT")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE virtual_trades ADD COLUMN intraday_high REAL")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE virtual_trades ADD COLUMN intraday_low REAL")
+    except: pass
+
     existing = conn.execute("SELECT value FROM app_state WHERE key='weights'").fetchone()
     if not existing:
         conn.execute("INSERT INTO app_state VALUES ('weights', ?)", [json.dumps({
@@ -111,8 +232,7 @@ def get_weights():
         conn.close()
         return json.loads(row["value"]) if row else {
             "rsi_momentum":0.20,"volume_surge":0.22,"overnight_gap_prob":0.25,
-            "earnings_catalyst":0.18,"sector_rotation":0.15
-        }
+            "earnings_catalyst":0.18,"sector_rotation":0.15}
     except:
         return {"rsi_momentum":0.20,"volume_surge":0.22,"overnight_gap_prob":0.25,
                 "earnings_catalyst":0.18,"sector_rotation":0.15}
@@ -120,82 +240,109 @@ def get_weights():
 def save_weights(w):
     conn = get_db()
     conn.execute("INSERT OR REPLACE INTO app_state VALUES ('weights', ?)", [json.dumps(w)])
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
 # ── PRICE DATA ────────────────────────────────────────────────────────────────
-def fetch_prices(tickers):
+def fetch_prices(tickers, batch_size=100):
+    """Fetch prices in batches to handle large universes"""
     results = {}
     try:
         import yfinance as yf
-        log.info(f"Fetching {len(tickers)} tickers via yfinance...")
-        batch = yf.download(tickers, period="5d", interval="1d",
-                            group_by="ticker", auto_adjust=True, progress=False, threads=True)
-        for ticker in tickers:
+        log.info(f"Fetching {len(tickers)} tickers via yfinance in batches of {batch_size}...")
+        for i in range(0, len(tickers), batch_size):
+            batch_tickers = tickers[i:i+batch_size]
             try:
-                df = batch if len(tickers)==1 else (batch[ticker] if ticker in batch.columns.get_level_values(0) else None)
-                if df is not None and len(df) >= 2:
-                    results[ticker] = {
-                        "price":   float(df["Close"].iloc[-1]),
-                        "open":    float(df["Open"].iloc[-1]),
-                        "prev":    float(df["Close"].iloc[-2]),
-                        "high":    float(df["High"].iloc[-1]),
-                        "low":     float(df["Low"].iloc[-1]),
-                        "volume":  float(df["Volume"].iloc[-1]),
-                        "avg_vol": float(df["Volume"].mean()),
-                        "vol_ratio": float(df["Volume"].iloc[-1]) / max(float(df["Volume"].mean()), 1),
-                        "gap_pct": (float(df["Open"].iloc[-1]) - float(df["Close"].iloc[-2])) / max(float(df["Close"].iloc[-2]), 1) * 100,
-                        "source":  "yfinance"
-                    }
-            except: pass
+                batch = yf.download(batch_tickers, period="5d", interval="1d",
+                                    group_by="ticker", auto_adjust=True, progress=False, threads=True)
+                for ticker in batch_tickers:
+                    try:
+                        df = batch if len(batch_tickers)==1 else (batch[ticker] if ticker in batch.columns.get_level_values(0) else None)
+                        if df is not None and len(df) >= 2:
+                            price = float(df["Close"].iloc[-1])
+                            if price != price: continue  # NaN check
+                            prev = float(df["Close"].iloc[-2])
+                            opn = float(df["Open"].iloc[-1])
+                            vol = float(df["Volume"].iloc[-1])
+                            avg_v = float(df["Volume"].mean())
+                            results[ticker] = {
+                                "price": price, "open": opn, "prev": prev,
+                                "high": float(df["High"].iloc[-1]),
+                                "low": float(df["Low"].iloc[-1]),
+                                "volume": vol, "avg_vol": avg_v,
+                                "vol_ratio": vol/max(avg_v,1),
+                                "gap_pct": (opn-prev)/max(prev,0.01)*100,
+                                "source": "yfinance"
+                            }
+                    except: pass
+            except Exception as e:
+                log.warning(f"Batch {i}-{i+batch_size} error: {e}")
+            time.sleep(0.5)  # Brief pause between batches
         log.info(f"yfinance returned {len(results)}/{len(tickers)}")
     except Exception as e:
         log.error(f"yfinance error: {e}")
 
-    # Alpha Vantage fallback
+    # Alpha Vantage fallback for missing
     missing = [t for t in tickers if t not in results]
     if missing and AV_KEY:
         import urllib.request
-        for ticker in missing[:5]:
+        for ticker in missing[:10]:
             try:
                 url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker}&apikey={AV_KEY}"
                 with urllib.request.urlopen(url, timeout=5) as r:
                     q = json.loads(r.read()).get("Global Quote", {})
                 if q.get("05. price"):
-                    p, prev = float(q["05. price"]), float(q["08. previous close"])
+                    p = float(q["05. price"]); prev = float(q["08. previous close"])
                     results[ticker] = {"price":p,"open":p,"prev":prev,"high":p,"low":p,
-                                       "volume":0,"avg_vol":1,"vol_ratio":1.0,
-                                       "gap_pct":(p-prev)/max(prev,1)*100,"source":"alpha_vantage"}
+                        "volume":0,"avg_vol":1,"vol_ratio":1.0,
+                        "gap_pct":(p-prev)/max(prev,0.01)*100,"source":"alpha_vantage"}
                 time.sleep(0.5)
             except: pass
 
-    # Cache fallback
+    # Cache prices
     conn = get_db()
-    for ticker in [t for t in tickers if t not in results]:
-        cached = conn.execute("SELECT value FROM app_state WHERE key=?", [f"cache_{ticker}"]).fetchone()
-        if cached:
-            d = json.loads(cached["value"]); d["source"] = "cache"; results[ticker] = d
     for ticker, data in results.items():
-        conn.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)", [f"cache_{ticker}", json.dumps(data)])
+        conn.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
+                     [f"cache_{ticker}", json.dumps(data)])
     conn.commit(); conn.close()
     return results
 
-def calc_rsi(ticker, period=14):
+def calc_rsi_batch(tickers, period=14):
+    """Calculate RSI for multiple tickers efficiently"""
+    rsi_map = {}
     try:
         import yfinance as yf
-        df = yf.download(ticker, period="60d", interval="1d", auto_adjust=True, progress=False)
-        if len(df) < period+1: return 50.0
-        delta = df["Close"].diff()
-        rs = delta.clip(lower=0).rolling(period).mean() / (-delta.clip(upper=0)).rolling(period).mean()
-        val = float((100 - 100/(1+rs)).iloc[-1])
-        return val if val==val else 50.0
-    except: return 50.0
+        log.info(f"Calculating RSI for {len(tickers)} tickers...")
+        for i in range(0, len(tickers), 50):
+            batch = tickers[i:i+50]
+            try:
+                data = yf.download(batch, period="60d", interval="1d",
+                                   auto_adjust=True, progress=False, threads=True)
+                for ticker in batch:
+                    try:
+                        df = data if len(batch)==1 else (data[ticker] if ticker in data.columns.get_level_values(0) else None)
+                        if df is not None and len(df) >= period+1:
+                            delta = df["Close"].diff()
+                            rs = delta.clip(lower=0).rolling(period).mean() / (-delta.clip(upper=0)).rolling(period).mean()
+                            val = float((100 - 100/(1+rs)).iloc[-1])
+                            rsi_map[ticker] = val if val==val else 50.0
+                        else:
+                            rsi_map[ticker] = 50.0
+                    except:
+                        rsi_map[ticker] = 50.0
+            except: pass
+            time.sleep(0.3)
+    except: pass
+    # Fill missing with 50
+    for t in tickers:
+        if t not in rsi_map: rsi_map[t] = 50.0
+    log.info(f"RSI calculated for {len(rsi_map)} tickers")
+    return rsi_map
 
 def get_earnings_soon(tickers):
     soon = set()
     try:
         import yfinance as yf
-        for t in tickers[:20]:
+        for t in tickers[:30]:
             try:
                 cal = yf.Ticker(t).calendar
                 if cal is not None and not cal.empty:
@@ -208,13 +355,18 @@ def get_earnings_soon(tickers):
 # ── SCORING ───────────────────────────────────────────────────────────────────
 def score(ticker, pd, rsi, earn_soon, w, direction="long"):
     rsi = rsi if rsi==rsi else 50.0
-    rsi_s = (1.0 if 40<=rsi<=65 else (0.9 if rsi<40 else 0.5)) if direction=="long" else (1.0 if rsi>65 else (0.7 if rsi>55 else 0.4))
+    if direction=="long":
+        rsi_s = 1.0 if 40<=rsi<=65 else (0.9 if rsi<40 else 0.5)
+    else:
+        rsi_s = 1.0 if rsi>65 else (0.7 if rsi>55 else 0.4)
     vr = pd.get("vol_ratio",1.0); vr = vr if vr==vr else 1.0
     gp = pd.get("gap_pct",0); gp = gp if gp==gp else 0.0
     gap_s = min(abs(gp)/10.0, 1.0)
     if direction=="short": gap_s = gap_s if gp<0 else gap_s*0.5
-    sec_s = 0.85 if SECTORS.get(ticker,"Other") in ["Tech","Finance"] else 0.7
-    raw = rsi_s*w["rsi_momentum"] + min(vr/3.5,1.0)*w["volume_surge"] + gap_s*w["overnight_gap_prob"] + (0.9 if ticker in earn_soon else 0.6)*w["earnings_catalyst"] + sec_s*w["sector_rotation"]
+    sec_s = 0.85 if get_sector(ticker) in ["Tech","Finance","Crypto"] else 0.7
+    raw = (rsi_s*w["rsi_momentum"] + min(vr/3.5,1.0)*w["volume_surge"] +
+           gap_s*w["overnight_gap_prob"] + (0.9 if ticker in earn_soon else 0.6)*w["earnings_catalyst"] +
+           sec_s*w["sector_rotation"])
     return min(int(raw*115), 96)
 
 def est_move(pd, conf, earn):
@@ -223,10 +375,10 @@ def est_move(pd, conf, earn):
     return round(min(4+(conf-60)*0.25+(vr-1)*1.5+(3 if earn else 0)+min(abs(gp)*0.3,3), 25), 1)
 
 def sell_time(conf):
-    if conf>=85: return "8:45–9:30 AM"
-    if conf>=75: return "9:30–10:30 AM"
-    if conf>=65: return "10:30–12 PM"
-    return "12–1:30 PM"
+    if conf>=85: return "8:45-9:30 AM"
+    if conf>=75: return "9:30-10:30 AM"
+    if conf>=65: return "10:30-12 PM"
+    return "12-1:30 PM"
 
 def reasoning(ticker, pd, rsi, earn, direction):
     p = []
@@ -238,59 +390,106 @@ def reasoning(ticker, pd, rsi, earn, direction):
     if vr>1.8: p.append(f"{vr:.1f}x vol")
     gp = pd.get("gap_pct",0)
     if abs(gp)>2: p.append(f"{gp:+.1f}% gap")
-    if earn: p.append("earnings soon")
-    return " · ".join(p[:3])
+    if earn: p.append("earnings catalyst")
+    return " . ".join(p[:3])
 
-# ── PICKS ─────────────────────────────────────────────────────────────────────
-def generate_picks(weights=None):
+# ── GENERATE PICKS (with caching) ─────────────────────────────────────────────
+def generate_picks(weights=None, scan_type="scheduled"):
     if weights is None: weights = get_weights()
-    log.info("Generating picks...")
-    prices = fetch_prices(UNIVERSE)
-    earn_soon = get_earnings_soon(UNIVERSE)
+    universe = build_universe()
+    log.info(f"Generating picks from {len(universe)} tickers (scan: {scan_type})...")
+
+    prices = fetch_prices(universe)
+    rsi_map = calc_rsi_batch(list(prices.keys()))
+    earn_soon = get_earnings_soon(list(prices.keys()))
+
     scored = []
-    for ticker in UNIVERSE:
+    for ticker in universe:
         if ticker not in prices: continue
         pd = prices[ticker]
-        rsi = calc_rsi(ticker)
+        rsi = rsi_map.get(ticker, 50.0)
         lc = score(ticker, pd, rsi, earn_soon, weights, "long")
         sc = score(ticker, pd, rsi, earn_soon, weights, "short")
         lm = est_move(pd, lc, ticker in earn_soon)
         sm = est_move(pd, sc, ticker in earn_soon)
         scored.append({
-            "ticker":ticker,"name":ticker,"sector":SECTORS.get(ticker,"Other"),
-            "price":pd["price"],"open_price":pd.get("open",pd["price"]),
-            "prev_close":pd.get("prev",pd["price"]),"rsi":round(rsi,1),
+            "ticker":ticker, "name":ticker, "sector":get_sector(ticker),
+            "price":pd["price"], "open_price":pd.get("open",pd["price"]),
+            "prev_close":pd.get("prev",pd["price"]), "rsi":round(rsi,1),
             "vol_ratio":round(pd.get("vol_ratio",1),2),
             "overnight_gap_pct":round(pd.get("gap_pct",0),2),
             "earnings_soon":ticker in earn_soon,
-            "long_conf":lc,"long_move":lm,
+            "long_conf":lc, "long_move":lm,
             "long_reasoning":reasoning(ticker,pd,rsi,ticker in earn_soon,"long"),
-            "short_conf":sc,"short_move":sm,
+            "short_conf":sc, "short_move":sm,
             "short_reasoning":reasoning(ticker,pd,rsi,ticker in earn_soon,"short"),
-            "sell_time":sell_time(lc),"data_source":pd.get("source","unknown"),
+            "sell_time":sell_time(lc), "data_source":pd.get("source","unknown"),
         })
-    longs  = sorted([s for s in scored if s["long_move"] >=MIN_MOVE], key=lambda x:x["long_conf"], reverse=True)
+
+    longs  = sorted([s for s in scored if s["long_move"]>=MIN_MOVE], key=lambda x:x["long_conf"], reverse=True)
     shorts = sorted([s for s in scored if s["short_move"]>=MIN_MOVE], key=lambda x:x["short_conf"], reverse=True)
-    today  = datetime.now().strftime("%Y-%m-%d")
-    conn   = get_db()
-    for i, pick in enumerate(longs[:MAX_PICKS]+shorts[:10]):
-        dir_  = "long" if i<MAX_PICKS else "short"
-        conf  = pick["long_conf"]  if dir_=="long" else pick["short_conf"]
-        move  = pick["long_move"]  if dir_=="long" else pick["short_move"]
-        rsn   = pick["long_reasoning"] if dir_=="long" else pick["short_reasoning"]
-        pid   = f"{pick['ticker']}_{today}_{dir_}"
+
+    result = {
+        "longs": longs[:MAX_PICKS],
+        "shorts": shorts[:10],
+        "all_longs": len(longs),
+        "all_shorts": len(shorts),
+        "total_scanned": len(scored),
+        "generated_at": datetime.now().isoformat(),
+        "scan_type": scan_type,
+    }
+
+    # Cache the picks
+    conn = get_db()
+    conn.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_picks', ?)", [json.dumps(result)])
+    conn.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_picks_time', ?)", [datetime.now().isoformat()])
+
+    # Save to scan_cache for historical analysis
+    conn.execute("INSERT INTO scan_cache (scan_time,scan_type,ticker_count,picks_json) VALUES (?,?,?,?)",
+                 [datetime.now().isoformat(), scan_type, len(scored), json.dumps(result)])
+
+    # Log predictions & virtual trades
+    today = datetime.now().strftime("%Y-%m-%d")
+    is_friday = datetime.now().weekday() == 4
+
+    for i, pick in enumerate(longs[:MAX_PICKS] + shorts[:10]):
+        dir_ = "long" if i < MAX_PICKS else "short"
+        conf = pick["long_conf"] if dir_=="long" else pick["short_conf"]
+        move = pick["long_move"] if dir_=="long" else pick["short_move"]
+        rsn  = pick["long_reasoning"] if dir_=="long" else pick["short_reasoning"]
+        pid  = f"{pick['ticker']}_{today}_{dir_}"
         if not conn.execute("SELECT id FROM predictions WHERE id=?", [pid]).fetchone():
             conn.execute("INSERT INTO predictions (id,ticker,name,date,direction,conf,expected_move,entry_price,sell_time,reasoning,sector,rsi,vol_ratio,weights_snapshot,logged_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                [pid,pick["ticker"],pick["name"],today,dir_,conf,move,pick["price"],pick["sell_time"],rsn,pick["sector"],pick["rsi"],pick["vol_ratio"],json.dumps(weights),datetime.now().isoformat()])
-        buy_p = pick.get("open_price",pick["price"])
-        vtid  = f"{pick['ticker']}_{today}_{dir_}_vt"
+                [pid,pick["ticker"],pick["name"],today,dir_,conf,move,pick["price"],
+                 pick["sell_time"],rsn,pick["sector"],pick["rsi"],pick["vol_ratio"],
+                 json.dumps(weights),datetime.now().isoformat()])
+        buy_p = pick.get("open_price", pick["price"])
+        vtid = f"{pick['ticker']}_{today}_{dir_}_vt"
         if not conn.execute("SELECT id FROM virtual_trades WHERE id=?", [vtid]).fetchone():
-            conn.execute("INSERT INTO virtual_trades (id,ticker,direction,buy_date,buy_time,buy_price,invested,conf,expected_move,outcome,sector,reasoning) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                [vtid,pick["ticker"],dir_,today,"09:45:00",buy_p,INVEST_PER_PICK,conf,move,"open",pick["sector"],rsn])
+            conn.execute("INSERT INTO virtual_trades (id,ticker,direction,buy_date,buy_time,buy_price,invested,conf,expected_move,outcome,sector,reasoning,weekend_hold) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [vtid,pick["ticker"],dir_,today,"09:30:00",buy_p,
+                 INVEST_PER_PICK,conf,move,"open",pick["sector"],rsn,
+                 1 if is_friday else 0])
         else:
-            conn.execute("UPDATE virtual_trades SET buy_price=?,buy_time='09:45:00' WHERE id=? AND buy_time!='09:45:00'", [buy_p,vtid])
+            conn.execute("UPDATE virtual_trades SET buy_price=?,buy_time='09:30:00' WHERE id=? AND buy_time!='09:30:00'",
+                         [buy_p, vtid])
+
     conn.commit(); conn.close()
-    return {"longs":longs[:MAX_PICKS],"shorts":shorts[:10],"generated_at":datetime.now().isoformat()}
+    log.info(f"Picks generated: {len(longs)} longs, {len(shorts)} shorts from {len(scored)} scanned")
+    return result
+
+def get_cached_picks():
+    """Return cached picks instantly — no yfinance calls"""
+    conn = get_db()
+    cached = conn.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
+    cache_time = conn.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
+    conn.close()
+    if cached:
+        result = json.loads(cached["value"])
+        result["cached"] = True
+        result["cache_time"] = cache_time["value"] if cache_time else None
+        return result
+    return None
 
 # ── SCORE YESTERDAY ───────────────────────────────────────────────────────────
 def score_yesterday():
@@ -300,18 +499,24 @@ def score_yesterday():
     conn.close()
     if not trades: log.info("No open trades to score"); return
     tickers = list(set(t["ticker"] for t in trades))
-    prices  = fetch_prices(tickers)
+    prices = fetch_prices(tickers)
     conn = get_db(); n=0
     for t in trades:
         if t["ticker"] not in prices: continue
         cur = prices[t["ticker"]]["price"]
         pct = (cur-t["buy_price"])/t["buy_price"]*100
         pnl = t["invested"]*(pct/100)
-        outcome = ("hit" if (pct>=MIN_MOVE if t["direction"]=="long" else pct<=-MIN_MOVE) else ("partial" if (pct>0 if t["direction"]=="long" else pct<0) else "miss"))
-        conn.execute("UPDATE virtual_trades SET sell_date=?,sell_price=?,current_value=?,actual_move=?,gross_pnl=?,net_pnl=?,outcome=?,sell_time=? WHERE id=?",
-            [datetime.now().strftime("%Y-%m-%d"),cur,t["invested"]+pnl,round(pct,2),round(pnl,4),round(pnl-FEE_PER_TRADE,4),outcome,datetime.now().strftime("%H:%M:%S"),t["id"]])
+        if t["direction"]=="long":
+            outcome = "hit" if pct>=MIN_MOVE else ("partial" if pct>0 else "miss")
+        else:
+            outcome = "hit" if pct<=-MIN_MOVE else ("partial" if pct<0 else "miss")
+        conn.execute("UPDATE virtual_trades SET sell_date=?,sell_price=?,current_value=?,actual_move=?,gross_pnl=?,net_pnl=?,outcome=?,sell_time=?,sell_reason=? WHERE id=?",
+            [datetime.now().strftime("%Y-%m-%d"),cur,t["invested"]+pnl,round(pct,2),
+             round(pnl,4),round(pnl-FEE_PER_TRADE,4),outcome,
+             datetime.now().strftime("%H:%M:%S"),"end_of_day",t["id"]])
         conn.execute("UPDATE predictions SET outcome=?,actual_move=?,resolved_at=? WHERE id=?",
-            [outcome,round(pct,2),datetime.now().isoformat(),f"{t['ticker']}_{yesterday}_{t['direction']}"])
+            [outcome,round(pct,2),datetime.now().isoformat(),
+             f"{t['ticker']}_{yesterday}_{t['direction']}"])
         n+=1
     conn.commit(); conn.close(); log.info(f"Scored {n} trades")
 
@@ -322,28 +527,22 @@ def run_audit():
     preds = [dict(p) for p in conn.execute("SELECT * FROM predictions WHERE outcome!='pending' ORDER BY date DESC LIMIT 200").fetchall()]
     total = conn.execute("SELECT COUNT(*) as n FROM predictions").fetchone()["n"]
     conn.close()
-    hits    = [p for p in preds if p["outcome"]=="hit"]
-    misses  = [p for p in preds if p["outcome"]=="miss"]
-    wr      = len(hits)/len(preds) if preds else None
-    w       = get_weights()
-    sec_acc = {}
-    for p in preds:
-        s = p.get("sector","Other")
-        if s not in sec_acc: sec_acc[s]={"hits":0,"total":0}
-        sec_acc[s]["total"]+=1
-        if p["outcome"]=="hit": sec_acc[s]["hits"]+=1
+    hits   = [p for p in preds if p["outcome"]=="hit"]
+    misses = [p for p in preds if p["outcome"]=="miss"]
+    wr     = len(hits)/len(preds) if preds else None
+    w      = get_weights()
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
         resp = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=800, messages=[{"role":"user","content":
-            f"Self-audit engine for overnight swing trading app. Analyze and return updated weights.\nWEIGHTS:{json.dumps(w)}\nDATA:{json.dumps({'total':total,'resolved':len(preds),'hits':len(hits),'misses':len(misses),'win_rate':wr,'sector_acc':sec_acc,'hcmr':len([p for p in preds if p['conf']>=80 and p['outcome']=='miss'])/max(len([p for p in preds if p['conf']>=80]),1)})}\nRules:sum=1.0,each 0.05-0.45. Respond ONLY JSON:{{'weights':{{...}},'reasoning':['...'],'summary':'...','confidence':'low|medium|high'}}"
+            f"Self-audit for overnight swing trading. Analyze and return updated weights.\nWEIGHTS:{json.dumps(w)}\nDATA:{json.dumps({'total':total,'resolved':len(preds),'hits':len(hits),'misses':len(misses),'win_rate':wr})}\nRules:sum=1.0,each 0.05-0.45. ONLY JSON:{{'weights':{{...}},'reasoning':['...'],'summary':'...','confidence':'low|medium|high'}}"
         }])
         result = json.loads(resp.content[0].text.replace("```json","").replace("```","").strip())
         nw = result["weights"]
-        s  = sum(nw.values())
+        s = sum(nw.values())
         if 0.85<s<1.15:
             nw = {k:round(v/s,4) for k,v in nw.items()}
-            save_weights(nw); log.info(f"Weights: {nw}")
+            save_weights(nw)
         else: nw = w
         conn = get_db()
         conn.execute("INSERT INTO audit_log (timestamp,weights_before,weights_after,reasoning,summary,total_predictions,resolved,hits,misses,win_rate) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -357,9 +556,34 @@ def run_audit():
 # ── SCHEDULER ─────────────────────────────────────────────────────────────────
 def scheduler():
     import schedule
-    schedule.every().day.at("08:30").do(lambda: (score_yesterday(), generate_picks()))
-    schedule.every().day.at("09:00").do(run_audit)
-    while True: schedule.run_pending(); time.sleep(60)
+    w = get_weights
+
+    # Post-market scans (CST = UTC-5 during CDT, but Railway runs UTC)
+    # We'll use UTC times: CST+5 = UTC
+    # 4 PM CST = 21:00 UTC, 5 PM = 22:00, 6 PM = 23:00
+    schedule.every().day.at("21:00").do(lambda: generate_picks(scan_type="post_market_1"))
+    schedule.every().day.at("22:00").do(lambda: generate_picks(scan_type="post_market_2"))
+    schedule.every().day.at("23:00").do(lambda: generate_picks(scan_type="post_market_3"))
+
+    # Pre-market scans
+    # 4 AM CST = 09:00 UTC, 5 AM = 10:00, ... 9 AM = 14:00
+    schedule.every().day.at("09:00").do(lambda: generate_picks(scan_type="pre_market_1"))
+    schedule.every().day.at("10:00").do(lambda: generate_picks(scan_type="pre_market_2"))
+    schedule.every().day.at("11:00").do(lambda: generate_picks(scan_type="pre_market_3"))
+    schedule.every().day.at("12:00").do(lambda: generate_picks(scan_type="pre_market_4"))
+    schedule.every().day.at("13:00").do(lambda: generate_picks(scan_type="pre_market_5"))
+    schedule.every().day.at("14:00").do(lambda: generate_picks(scan_type="final_scan"))
+
+    # Score yesterday's trades at 8:30 AM CST = 13:30 UTC
+    schedule.every().day.at("13:30").do(score_yesterday)
+
+    # Audit at 8:45 AM CST = 13:45 UTC (before final scan)
+    schedule.every().day.at("13:45").do(run_audit)
+
+    log.info("Scheduler started with full scan schedule")
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
 
 # ── ROUTES ────────────────────────────────────────────────────────────────────
 @app.route("/api/health")
@@ -368,8 +592,24 @@ def health():
 
 @app.route("/api/picks")
 def api_picks():
-    try: return jsonify(generate_picks())
-    except Exception as e: return jsonify({"error":str(e)}), 500
+    """Serve cached picks instantly. Use ?fresh=true to force new scan."""
+    fresh = request.args.get("fresh","false").lower() == "true"
+    if not fresh:
+        cached = get_cached_picks()
+        if cached:
+            return jsonify(cached)
+    try:
+        return jsonify(generate_picks(scan_type="manual"))
+    except Exception as e:
+        return jsonify({"error":str(e)}), 500
+
+@app.route("/api/picks/fresh")
+def api_picks_fresh():
+    """Force a fresh scan — use sparingly"""
+    try:
+        return jsonify(generate_picks(scan_type="manual_fresh"))
+    except Exception as e:
+        return jsonify({"error":str(e)}), 500
 
 @app.route("/api/weights")
 def api_weights():
@@ -391,14 +631,12 @@ def api_outcome(pid):
 
 @app.route("/api/virtual-trades")
 def api_vt():
+    direction = request.args.get("direction")  # optional filter: "long" or "short"
     conn = get_db()
-    rows = [dict(r) for r in conn.execute("SELECT * FROM virtual_trades ORDER BY buy_date DESC LIMIT 500").fetchall()]
-    conn.close(); return jsonify(rows)
-
-@app.route("/api/portfolio")
-def api_portfolio():
-    conn = get_db()
-    rows = [dict(r) for r in conn.execute("SELECT * FROM portfolio").fetchall()] if conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='portfolio'").fetchone() else []
+    if direction:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM virtual_trades WHERE direction=? ORDER BY buy_date DESC LIMIT 500", [direction]).fetchall()]
+    else:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM virtual_trades ORDER BY buy_date DESC LIMIT 500").fetchall()]
     conn.close(); return jsonify(rows)
 
 @app.route("/api/audit", methods=["POST"])
@@ -436,15 +674,69 @@ def api_stats():
     vt  = conn.execute("SELECT COUNT(*) as n FROM virtual_trades").fetchone()["n"]
     vo  = conn.execute("SELECT COUNT(*) as n FROM virtual_trades WHERE outcome='open'").fetchone()["n"]
     la  = conn.execute("SELECT value FROM app_state WHERE key='last_audit'").fetchone()
+    ct  = conn.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
     conn.close()
-    return jsonify({"total_predictions":tp,"resolved":res,"hits":h,"misses":m,
-        "win_rate":round(h/res*100,1) if res else None,"virtual_trades":vt,
-        "virtual_open":vo,"last_audit":la["value"] if la else None,"weights":get_weights()})
+    return jsonify({
+        "total_predictions":tp,"resolved":res,"hits":h,"misses":m,
+        "win_rate":round(h/res*100,1) if res else None,
+        "virtual_trades":vt,"virtual_open":vo,
+        "last_audit":la["value"] if la else None,
+        "last_scan":ct["value"] if ct else None,
+        "weights":get_weights()
+    })
 
-# ── INIT & START ──────────────────────────────────────────────────────────────
+@app.route("/api/scan-history")
+def api_scan_history():
+    conn = get_db()
+    rows = [dict(r) for r in conn.execute("SELECT id,scan_time,scan_type,ticker_count FROM scan_cache ORDER BY scan_time DESC LIMIT 50").fetchall()]
+    conn.close(); return jsonify(rows)
+
+@app.route("/api/intraday-pnl")
+def api_intraday_pnl():
+    """Fetch retroactive 5-min intraday data for open positions to build smooth performance chart"""
+    conn = get_db()
+    open_trades = conn.execute("SELECT * FROM virtual_trades WHERE outcome='open'").fetchall()
+    conn.close()
+    if not open_trades:
+        return jsonify({"points":[],"message":"No open positions"})
+    try:
+        import yfinance as yf
+        total_invested = sum(t["invested"] for t in open_trades)
+        # Fetch 5-min data for all open position tickers
+        tickers = list(set(t["ticker"] for t in open_trades))
+        data = yf.download(tickers, period="2d", interval="5m",
+                           group_by="ticker", auto_adjust=True, progress=False)
+        points = []
+        if data is not None and len(data) > 0:
+            for idx in range(len(data)):
+                ts = data.index[idx]
+                total_pnl = 0
+                for t in open_trades:
+                    try:
+                        if len(tickers) == 1:
+                            price = float(data["Close"].iloc[idx])
+                        else:
+                            price = float(data[t["ticker"]]["Close"].iloc[idx])
+                        if price != price: continue
+                        pct = (price - t["buy_price"]) / t["buy_price"] * 100
+                        total_pnl += t["invested"] * (pct / 100)
+                    except: pass
+                points.append({
+                    "ts": int(ts.timestamp() * 1000),
+                    "time": ts.strftime("%H:%M"),
+                    "date": ts.strftime("%Y-%m-%d"),
+                    "virtual": round(1000 + total_pnl, 2),
+                    "pnl": round(total_pnl, 4)
+                })
+        return jsonify({"points": points, "positions": len(open_trades)})
+    except Exception as e:
+        log.error(f"Intraday PnL error: {e}")
+        return jsonify({"points":[],"error":str(e)})
+
+# ── INIT ──────────────────────────────────────────────────────────────────────
 init_db()
 threading.Thread(target=scheduler, daemon=True).start()
-log.info("Brain initialized")
+log.info("Brain v3 initialized — expanded universe, scan schedule, caching")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
