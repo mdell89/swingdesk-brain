@@ -415,28 +415,38 @@ def save_signal_weights(weights):
     database.close()
 
 # ── TRADE QUEUE — Self-Regulating Position Sizing ─────────────────────────────
+def get_dynamic_fallback_amount():
+    """
+    Calculate the fallback investment amount when the queue is empty.
+    Uses 1% of total portfolio value. Floor is $1.00 (Cash App minimum).
+    Falls back to DEFAULT_INVESTMENT until 10+ closed trades exist.
+    """
+    MINIMUM_FLOOR = 1.00
+    HISTORY_THRESHOLD = 10
+    database = get_database()
+    closed_trades = database.execute(
+        "SELECT COUNT(*) as count, COALESCE(SUM(net_pnl), 0) as total_pnl FROM virtual_trades WHERE outcome != 'open'"
+    ).fetchone()
+    database.close()
+    if closed_trades["count"] < HISTORY_THRESHOLD:
+        return DEFAULT_INVESTMENT
+    portfolio_value = 1000.0 + float(closed_trades["total_pnl"] or 0)
+    return max(round(portfolio_value * 0.01, 2), MINIMUM_FLOOR)
+
 def get_next_queue_amount():
     """
     Retrieve the next available amount from the trade queue (FIFO).
-    
-    Returns the oldest unconsumed amount, or DEFAULT_INVESTMENT ($10.00)
-    if the queue is empty. This is the core of the self-regulating
-    position sizing system — each trade's investment amount is
-    determined by the outcome of a previous trade.
-    
-    The elegance: no rules, no floors, no ceilings. The queue just
-    naturally tracks the brain's recent performance through the dollar
-    amounts flowing through it.
+    Returns the oldest unconsumed amount, or a dynamic fallback (1% of
+    portfolio value) if the queue is empty.
     """
     database = get_database()
     next_amount = database.execute(
         "SELECT id, amount FROM trade_queue WHERE consumed = 0 ORDER BY id ASC LIMIT 1"
     ).fetchone()
     database.close()
-
     if next_amount:
         return next_amount["id"], next_amount["amount"]
-    return None, DEFAULT_INVESTMENT
+    return None, get_dynamic_fallback_amount()
 
 def consume_queue_amount(queue_id, consuming_trade_id):
     """
@@ -529,6 +539,8 @@ def fetch_price_data(tickers):
                                 "gap_percent": (open_price - previous_close) / max(previous_close, 0.01) * 100,
                                 "day_change_percent": (close_price - previous_close) / max(previous_close, 0.01) * 100,
                                 "source": "yfinance",
+                                "52w_high": None,
+                                "broke_52w_high_days_ago": None,
                             }
                     except:
                         pass
@@ -650,6 +662,46 @@ def check_upcoming_earnings(tickers):
     except:
         pass
     return earnings_soon
+
+# ── 52-WEEK BREAKOUT DETECTION ────────────────────────────────────────────────
+def check_52w_breakouts(tickers, price_data):
+    """
+    Detect tickers that have broken above their 52-week high within the last 7 days.
+    This is purely informational metadata — it does NOT affect confidence scores
+    or recommendations. The brain tracks outcomes separately so we can learn
+    over time whether 52W breakouts correlate with better performance.
+
+    Returns: dict of {ticker: days_ago} for recent breakouts, or {} if none.
+    """
+    breakouts = {}
+    try:
+        import yfinance as yf
+        for ticker in tickers:
+            if ticker not in price_data:
+                continue
+            try:
+                # Fetch 1 year of daily data to find the 52-week high
+                hist = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=True)
+                if hist is None or len(hist) < 30:
+                    continue
+
+                current_price = price_data[ticker]["price"]
+                yearly_high = float(hist["High"].max())
+
+                # Find the most recent day the price crossed above the 52W high
+                # We look at the last 7 trading days
+                recent = hist.tail(7)
+                for days_back, (date, row) in enumerate(reversed(list(recent.iterrows()))):
+                    if float(row["High"]) >= yearly_high * 0.995:  # Within 0.5% of 52W high
+                        breakouts[ticker] = days_back + 1
+                        price_data[ticker]["52w_high"] = round(yearly_high, 2)
+                        price_data[ticker]["broke_52w_high_days_ago"] = days_back + 1
+                        break
+            except:
+                pass
+    except Exception as error:
+        log.warning(f"52W breakout check error: {error}")
+    return breakouts
 
 # ── SCORING ENGINE ────────────────────────────────────────────────────────────
 def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, direction="long"):
@@ -807,6 +859,9 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
     rsi_values = calculate_rsi_batch(list(price_data.keys()))
     earnings_soon = check_upcoming_earnings(list(price_data.keys()))
 
+    # Check for 52-week breakouts (informational only, does not affect scoring)
+    check_52w_breakouts(list(price_data.keys()), price_data)
+
     # Prevent simultaneous long and short on the same ticker
     database = get_database()
     open_trades = database.execute(
@@ -854,9 +909,14 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
             "short_reasoning": build_reasoning_text(ticker, stock_data, rsi, has_earnings, "short"),
             "sell_time": predict_sell_time_window(long_confidence),
             "data_source": stock_data.get("source", "unknown"),
+            "52w_high": stock_data.get("52w_high"),
+            "broke_52w_high_days_ago": stock_data.get("broke_52w_high_days_ago"),
         })
 
-    # Filter by confidence floor and prevent conflicting directions
+    # Filter by confidence floor — longs only.
+    # Shorts are disabled: current signals (RSI momentum, volume surge, gap probability)
+    # are optimized for long setups. Short-specific signals (RSI overbought, failed
+    # breakout, sector weakness) will be added in a future session before re-enabling.
     recommended_longs = sorted(
         [s for s in scored_stocks
          if s["long_conf"] >= CONFIDENCE_FLOOR
@@ -864,13 +924,7 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
          and s["ticker"] not in open_short_tickers],
         key=lambda x: x["long_conf"], reverse=True
     )
-    recommended_shorts = sorted(
-        [s for s in scored_stocks
-         if s["short_conf"] >= CONFIDENCE_FLOOR
-         and s["short_move"] >= MIN_EXPECTED_MOVE
-         and s["ticker"] not in open_long_tickers],
-        key=lambda x: x["short_conf"], reverse=True
-    )
+    recommended_shorts = []  # Disabled until short-specific signals are implemented
 
     scan_result = {
         "longs": recommended_longs[:MAX_LONG_PICKS],
@@ -968,7 +1022,9 @@ def execute_opening_positions():
     picks = json.loads(cached["value"])
     is_friday = current_time_cst().weekday() == 4
 
-    all_picks = (picks.get("longs", [])[:MAX_LONG_PICKS]) + (picks.get("shorts", [])[:MAX_SHORT_PICKS])
+    # Shorts are disabled — only execute long picks.
+    # Virtual short execution requires short-specific signals to be meaningful.
+    all_picks = picks.get("longs", [])[:MAX_LONG_PICKS]
 
     # Fetch current prices at execution time (8:45 AM)
     tickers = [pick["ticker"] for pick in all_picks]
@@ -1219,6 +1275,19 @@ def run_self_audit():
     win_rate = len(hit_predictions) / len(resolved_predictions) if resolved_predictions else None
     current_weights = get_signal_weights()
 
+    # Gather closed_days distribution to help brain learn from extended holds
+    database = get_database()
+    closed_days_rows = database.execute("""
+        SELECT closed_days, COUNT(*) as count,
+               AVG(COALESCE(actual_move, 0)) as avg_move,
+               SUM(CASE WHEN outcome='hit' THEN 1 ELSE 0 END) as hits
+        FROM virtual_trades
+        WHERE outcome != 'open' AND closed_days IS NOT NULL
+        GROUP BY closed_days ORDER BY closed_days
+    """).fetchall()
+    database.close()
+    closed_days_summary = [dict(row) for row in closed_days_rows]
+
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -1228,6 +1297,7 @@ def run_self_audit():
                 f"Self-audit for overnight swing trading brain. Analyze and return updated weights.\n"
                 f"CURRENT WEIGHTS: {json.dumps(current_weights)}\n"
                 f"PERFORMANCE: {json.dumps({'total': total_predictions, 'resolved': len(resolved_predictions), 'hits': len(hit_predictions), 'misses': len(miss_predictions), 'win_rate': win_rate})}\n"
+                f"HOLD DURATION BREAKDOWN: {json.dumps(closed_days_summary)}\n"
                 f"Rules: weights must sum to 1.0, each between 0.05-0.45.\n"
                 f"Respond ONLY with valid JSON: {{\"weights\":{{...}},\"reasoning\":[\"...\"],\"summary\":\"...\",\"confidence\":\"low|medium|high\"}}"
             }]
@@ -1447,35 +1517,63 @@ def api_audit_log():
 @app.route("/api/perf-history")
 def api_performance_history():
     """
-    Build performance history from resolved trades and intraday position checks.
-    Combines daily settled P&L with 5-minute intraday data points for smooth charts.
+    Build performance history from resolved trades and position check snapshots.
+
+    Strategy:
+    - Closed trades contribute settled dollar P&L to the running balance.
+    - Position checks contribute intraday/multi-day snapshots so the chart
+      shows portfolio value fluctuating with open positions — even before any
+      trade closes. Each check_time snapshot aggregates dollar P&L across all
+      open positions at that moment using invested_amount as the base.
+    - Always emits a $1,000 seed point so the chart has something to draw from
+      day one.
     """
     database = get_database()
+
+    # ── Settled (closed) daily P&L ────────────────────────────────────────────
     daily_results = database.execute("""
-        SELECT sell_date as date,
-               SUM(COALESCE(gross_pnl, 0)) as daily_pnl,
-               COUNT(*) as trade_count
+        SELECT sell_date AS date,
+               SUM(COALESCE(gross_pnl, 0)) AS daily_pnl,
+               COUNT(*) AS trade_count
         FROM virtual_trades
         WHERE outcome != 'open' AND sell_date IS NOT NULL
         GROUP BY sell_date
         ORDER BY sell_date ASC
     """).fetchall()
 
-    today = current_time_cst().strftime("%Y-%m-%d")
-    intraday_checks = database.execute("""
-        SELECT check_time, SUM(pnl_percent) as total_pnl_percent
-        FROM position_checks
-        WHERE check_time LIKE ?
-        GROUP BY check_time
-        ORDER BY check_time ASC
-    """, [today + "%"]).fetchall()
+    # ── Position check snapshots (all dates, not just today) ──────────────────
+    # Join with virtual_trades to get invested_amount so we can calculate
+    # real dollar P&L: invested_amount * pnl_percent / 100
+    check_snapshots = database.execute("""
+        SELECT pc.check_time,
+               SUM(pc.pnl_percent * COALESCE(vt.invested_amount, 10.0) / 100.0) AS snapshot_pnl_dollars
+        FROM position_checks pc
+        LEFT JOIN virtual_trades vt ON pc.position_id = vt.id
+        GROUP BY pc.check_time
+        ORDER BY pc.check_time ASC
+    """).fetchall()
+
     database.close()
 
-    history = []
+    # ── Build settled balance timeline ────────────────────────────────────────
     running_balance = 1000.0
+    history = []
 
+    # Seed point so chart always has something to draw from day one
+    seed_ts = int((datetime.utcnow() - timedelta(days=1)).timestamp() * 1000)
+    history.append({
+        "date": (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d"),
+        "virtual": 1000.0,
+        "daily_pnl": 0,
+        "trades": 0,
+        "ts": seed_ts,
+        "seed": True,
+    })
+
+    closed_dates = set()
     for row in daily_results:
         running_balance += float(row["daily_pnl"] or 0)
+        closed_dates.add(row["date"])
         history.append({
             "date": row["date"],
             "virtual": round(running_balance, 2),
@@ -1484,15 +1582,20 @@ def api_performance_history():
             "ts": int(datetime.fromisoformat(row["date"]).timestamp() * 1000),
         })
 
-    # Append intraday data points for smooth chart during market hours
-    for check in intraday_checks:
-        intraday_pnl = float(check["total_pnl_percent"] or 0) * DEFAULT_INVESTMENT / 100
+    # ── Overlay position check snapshots as intraday points ───────────────────
+    # These show the portfolio fluctuating with unrealized P&L even before
+    # any trade closes, mimicking a live portfolio chart.
+    for snapshot in check_snapshots:
+        if not snapshot["check_time"]:
+            continue
+        snapshot_dollars = float(snapshot["snapshot_pnl_dollars"] or 0)
+        check_dt = datetime.fromisoformat(snapshot["check_time"])
         history.append({
-            "date": today,
-            "virtual": round(running_balance + intraday_pnl, 2),
-            "daily_pnl": round(intraday_pnl, 4),
+            "date": check_dt.strftime("%Y-%m-%d"),
+            "virtual": round(running_balance + snapshot_dollars, 2),
+            "daily_pnl": round(snapshot_dollars, 4),
             "trades": 0,
-            "ts": int(datetime.fromisoformat(check["check_time"]).timestamp() * 1000),
+            "ts": int(check_dt.timestamp() * 1000),
             "intraday": True,
         })
 
