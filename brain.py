@@ -48,7 +48,7 @@ load_dotenv()
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_KEY") or os.getenv("ANTHROPIC_API_KEY")
 ALPHA_VANTAGE_KEY    = os.getenv("ALPHA_VANTAGE_KEY")
-DATABASE_PATH        = Path(__file__).parent / "portfolio_brain.db"
+DATABASE_PATH = Path("/app/data/portfolio_brain.db")
 FEE_PER_TRADE        = 0.02      # Cash App sell fee
 DEFAULT_INVESTMENT   = 10.00     # Fallback when queue is empty
 CONFIDENCE_FLOOR     = 65        # Minimum confidence to recommend/trade
