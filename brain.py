@@ -48,7 +48,7 @@ load_dotenv()
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_KEY") or os.getenv("ANTHROPIC_API_KEY")
 ALPHA_VANTAGE_KEY    = os.getenv("ALPHA_VANTAGE_KEY")
-DATABASE_PATH = Path("/app/data/portfolio_brain.db")
+DATABASE_PATH        = Path(__file__).parent / "portfolio_brain.db"
 FEE_PER_TRADE        = 0.02      # Cash App sell fee
 DEFAULT_INVESTMENT   = 10.00     # Fallback when queue is empty
 CONFIDENCE_FLOOR     = 65        # Minimum confidence to recommend/trade
@@ -892,13 +892,16 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
     all_recommended = recommended_longs[:MAX_LONG_PICKS] + recommended_shorts[:MAX_SHORT_PICKS]
     for pick in all_recommended:
         direction = "long" if pick in recommended_longs[:MAX_LONG_PICKS] else "short"
-        database.execute("""
-            INSERT OR REPLACE INTO candidates (ticker, direction, first_seen, last_seen, confidence, expected_move, monitoring)
-            VALUES (?, ?, COALESCE((SELECT first_seen FROM candidates WHERE ticker=?), ?), ?, ?, 1)
-        """, [pick["ticker"], direction, pick["ticker"],
-              current_time_cst().isoformat(), current_time_cst().isoformat(),
-              pick["long_conf"] if direction == "long" else pick["short_conf"],
-              pick["long_move"] if direction == "long" else pick["short_move"]])
+        conf = pick["long_conf"] if direction == "long" else pick["short_conf"]
+        move = pick["long_move"] if direction == "long" else pick["short_move"]
+        now_iso = current_time_cst().isoformat()
+        # Check if candidate already exists to preserve first_seen timestamp
+        existing = database.execute("SELECT first_seen FROM candidates WHERE ticker=?", [pick["ticker"]]).fetchone()
+        first_seen = existing["first_seen"] if existing else now_iso
+        database.execute(
+            "INSERT OR REPLACE INTO candidates (ticker, direction, first_seen, last_seen, confidence, expected_move, monitoring) VALUES (?,?,?,?,?,?,?)",
+            [pick["ticker"], direction, first_seen, now_iso, conf, move, 1]
+        )
 
     # Log predictions (only for 65%+ confidence)
     today = current_time_cst().strftime("%Y-%m-%d")
