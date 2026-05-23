@@ -91,7 +91,8 @@ def fetch_sp500_tickers():
     try:
         import urllib.request
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        with urllib.request.urlopen(url, timeout=10) as response:
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; SwingDesk/1.0)"})
+        with urllib.request.urlopen(request, timeout=10) as response:
             html = response.read().decode()
         tickers = []
         rows = html.split("<tbody>")[1].split("</tbody>")[0].split("<tr>")
@@ -112,7 +113,8 @@ def fetch_nasdaq100_tickers():
     try:
         import urllib.request
         url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-        with urllib.request.urlopen(url, timeout=10) as response:
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; SwingDesk/1.0)"})
+        with urllib.request.urlopen(request, timeout=10) as response:
             html = response.read().decode()
         tickers = []
         rows = html.split("<tbody>")[1].split("</tbody>")[0].split("<tr>")
@@ -132,9 +134,9 @@ def fetch_nasdaq100_tickers():
 HIGH_VOLATILITY_TICKERS = [
     "GME","AMC","BB","NOK","SOFI","MSTR","CVNA","HOOD","RBLX","SNAP",
     "RIVN","LCID","IONQ","RGTI","COIN","PLTR","SMCI","SNDL","TLRY",
-    "OPEN","CLOV","SPCE","LAZR","MARA","RIOT","BITF","HUT",
+    "OPEN","CLOV","SPCE","MARA","RIOT","BITF","HUT",
     "UPST","AFRM","DKNG","PENN","STEM","PLUG","FCEL","BE",
-    "CHPT","BLNK","QS","GOEV","FSR","NKLA","WKHS",
+    "CHPT","BLNK","QS","WKHS",
     "SPY","QQQ","IWM","DIA","ARKK","ARKG","ARKF","ARKW",
     "XLF","XLK","XLE","XLV","XLI","XLP","XLY","XLB","XLRE","XLC","XLU",
     "SOXL","TQQQ","SQQQ","UVXY",
@@ -1631,17 +1633,42 @@ def api_open_positions_dynamic():
             # using current indicator data (not current price as anchor)
             dynamic_estimate = estimate_overnight_move(stock_data, dynamic_confidence, has_earnings)
 
-            # Current P&L
+            # Current P&L — use live price only during market hours on weekdays.
+            # On weekends or after hours, freeze at last known good price from DB
+            # to avoid yfinance returning stale intraday data that wipes real gains.
             buy_price = position["buy_price"] or 0
-            current_price = stock_data["price"]
+            now_cst = current_time_cst()
+            market_is_live = (now_cst.weekday() < 5 and
+                              now_cst.hour >= 8 and
+                              (now_cst.hour < 15 or (now_cst.hour == 15 and now_cst.minute == 0)))
+
+            if market_is_live:
+                current_price = stock_data["price"]
+            else:
+                # Use the stored current_value from DB to back-calculate a stable price,
+                # or fall back to the daily close from fetch_price_data (period=5d, iloc[-1])
+                stored_pnl = position.get("current_value")
+                if stored_pnl and stored_pnl != position["invested_amount"]:
+                    # Trust the last value written by the monitoring loop
+                    current_price = buy_price * (stored_pnl / max(position["invested_amount"], 0.01))
+                else:
+                    # Use daily close — fetch_price_data period="5d" returns the last trading day's close
+                    current_price = stock_data["price"]
+
             pnl_pct = (current_price - buy_price) / max(buy_price, 0.01) * 100
             if position["direction"] == "short":
                 pnl_pct = -pnl_pct
 
+            # Compute dollar P&L from invested amount, not just price ratio,
+            # so fractional share positions display correctly
+            invested_amount = position["invested_amount"] or 10.0
+            current_value = invested_amount * (1 + pnl_pct / 100)
+
             enriched["dynamic_confidence"] = dynamic_confidence
             enriched["dynamic_estimate"] = dynamic_estimate
-            enriched["current_price"] = current_price
+            enriched["current_price"] = round(current_price, 4)
             enriched["current_pnl_percent"] = round(pnl_pct, 2)
+            enriched["current_value"] = round(current_value, 4)
             enriched["current_rsi"] = round(rsi, 1)
             enriched["current_volume_ratio"] = round(stock_data.get("volume_ratio", 1), 2)
 
@@ -1686,7 +1713,7 @@ def api_seed_friday():
             "MU","QCOM","ARM","AVGO","TSM","ORCL","CRM","SNOW","DDOG","NET",
             "CRWD","ZS","PANW","SHOP","ROKU","SPOT","ABNB","DASH","BB","NOK",
             "TLRY","SNDL","MARA","RIOT","DKNG","PLUG","FCEL","UPST","AFRM",
-            "SPCE","LAZR","QS","CHPT","BLNK",
+            "SPCE","QS","CHPT","BLNK",
             "SPY","QQQ","IWM","DIA","ARKK","ARKG","XLF","XLK","XLE","XLV",
         ]))
         
