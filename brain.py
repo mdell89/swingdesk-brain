@@ -1,9 +1,42 @@
 """
-brain.py — Overnight Swing Desk Backend v3
-Foundation: cached picks, ~1500 tickers, scan schedule, schema upgrades
+brain.py — Overnight Swing Desk Backend v4 (Push 2)
+══════════════════════════════════════════════════════
+Trading Engine with Self-Regulating Queue System
+
+Architecture:
+    - Comprehensive scans every 30 min during pre/post market (~1,500 tickers)
+    - 5-minute targeted monitoring on candidates + open positions
+    - FIFO queue system for position sizing (compounding)
+    - Dynamic sell engine with real-time decision making
+    - Force-close deadline at 2:45 PM CST
+
+Queue System:
+    The queue is a FIFO (first-in, first-out) list of dollar amounts.
+    When a trade closes (sold or covered), its ending value (original
+    investment + profit/loss) is appended to the back of the queue.
+    When a new trade opens, it takes the next available amount from
+    the front of the queue. If the queue is empty, it falls back to
+    the default amount ($10.00).
+
+    This creates a naturally self-regulating position sizing system:
+    - Winning streaks → queue amounts grow → larger future positions
+    - Losing streaks → queue amounts shrink → smaller future positions
+    - No manual intervention needed — risk scales automatically
+    - No floors or ceilings — pure compounding in both directions
+
+    When multiple trades close simultaneously (e.g., force-close at
+    2:45 PM), their queue order is randomized to avoid systematic
+    bias. Similarly, when multiple candidates appear on the same scan,
+    queue amounts are assigned in randomized order.
+
+Confidence Floor:
+    Only stocks scoring 65% confidence or higher are considered.
+    Nothing below 65% is logged, traded, or stored. This keeps the
+    database clean and ensures the brain only learns from predictions
+    it has meaningful conviction about.
 """
 
-import os, json, sqlite3, time, logging, threading
+import os, json, sqlite3, time, logging, threading, random
 from datetime import datetime, timedelta
 from pathlib import Path
 from flask import Flask, jsonify, request
@@ -12,13 +45,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-ANTHROPIC_KEY   = os.getenv("ANTHROPIC_KEY") or os.getenv("ANTHROPIC_API_KEY")
-AV_KEY          = os.getenv("ALPHA_VANTAGE_KEY")
-DB_PATH         = Path(__file__).parent / "portfolio_brain.db"
-FEE_PER_TRADE   = 0.02
-INVEST_PER_PICK = 10.00
-MIN_MOVE        = 5.0
-MAX_PICKS       = 20
+# ── CONFIGURATION ─────────────────────────────────────────────────────────────
+ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_KEY") or os.getenv("ANTHROPIC_API_KEY")
+ALPHA_VANTAGE_KEY    = os.getenv("ALPHA_VANTAGE_KEY")
+DATABASE_PATH        = Path(__file__).parent / "portfolio_brain.db"
+FEE_PER_TRADE        = 0.02      # Cash App sell fee
+DEFAULT_INVESTMENT   = 10.00     # Fallback when queue is empty
+CONFIDENCE_FLOOR     = 65        # Minimum confidence to recommend/trade
+MIN_EXPECTED_MOVE    = 5.0       # Minimum predicted overnight move (%)
+MAX_LONG_PICKS       = 20        # Maximum long recommendations per scan
+MAX_SHORT_PICKS      = 10        # Maximum short recommendations per scan
+TIMEZONE_OFFSET      = -5        # CST = UTC-5 (CDT during summer)
+MONITOR_INTERVAL     = 300       # 5 minutes in seconds
+SCAN_BATCH_SIZE      = 100       # Tickers per yfinance batch call
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -26,14 +65,34 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
-# ── UNIVERSE — ~1500 tickers ──────────────────────────────────────────────────
-def fetch_sp500():
-    """Fetch S&P 500 tickers from Wikipedia"""
+# ── TIME UTILITIES ────────────────────────────────────────────────────────────
+def current_time_cst():
+    """Returns current time adjusted to Central Standard Time."""
+    return datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
+
+def is_weekday():
+    """Returns True if today is a weekday (Mon-Fri)."""
+    return current_time_cst().weekday() < 5
+
+def is_market_open():
+    """Returns True during regular market hours (8:30 AM - 3:00 PM CST)."""
+    now = current_time_cst()
+    return now.weekday() < 5 and 8 <= now.hour < 15
+
+def minutes_until_forced_close():
+    """Returns minutes remaining until the 2:45 PM CST forced close."""
+    now = current_time_cst()
+    close_time = now.replace(hour=14, minute=45, second=0)
+    return int((close_time - now).total_seconds() / 60)
+
+# ── TICKER UNIVERSE ───────────────────────────────────────────────────────────
+def fetch_sp500_tickers():
+    """Fetch S&P 500 ticker list from Wikipedia."""
     try:
         import urllib.request
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        with urllib.request.urlopen(url, timeout=10) as r:
-            html = r.read().decode()
+        with urllib.request.urlopen(url, timeout=10) as response:
+            html = response.read().decode()
         tickers = []
         rows = html.split("<tbody>")[1].split("</tbody>")[0].split("<tr>")
         for row in rows[1:]:
@@ -44,17 +103,17 @@ def fetch_sp500():
                     tickers.append(ticker.replace(".", "-"))
         log.info(f"Fetched {len(tickers)} S&P 500 tickers")
         return tickers
-    except Exception as e:
-        log.warning(f"Could not fetch S&P 500 list: {e}")
+    except Exception as error:
+        log.warning(f"S&P 500 fetch failed: {error}")
         return []
 
-def fetch_nasdaq100():
-    """Fetch Nasdaq 100 tickers"""
+def fetch_nasdaq100_tickers():
+    """Fetch Nasdaq 100 ticker list from Wikipedia."""
     try:
         import urllib.request
         url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-        with urllib.request.urlopen(url, timeout=10) as r:
-            html = r.read().decode()
+        with urllib.request.urlopen(url, timeout=10) as response:
+            html = response.read().decode()
         tickers = []
         rows = html.split("<tbody>")[1].split("</tbody>")[0].split("<tr>")
         for row in rows[1:]:
@@ -65,57 +124,24 @@ def fetch_nasdaq100():
                     tickers.append(ticker.replace(".", "-"))
         log.info(f"Fetched {len(tickers)} Nasdaq 100 tickers")
         return tickers
-    except Exception as e:
-        log.warning(f"Could not fetch Nasdaq 100 list: {e}")
+    except Exception as error:
+        log.warning(f"Nasdaq 100 fetch failed: {error}")
         return []
 
-# High-volatility additions that may not be in indices
-EXTRA_TICKERS = [
+# High-volatility and popular retail tickers not always in major indices
+HIGH_VOLATILITY_TICKERS = [
     "GME","AMC","BB","NOK","SOFI","MSTR","CVNA","HOOD","RBLX","SNAP",
     "RIVN","LCID","IONQ","RGTI","COIN","PLTR","SMCI","SNDL","TLRY",
-    "OPEN","CLOV","WISH","SPCE","LAZR","MARA","RIOT","BITF","HUT",
-    "UPST","AFRM","DKNG","PENN","RSI","STEM","PLUG","FCEL","BE",
-    "CHPT","BLNK","QS","GOEV","FSR","NKLA","WKHS","RIDE",
+    "OPEN","CLOV","SPCE","LAZR","MARA","RIOT","BITF","HUT",
+    "UPST","AFRM","DKNG","PENN","STEM","PLUG","FCEL","BE",
+    "CHPT","BLNK","QS","GOEV","FSR","NKLA","WKHS",
     "SPY","QQQ","IWM","DIA","ARKK","ARKG","ARKF","ARKW",
     "XLF","XLK","XLE","XLV","XLI","XLP","XLY","XLB","XLRE","XLC","XLU",
-    "SOXL","TQQQ","SQQQ","UVXY","VXX",
+    "SOXL","TQQQ","SQQQ","UVXY",
 ]
 
-def build_universe():
-    """Build full ticker universe, cache it in DB"""
-    conn = get_db()
-    cached = conn.execute("SELECT value FROM app_state WHERE key='universe'").fetchone()
-    cache_date = conn.execute("SELECT value FROM app_state WHERE key='universe_date'").fetchone()
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    if cached and cache_date and cache_date["value"] == today:
-        tickers = json.loads(cached["value"])
-        conn.close()
-        log.info(f"Using cached universe: {len(tickers)} tickers")
-        return tickers
-
-    sp500 = fetch_sp500()
-    ndx100 = fetch_nasdaq100()
-    combined = list(dict.fromkeys(sp500 + ndx100 + EXTRA_TICKERS))
-
-    if len(combined) < 100:
-        if cached:
-            combined = json.loads(cached["value"])
-            log.warning(f"Fetch failed, using previous cache: {len(combined)} tickers")
-        else:
-            combined = EXTRA_TICKERS
-            log.warning(f"No cache, using extras only: {len(combined)} tickers")
-    else:
-        conn.execute("INSERT OR REPLACE INTO app_state VALUES ('universe', ?)", [json.dumps(combined)])
-        conn.execute("INSERT OR REPLACE INTO app_state VALUES ('universe_date', ?)", [today])
-        conn.commit()
-
-    conn.close()
-    log.info(f"Universe built: {len(combined)} tickers")
-    return combined
-
-# Sector mapping — we'll expand this dynamically but start with known sectors
-SECTORS = {
+# Sector classification for each ticker
+SECTOR_MAP = {
     "NVDA":"Tech","META":"Tech","AMD":"Tech","TSLA":"Auto","AMZN":"Consumer",
     "MSFT":"Tech","PLTR":"Tech","SOFI":"Finance","MSTR":"Finance","JPM":"Finance",
     "BAC":"Finance","COIN":"Crypto","GOOGL":"Tech","GOOG":"Tech","AAPL":"Tech",
@@ -130,360 +156,781 @@ SECTORS = {
     "SPY":"ETF","QQQ":"ETF","IWM":"ETF","DIA":"ETF","ARKK":"ETF","ARKG":"ETF",
     "XLF":"ETF","XLK":"ETF","XLE":"ETF","XLV":"ETF","MARA":"Crypto",
     "RIOT":"Crypto","DKNG":"Consumer","PLUG":"Energy","FCEL":"Energy",
-    "SOXL":"ETF","TQQQ":"ETF","SQQQ":"ETF","UVXY":"ETF",
     "LLY":"Healthcare","UNH":"Healthcare","JNJ":"Healthcare","PFE":"Healthcare",
-    "ABBV":"Healthcare","MRK":"Healthcare","TMO":"Healthcare","ABT":"Healthcare",
-    "GILD":"Healthcare","VRTX":"Healthcare","REGN":"Healthcare","BIIB":"Healthcare",
-    "CVX":"Energy","SLB":"Energy","HAL":"Energy","BKR":"Energy","EOG":"Energy",
-    "V":"Finance","MA":"Finance","GS":"Finance","BLK":"Finance","WFC":"Finance",
-    "BK":"Finance","AIG":"Finance","AFL":"Finance",
-    "PG":"Consumer","KO":"Consumer","PEP":"Consumer","WMT":"Consumer","COST":"Consumer",
-    "HD":"Consumer","LOW":"Consumer","TGT":"Consumer","MCD":"Consumer","SBUX":"Consumer",
-    "BA":"Industrial","CAT":"Industrial","DE":"Industrial","GE":"Industrial",
-    "HON":"Industrial","UNP":"Industrial","RTX":"Defense","NOC":"Defense","LHX":"Defense","GD":"Defense",
+    "ABBV":"Healthcare","MRK":"Healthcare","V":"Finance","MA":"Finance",
+    "GS":"Finance","BLK":"Finance","WFC":"Finance","PG":"Consumer",
+    "KO":"Consumer","PEP":"Consumer","WMT":"Consumer","COST":"Consumer",
+    "HD":"Consumer","LOW":"Consumer","BA":"Industrial","CAT":"Industrial",
+    "GE":"Industrial","HON":"Industrial","RTX":"Defense","NOC":"Defense",
 }
 
 def get_sector(ticker):
-    return SECTORS.get(ticker, "Other")
+    """Return the sector classification for a ticker, defaulting to 'Other'."""
+    return SECTOR_MAP.get(ticker, "Other")
+
+def build_ticker_universe():
+    """
+    Build the full ticker universe by combining S&P 500, Nasdaq 100,
+    and high-volatility additions. Caches the list daily to avoid
+    redundant Wikipedia fetches.
+    """
+    database = get_database()
+    cached_universe = database.execute("SELECT value FROM app_state WHERE key='universe'").fetchone()
+    cached_date = database.execute("SELECT value FROM app_state WHERE key='universe_date'").fetchone()
+    today = current_time_cst().strftime("%Y-%m-%d")
+
+    if cached_universe and cached_date and cached_date["value"] == today:
+        database.close()
+        tickers = json.loads(cached_universe["value"])
+        log.info(f"Using cached universe: {len(tickers)} tickers")
+        return tickers
+
+    sp500 = fetch_sp500_tickers()
+    nasdaq100 = fetch_nasdaq100_tickers()
+    combined = list(dict.fromkeys(sp500 + nasdaq100 + HIGH_VOLATILITY_TICKERS))
+
+    if len(combined) < 100:
+        if cached_universe:
+            combined = json.loads(cached_universe["value"])
+            log.warning(f"Fetch failed, using previous cache: {len(combined)} tickers")
+        else:
+            combined = HIGH_VOLATILITY_TICKERS
+            log.warning(f"No cache available, using high-vol tickers only: {len(combined)}")
+    else:
+        database.execute("INSERT OR REPLACE INTO app_state VALUES ('universe',?)", [json.dumps(combined)])
+        database.execute("INSERT OR REPLACE INTO app_state VALUES ('universe_date',?)", [today])
+        database.commit()
+
+    database.close()
+    log.info(f"Universe built: {len(combined)} tickers")
+    return combined
 
 # ── DATABASE ──────────────────────────────────────────────────────────────────
-def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.row_factory = sqlite3.Row
-    return conn
+def get_database():
+    """Open a connection to the SQLite database with WAL mode enabled."""
+    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False, timeout=10)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.row_factory = sqlite3.Row
+    return connection
 
-def init_db():
-    conn = get_db()
-    conn.executescript("""
+def initialize_database():
+    """
+    Create all required tables and seed default values.
+    Safe to call multiple times — uses IF NOT EXISTS.
+    """
+    database = get_database()
+    database.executescript("""
         CREATE TABLE IF NOT EXISTS predictions (
-            id TEXT PRIMARY KEY, ticker TEXT, name TEXT, date TEXT, direction TEXT,
-            conf INTEGER, expected_move REAL, entry_price REAL, sell_time TEXT,
-            reasoning TEXT, sector TEXT, rsi REAL, vol_ratio REAL,
-            weights_snapshot TEXT, outcome TEXT DEFAULT 'pending',
-            actual_move REAL, actual_sell_price REAL, gross_pnl REAL,
-            net_pnl REAL, logged_at TEXT, resolved_at TEXT
+            id TEXT PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            name TEXT,
+            date TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            confidence INTEGER,
+            expected_move REAL,
+            entry_price REAL,
+            sell_time_window TEXT,
+            reasoning TEXT,
+            sector TEXT,
+            rsi REAL,
+            volume_ratio REAL,
+            weights_snapshot TEXT,
+            outcome TEXT DEFAULT 'pending',
+            actual_move REAL,
+            actual_sell_price REAL,
+            gross_pnl REAL,
+            net_pnl REAL,
+            logged_at TEXT,
+            resolved_at TEXT
         );
+
         CREATE TABLE IF NOT EXISTS virtual_trades (
-            id TEXT PRIMARY KEY, ticker TEXT, direction TEXT, buy_date TEXT,
-            buy_time TEXT, buy_price REAL, sell_date TEXT, sell_time TEXT,
-            sell_price REAL, invested REAL DEFAULT 10.0, current_value REAL,
-            conf INTEGER, expected_move REAL, actual_move REAL, gross_pnl REAL,
-            net_pnl REAL, fee REAL DEFAULT 0.02, outcome TEXT DEFAULT 'open',
-            sector TEXT, reasoning TEXT, weekend_hold INTEGER DEFAULT 0,
-            sell_reason TEXT, sell_sentiment_history TEXT,
-            intraday_high REAL, intraday_low REAL
+            id TEXT PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            buy_date TEXT NOT NULL,
+            buy_time TEXT,
+            buy_price REAL,
+            sell_date TEXT,
+            sell_time TEXT,
+            sell_price REAL,
+            invested_amount REAL DEFAULT 10.0,
+            current_value REAL,
+            confidence INTEGER,
+            expected_move REAL,
+            actual_move REAL,
+            gross_pnl REAL,
+            net_pnl REAL,
+            fee REAL DEFAULT 0.02,
+            outcome TEXT DEFAULT 'open',
+            sector TEXT,
+            reasoning TEXT,
+            weekend_hold INTEGER DEFAULT 0,
+            sell_reason TEXT,
+            sell_sentiment_history TEXT,
+            intraday_high_pct REAL,
+            intraday_low_pct REAL,
+            status TEXT DEFAULT 'recommended',
+            queue_position INTEGER
         );
+
         CREATE TABLE IF NOT EXISTS audit_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT,
-            weights_before TEXT, weights_after TEXT, reasoning TEXT,
-            summary TEXT, total_predictions INTEGER, resolved INTEGER,
-            hits INTEGER, misses INTEGER, win_rate REAL
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            weights_before TEXT,
+            weights_after TEXT,
+            reasoning TEXT,
+            summary TEXT,
+            total_predictions INTEGER,
+            resolved_count INTEGER,
+            hit_count INTEGER,
+            miss_count INTEGER,
+            win_rate REAL
         );
+
         CREATE TABLE IF NOT EXISTS weights_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT,
-            rsi_momentum REAL, volume_surge REAL, overnight_gap_prob REAL,
-            earnings_catalyst REAL, sector_rotation REAL, win_rate REAL,
-            total_resolved INTEGER, audit_reasoning TEXT
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            rsi_momentum REAL,
+            volume_surge REAL,
+            overnight_gap_probability REAL,
+            earnings_catalyst REAL,
+            sector_rotation REAL,
+            win_rate REAL,
+            total_resolved INTEGER,
+            audit_reasoning TEXT
         );
-        CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT);
+
+        CREATE TABLE IF NOT EXISTS app_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS scan_cache (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            scan_time TEXT, scan_type TEXT, ticker_count INTEGER,
-            picks_json TEXT, all_scores_json TEXT
+            scan_time TEXT NOT NULL,
+            scan_type TEXT,
+            ticker_count INTEGER,
+            picks_json TEXT
         );
+
         CREATE TABLE IF NOT EXISTS position_checks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            position_id TEXT, check_time TEXT, price REAL,
-            pnl_pct REAL, sentiment TEXT
+            position_id TEXT NOT NULL,
+            check_time TEXT NOT NULL,
+            price REAL,
+            pnl_percent REAL,
+            sentiment TEXT,
+            ticker TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS candidates (
+            ticker TEXT PRIMARY KEY,
+            direction TEXT,
+            first_seen TEXT,
+            last_seen TEXT,
+            confidence INTEGER,
+            expected_move REAL,
+            monitoring INTEGER DEFAULT 1
+        );
+
+        /*
+         * Trade Queue — Self-Regulating Position Sizing
+         * ═══════════════════════════════════════════════
+         * Each row represents a dollar amount available for the next trade.
+         * When a trade closes, its ending value (investment + P&L) is appended.
+         * When a new trade opens, the oldest available amount is consumed.
+         *
+         * The queue naturally self-regulates:
+         *   - Winning trades add larger amounts → future positions grow
+         *   - Losing trades add smaller amounts → future positions shrink
+         *   - No manual intervention, floors, or ceilings needed
+         *
+         * If the queue is empty when a trade needs to open, the system
+         * falls back to DEFAULT_INVESTMENT ($10.00).
+         */
+        CREATE TABLE IF NOT EXISTS trade_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            amount REAL NOT NULL,
+            source_trade_id TEXT,
+            created_at TEXT NOT NULL,
+            consumed INTEGER DEFAULT 0,
+            consumed_by_trade_id TEXT,
+            consumed_at TEXT
         );
     """)
-    # Add new columns to virtual_trades if they don't exist
-    try:
-        conn.execute("ALTER TABLE virtual_trades ADD COLUMN weekend_hold INTEGER DEFAULT 0")
-    except: pass
-    try:
-        conn.execute("ALTER TABLE virtual_trades ADD COLUMN sell_reason TEXT")
-    except: pass
-    try:
-        conn.execute("ALTER TABLE virtual_trades ADD COLUMN sell_sentiment_history TEXT")
-    except: pass
-    try:
-        conn.execute("ALTER TABLE virtual_trades ADD COLUMN intraday_high REAL")
-    except: pass
-    try:
-        conn.execute("ALTER TABLE virtual_trades ADD COLUMN intraday_low REAL")
-    except: pass
 
-    existing = conn.execute("SELECT value FROM app_state WHERE key='weights'").fetchone()
-    if not existing:
-        conn.execute("INSERT INTO app_state VALUES ('weights', ?)", [json.dumps({
-            "rsi_momentum":0.20,"volume_surge":0.22,"overnight_gap_prob":0.25,
-            "earnings_catalyst":0.18,"sector_rotation":0.15
-        })])
-    conn.commit()
-    conn.close()
-    log.info(f"Database ready at {DB_PATH}")
+    # Add new columns to virtual_trades if upgrading from earlier schema
+    for column_definition in [
+        "weekend_hold INTEGER DEFAULT 0",
+        "sell_reason TEXT",
+        "sell_sentiment_history TEXT",
+        "intraday_high_pct REAL",
+        "intraday_low_pct REAL",
+        "status TEXT DEFAULT 'recommended'",
+        "queue_position INTEGER",
+    ]:
+        try:
+            column_name = column_definition.split()[0]
+            database.execute(f"ALTER TABLE virtual_trades ADD COLUMN {column_definition}")
+        except:
+            pass  # Column already exists
 
-def get_weights():
+    # Seed default signal weights if not already set
+    existing_weights = database.execute("SELECT value FROM app_state WHERE key='weights'").fetchone()
+    if not existing_weights:
+        default_weights = {
+            "rsi_momentum": 0.20,
+            "volume_surge": 0.22,
+            "overnight_gap_probability": 0.25,
+            "earnings_catalyst": 0.18,
+            "sector_rotation": 0.15,
+        }
+        database.execute("INSERT INTO app_state VALUES ('weights',?)", [json.dumps(default_weights)])
+
+    database.commit()
+    database.close()
+    log.info(f"Database initialized at {DATABASE_PATH}")
+
+def get_signal_weights():
+    """Retrieve current signal weights from the database."""
     try:
-        conn = get_db()
-        row = conn.execute("SELECT value FROM app_state WHERE key='weights'").fetchone()
-        conn.close()
-        return json.loads(row["value"]) if row else {
-            "rsi_momentum":0.20,"volume_surge":0.22,"overnight_gap_prob":0.25,
-            "earnings_catalyst":0.18,"sector_rotation":0.15}
+        database = get_database()
+        row = database.execute("SELECT value FROM app_state WHERE key='weights'").fetchone()
+        database.close()
+        if row:
+            return json.loads(row["value"])
     except:
-        return {"rsi_momentum":0.20,"volume_surge":0.22,"overnight_gap_prob":0.25,
-                "earnings_catalyst":0.18,"sector_rotation":0.15}
+        pass
+    return {
+        "rsi_momentum": 0.20, "volume_surge": 0.22,
+        "overnight_gap_probability": 0.25, "earnings_catalyst": 0.18,
+        "sector_rotation": 0.15,
+    }
 
-def save_weights(w):
-    conn = get_db()
-    conn.execute("INSERT OR REPLACE INTO app_state VALUES ('weights', ?)", [json.dumps(w)])
-    conn.commit(); conn.close()
+def save_signal_weights(weights):
+    """Persist updated signal weights to the database."""
+    database = get_database()
+    database.execute("INSERT OR REPLACE INTO app_state VALUES ('weights',?)", [json.dumps(weights)])
+    database.commit()
+    database.close()
+
+# ── TRADE QUEUE — Self-Regulating Position Sizing ─────────────────────────────
+def get_next_queue_amount():
+    """
+    Retrieve the next available amount from the trade queue (FIFO).
+    
+    Returns the oldest unconsumed amount, or DEFAULT_INVESTMENT ($10.00)
+    if the queue is empty. This is the core of the self-regulating
+    position sizing system — each trade's investment amount is
+    determined by the outcome of a previous trade.
+    
+    The elegance: no rules, no floors, no ceilings. The queue just
+    naturally tracks the brain's recent performance through the dollar
+    amounts flowing through it.
+    """
+    database = get_database()
+    next_amount = database.execute(
+        "SELECT id, amount FROM trade_queue WHERE consumed = 0 ORDER BY id ASC LIMIT 1"
+    ).fetchone()
+    database.close()
+
+    if next_amount:
+        return next_amount["id"], next_amount["amount"]
+    return None, DEFAULT_INVESTMENT
+
+def consume_queue_amount(queue_id, consuming_trade_id):
+    """
+    Mark a queue entry as consumed by a specific trade.
+    Called when a new position opens and takes an amount from the queue.
+    """
+    if queue_id is None:
+        return  # Was a fallback amount, nothing to consume
+    database = get_database()
+    database.execute(
+        "UPDATE trade_queue SET consumed = 1, consumed_by_trade_id = ?, consumed_at = ? WHERE id = ?",
+        [consuming_trade_id, current_time_cst().isoformat(), queue_id]
+    )
+    database.commit()
+    database.close()
+
+def add_to_queue(amount, source_trade_id):
+    """
+    Add a completed trade's ending value to the back of the queue.
+    
+    Called when a position closes (sold or covered). The ending value
+    (original investment + profit/loss) becomes available for a future
+    trade. This is how compounding works — winning trades produce
+    larger queue amounts, losing trades produce smaller ones.
+    """
+    database = get_database()
+    database.execute(
+        "INSERT INTO trade_queue (amount, source_trade_id, created_at) VALUES (?, ?, ?)",
+        [round(amount, 4), source_trade_id, current_time_cst().isoformat()]
+    )
+    database.commit()
+    database.close()
+
+def get_queue_status():
+    """Return current queue state for API consumers."""
+    database = get_database()
+    available = database.execute("SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total FROM trade_queue WHERE consumed = 0").fetchone()
+    total_ever = database.execute("SELECT COUNT(*) as count FROM trade_queue").fetchone()
+    recent = [dict(row) for row in database.execute(
+        "SELECT amount, source_trade_id, created_at, consumed FROM trade_queue ORDER BY id DESC LIMIT 20"
+    ).fetchall()]
+    database.close()
+    return {
+        "available_count": available["count"],
+        "available_total": round(available["total"], 2),
+        "total_ever_queued": total_ever["count"],
+        "default_fallback": DEFAULT_INVESTMENT,
+        "recent_entries": recent,
+    }
 
 # ── PRICE DATA ────────────────────────────────────────────────────────────────
-def fetch_prices(tickers, batch_size=100):
-    """Fetch prices in batches to handle large universes"""
+def fetch_price_data(tickers):
+    """
+    Fetch daily price data for a list of tickers using yfinance (primary)
+    with Alpha Vantage as fallback and local cache as last resort.
+    Processes tickers in batches to handle large universes.
+    """
     results = {}
     try:
         import yfinance as yf
-        log.info(f"Fetching {len(tickers)} tickers via yfinance in batches of {batch_size}...")
-        for i in range(0, len(tickers), batch_size):
-            batch_tickers = tickers[i:i+batch_size]
+        log.info(f"Fetching price data for {len(tickers)} tickers...")
+        for batch_start in range(0, len(tickers), SCAN_BATCH_SIZE):
+            batch_tickers = tickers[batch_start:batch_start + SCAN_BATCH_SIZE]
             try:
-                batch = yf.download(batch_tickers, period="5d", interval="1d",
-                                    group_by="ticker", auto_adjust=True, progress=False, threads=True)
+                batch_data = yf.download(
+                    batch_tickers, period="5d", interval="1d",
+                    group_by="ticker", auto_adjust=True, progress=False, threads=True
+                )
                 for ticker in batch_tickers:
                     try:
-                        df = batch if len(batch_tickers)==1 else (batch[ticker] if ticker in batch.columns.get_level_values(0) else None)
-                        if df is not None and len(df) >= 2:
-                            price = float(df["Close"].iloc[-1])
-                            if price != price: continue  # NaN check
-                            prev = float(df["Close"].iloc[-2])
-                            opn = float(df["Open"].iloc[-1])
-                            vol = float(df["Volume"].iloc[-1])
-                            avg_v = float(df["Volume"].mean())
+                        ticker_data = (batch_data if len(batch_tickers) == 1
+                                       else (batch_data[ticker] if ticker in batch_data.columns.get_level_values(0) else None))
+                        if ticker_data is not None and len(ticker_data) >= 2:
+                            close_price = float(ticker_data["Close"].iloc[-1])
+                            if close_price != close_price:
+                                continue  # Skip NaN
+                            previous_close = float(ticker_data["Close"].iloc[-2])
+                            open_price = float(ticker_data["Open"].iloc[-1])
+                            volume = float(ticker_data["Volume"].iloc[-1])
+                            average_volume = float(ticker_data["Volume"].mean())
                             results[ticker] = {
-                                "price": price, "open": opn, "prev": prev,
-                                "high": float(df["High"].iloc[-1]),
-                                "low": float(df["Low"].iloc[-1]),
-                                "volume": vol, "avg_vol": avg_v,
-                                "vol_ratio": vol/max(avg_v,1),
-                                "gap_pct": (opn-prev)/max(prev,0.01)*100,
-                                "source": "yfinance"
+                                "price": close_price,
+                                "open": open_price,
+                                "previous_close": previous_close,
+                                "high": float(ticker_data["High"].iloc[-1]),
+                                "low": float(ticker_data["Low"].iloc[-1]),
+                                "volume": volume,
+                                "average_volume": average_volume,
+                                "volume_ratio": volume / max(average_volume, 1),
+                                "gap_percent": (open_price - previous_close) / max(previous_close, 0.01) * 100,
+                                "day_change_percent": (close_price - previous_close) / max(previous_close, 0.01) * 100,
+                                "source": "yfinance",
                             }
-                    except: pass
-            except Exception as e:
-                log.warning(f"Batch {i}-{i+batch_size} error: {e}")
-            time.sleep(0.5)  # Brief pause between batches
-        log.info(f"yfinance returned {len(results)}/{len(tickers)}")
-    except Exception as e:
-        log.error(f"yfinance error: {e}")
+                    except:
+                        pass
+            except Exception as batch_error:
+                log.warning(f"Batch error at index {batch_start}: {batch_error}")
+            time.sleep(0.3)  # Brief pause between batches to be polite
+        log.info(f"yfinance returned {len(results)}/{len(tickers)} tickers")
+    except Exception as error:
+        log.error(f"yfinance error: {error}")
 
-    # Alpha Vantage fallback for missing
-    missing = [t for t in tickers if t not in results]
-    if missing and AV_KEY:
+    # Alpha Vantage fallback for missing tickers
+    missing_tickers = [t for t in tickers if t not in results]
+    if missing_tickers and ALPHA_VANTAGE_KEY:
         import urllib.request
-        for ticker in missing[:10]:
+        for ticker in missing_tickers[:10]:
             try:
-                url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker}&apikey={AV_KEY}"
-                with urllib.request.urlopen(url, timeout=5) as r:
-                    q = json.loads(r.read()).get("Global Quote", {})
-                if q.get("05. price"):
-                    p = float(q["05. price"]); prev = float(q["08. previous close"])
-                    results[ticker] = {"price":p,"open":p,"prev":prev,"high":p,"low":p,
-                        "volume":0,"avg_vol":1,"vol_ratio":1.0,
-                        "gap_pct":(p-prev)/max(prev,0.01)*100,"source":"alpha_vantage"}
+                url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}"
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    quote = json.loads(response.read()).get("Global Quote", {})
+                if quote.get("05. price"):
+                    price = float(quote["05. price"])
+                    previous = float(quote["08. previous close"])
+                    results[ticker] = {
+                        "price": price, "open": price, "previous_close": previous,
+                        "high": price, "low": price, "volume": 0, "average_volume": 1,
+                        "volume_ratio": 1.0,
+                        "gap_percent": (price - previous) / max(previous, 0.01) * 100,
+                        "day_change_percent": (price - previous) / max(previous, 0.01) * 100,
+                        "source": "alpha_vantage",
+                    }
                 time.sleep(0.5)
-            except: pass
+            except:
+                pass
 
-    # Cache prices
-    conn = get_db()
+    # Cache all fetched prices
+    database = get_database()
     for ticker, data in results.items():
-        conn.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
-                     [f"cache_{ticker}", json.dumps(data)])
-    conn.commit(); conn.close()
+        database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
+                         [f"cache_{ticker}", json.dumps(data)])
+    database.commit()
+    database.close()
     return results
 
-def calc_rsi_batch(tickers, period=14):
-    """Calculate RSI for multiple tickers efficiently"""
-    rsi_map = {}
+def fetch_current_prices(tickers):
+    """Quick price fetch for 5-minute monitoring — returns {ticker: price}."""
+    results = {}
     try:
         import yfinance as yf
-        log.info(f"Calculating RSI for {len(tickers)} tickers...")
-        for i in range(0, len(tickers), 50):
-            batch = tickers[i:i+50]
+        batch_data = yf.download(
+            tickers, period="1d", interval="5m",
+            group_by="ticker", auto_adjust=True, progress=False, threads=True
+        )
+        for ticker in tickers:
             try:
-                data = yf.download(batch, period="60d", interval="1d",
-                                   auto_adjust=True, progress=False, threads=True)
-                for ticker in batch:
+                ticker_data = (batch_data if len(tickers) == 1
+                               else (batch_data[ticker] if ticker in batch_data.columns.get_level_values(0) else None))
+                if ticker_data is not None and len(ticker_data) >= 1:
+                    price = float(ticker_data["Close"].iloc[-1])
+                    if price == price:  # Not NaN
+                        results[ticker] = price
+            except:
+                pass
+    except:
+        pass
+    return results
+
+def calculate_rsi_batch(tickers, period=14):
+    """Calculate RSI for multiple tickers in batches."""
+    rsi_values = {}
+    try:
+        import yfinance as yf
+        for batch_start in range(0, len(tickers), 50):
+            batch_tickers = tickers[batch_start:batch_start + 50]
+            try:
+                data = yf.download(
+                    batch_tickers, period="60d", interval="1d",
+                    auto_adjust=True, progress=False, threads=True
+                )
+                for ticker in batch_tickers:
                     try:
-                        df = data if len(batch)==1 else (data[ticker] if ticker in data.columns.get_level_values(0) else None)
-                        if df is not None and len(df) >= period+1:
-                            delta = df["Close"].diff()
-                            rs = delta.clip(lower=0).rolling(period).mean() / (-delta.clip(upper=0)).rolling(period).mean()
-                            val = float((100 - 100/(1+rs)).iloc[-1])
-                            rsi_map[ticker] = val if val==val else 50.0
+                        ticker_data = (data if len(batch_tickers) == 1
+                                       else (data[ticker] if ticker in data.columns.get_level_values(0) else None))
+                        if ticker_data is not None and len(ticker_data) >= period + 1:
+                            price_changes = ticker_data["Close"].diff()
+                            average_gain = price_changes.clip(lower=0).rolling(period).mean()
+                            average_loss = (-price_changes.clip(upper=0)).rolling(period).mean()
+                            relative_strength = average_gain / average_loss
+                            rsi = float((100 - 100 / (1 + relative_strength)).iloc[-1])
+                            rsi_values[ticker] = rsi if rsi == rsi else 50.0
                         else:
-                            rsi_map[ticker] = 50.0
+                            rsi_values[ticker] = 50.0
                     except:
-                        rsi_map[ticker] = 50.0
-            except: pass
+                        rsi_values[ticker] = 50.0
+            except:
+                pass
             time.sleep(0.3)
-    except: pass
-    # Fill missing with 50
-    for t in tickers:
-        if t not in rsi_map: rsi_map[t] = 50.0
-    log.info(f"RSI calculated for {len(rsi_map)} tickers")
-    return rsi_map
+    except:
+        pass
+    # Fill missing with neutral RSI
+    for ticker in tickers:
+        if ticker not in rsi_values:
+            rsi_values[ticker] = 50.0
+    return rsi_values
 
-def get_earnings_soon(tickers):
-    soon = set()
+def check_upcoming_earnings(tickers):
+    """Identify tickers with earnings announcements in the next 3 days."""
+    earnings_soon = set()
     try:
         import yfinance as yf
-        for t in tickers[:30]:
+        for ticker in tickers[:30]:
             try:
-                cal = yf.Ticker(t).calendar
-                if cal is not None and not cal.empty:
-                    d = cal.iloc[0].get("Earnings Date")
-                    if d and 0 <= (d - datetime.now()).days <= 3: soon.add(t)
-            except: pass
-    except: pass
-    return soon
+                calendar = yf.Ticker(ticker).calendar
+                if calendar is not None and not calendar.empty:
+                    earnings_date = calendar.iloc[0].get("Earnings Date")
+                    if earnings_date and 0 <= (earnings_date - datetime.now()).days <= 3:
+                        earnings_soon.add(ticker)
+            except:
+                pass
+    except:
+        pass
+    return earnings_soon
 
-# ── SCORING ───────────────────────────────────────────────────────────────────
-def score(ticker, pd, rsi, earn_soon, w, direction="long"):
-    rsi = rsi if rsi==rsi else 50.0
-    if direction=="long":
-        rsi_s = 1.0 if 40<=rsi<=65 else (0.9 if rsi<40 else 0.5)
+# ── SCORING ENGINE ────────────────────────────────────────────────────────────
+def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, direction="long"):
+    """
+    Calculate a confidence score (0-96) for a potential trade.
+    Combines RSI, volume, overnight gap, earnings, and sector signals
+    weighted by the brain's current learned weights.
+    """
+    # Guard against NaN values
+    rsi = rsi if rsi == rsi else 50.0
+
+    # RSI signal: different logic for long vs short
+    if direction == "long":
+        rsi_score = 1.0 if 40 <= rsi <= 65 else (0.9 if rsi < 40 else 0.5)
     else:
-        rsi_s = 1.0 if rsi>65 else (0.7 if rsi>55 else 0.4)
-    vr = pd.get("vol_ratio",1.0); vr = vr if vr==vr else 1.0
-    gp = pd.get("gap_pct",0); gp = gp if gp==gp else 0.0
-    gap_s = min(abs(gp)/10.0, 1.0)
-    if direction=="short": gap_s = gap_s if gp<0 else gap_s*0.5
-    sec_s = 0.85 if get_sector(ticker) in ["Tech","Finance","Crypto"] else 0.7
-    raw = (rsi_s*w["rsi_momentum"] + min(vr/3.5,1.0)*w["volume_surge"] +
-           gap_s*w["overnight_gap_prob"] + (0.9 if ticker in earn_soon else 0.6)*w["earnings_catalyst"] +
-           sec_s*w["sector_rotation"])
-    return min(int(raw*115), 96)
+        rsi_score = 1.0 if rsi > 65 else (0.7 if rsi > 55 else 0.4)
 
-def est_move(pd, conf, earn):
-    vr = pd.get("vol_ratio",1); vr = vr if vr==vr else 1.0
-    gp = pd.get("gap_pct",0); gp = gp if gp==gp else 0.0
-    return round(min(4+(conf-60)*0.25+(vr-1)*1.5+(3 if earn else 0)+min(abs(gp)*0.3,3), 25), 1)
+    # Volume surge signal
+    volume_ratio = price_data.get("volume_ratio", 1.0)
+    volume_ratio = volume_ratio if volume_ratio == volume_ratio else 1.0
+    volume_score = min(volume_ratio / 3.5, 1.0)
 
-def sell_time(conf):
-    if conf>=85: return "8:45-9:30 AM"
-    if conf>=75: return "9:30-10:30 AM"
-    if conf>=65: return "10:30-12 PM"
+    # Overnight gap signal
+    gap_percent = price_data.get("gap_percent", 0)
+    gap_percent = gap_percent if gap_percent == gap_percent else 0.0
+    gap_score = min(abs(gap_percent) / 10.0, 1.0)
+    if direction == "short":
+        gap_score = gap_score if gap_percent < 0 else gap_score * 0.5
+
+    # Earnings catalyst signal
+    earnings_score = 0.9 if ticker in earnings_soon else 0.6
+
+    # Sector rotation signal
+    sector_score = 0.85 if get_sector(ticker) in ["Tech", "Finance", "Crypto"] else 0.7
+
+    # Weighted combination
+    raw_score = (
+        rsi_score * weights["rsi_momentum"] +
+        volume_score * weights["volume_surge"] +
+        gap_score * weights["overnight_gap_probability"] +
+        earnings_score * weights["earnings_catalyst"] +
+        sector_score * weights["sector_rotation"]
+    )
+    return min(int(raw_score * 115), 96)
+
+def estimate_overnight_move(price_data, confidence, has_earnings):
+    """Estimate the expected overnight price movement percentage."""
+    volume_ratio = price_data.get("volume_ratio", 1)
+    volume_ratio = volume_ratio if volume_ratio == volume_ratio else 1.0
+    gap_percent = price_data.get("gap_percent", 0)
+    gap_percent = gap_percent if gap_percent == gap_percent else 0.0
+    base_move = 4 + (confidence - 60) * 0.25
+    volume_bonus = (volume_ratio - 1) * 1.5
+    earnings_bonus = 3 if has_earnings else 0
+    gap_boost = min(abs(gap_percent) * 0.3, 3)
+    return round(min(base_move + volume_bonus + earnings_bonus + gap_boost, 25), 1)
+
+def predict_sell_time_window(confidence):
+    """Predict the optimal sell window based on confidence level."""
+    if confidence >= 85: return "8:45-9:30 AM"
+    if confidence >= 75: return "9:30-10:30 AM"
+    if confidence >= 65: return "10:30-12 PM"
     return "12-1:30 PM"
 
-def reasoning(ticker, pd, rsi, earn, direction):
-    p = []
-    if direction=="long":
-        p.append(f"RSI {rsi:.0f} oversold" if rsi<45 else (f"RSI {rsi:.0f} momentum" if rsi>60 else f"RSI {rsi:.0f} neutral"))
+def build_reasoning_text(ticker, price_data, rsi, has_earnings, direction):
+    """Build a human-readable reasoning string for a recommendation."""
+    parts = []
+    if direction == "long":
+        if rsi < 45: parts.append(f"RSI {rsi:.0f} oversold")
+        elif rsi > 60: parts.append(f"RSI {rsi:.0f} momentum")
+        else: parts.append(f"RSI {rsi:.0f} neutral")
     else:
-        p.append(f"RSI {rsi:.0f} overbought" if rsi>65 else f"RSI {rsi:.0f} weakening")
-    vr = pd.get("vol_ratio",1)
-    if vr>1.8: p.append(f"{vr:.1f}x vol")
-    gp = pd.get("gap_pct",0)
-    if abs(gp)>2: p.append(f"{gp:+.1f}% gap")
-    if earn: p.append("earnings catalyst")
-    return " . ".join(p[:3])
+        parts.append(f"RSI {rsi:.0f} overbought" if rsi > 65 else f"RSI {rsi:.0f} weakening")
+    volume_ratio = price_data.get("volume_ratio", 1)
+    if volume_ratio > 1.8:
+        parts.append(f"{volume_ratio:.1f}x volume")
+    gap = price_data.get("gap_percent", 0)
+    if abs(gap) > 2:
+        parts.append(f"{gap:+.1f}% gap")
+    if has_earnings:
+        parts.append("earnings catalyst")
+    return " · ".join(parts[:3])
 
-# ── GENERATE PICKS (with caching) ─────────────────────────────────────────────
-def generate_picks(weights=None, scan_type="scheduled"):
-    if weights is None: weights = get_weights()
-    universe = build_universe()
-    log.info(f"Generating picks from {len(universe)} tickers (scan: {scan_type})...")
+# ── DYNAMIC SELL ENGINE ───────────────────────────────────────────────────────
+def evaluate_sell_decision(trade, current_price, rsi=None, volume_ratio=None):
+    """
+    Evaluate whether to sell an open position based on current market data.
+    
+    Returns: (should_sell: bool, reason: str, sentiment: str)
+    
+    The sell engine balances two competing goals:
+    1. Let winners ride (don't sell too early if momentum is strong)
+    2. Cut losers (don't hold a losing position hoping for reversal)
+    
+    The 2:45 PM CST deadline is absolute — everything closes by then.
+    """
+    buy_price = trade["buy_price"]
+    pnl_percent = (current_price - buy_price) / buy_price * 100
 
-    prices = fetch_prices(universe)
-    rsi_map = calc_rsi_batch(list(prices.keys()))
-    earn_soon = get_earnings_soon(list(prices.keys()))
+    # For short positions, invert the P&L logic
+    if trade["direction"] == "short":
+        pnl_percent = -pnl_percent
 
-    scored = []
+    remaining_minutes = minutes_until_forced_close()
+
+    # ── FORCED CLOSE — Non-negotiable deadline ──
+    if remaining_minutes <= 0:
+        return True, "forced_close", f"Force-closed at 2:45 PM — {pnl_percent:+.1f}%"
+
+    # ── TARGET HIT — Take profits on strong moves ──
+    if pnl_percent >= 8:
+        return True, "target_hit", f"Sold — target hit at {pnl_percent:+.1f}%"
+
+    # ── STOP LOSS — Cut losses on strong reversals ──
+    if pnl_percent <= -5:
+        return True, "stop_loss", f"Exiting — reversal at {pnl_percent:+.1f}%"
+
+    # ── MOMENTUM FADE — Small gain but volume dying ──
+    if pnl_percent >= 2 and pnl_percent < 5 and volume_ratio and volume_ratio < 0.6:
+        return True, "momentum_fade", f"Exiting — volume fading at {pnl_percent:+.1f}%"
+
+    # ── RSI EXHAUSTION — Momentum peaked for longs ──
+    if trade["direction"] == "long" and rsi and rsi > 80 and pnl_percent > 3:
+        return True, "rsi_exhaustion", f"Exiting — RSI {rsi:.0f} exhausted at {pnl_percent:+.1f}%"
+
+    # ── TIME PRESSURE — Clock running out, take what you have ──
+    if remaining_minutes < 30 and pnl_percent > 0.5:
+        return True, "time_pressure", f"Closing — {remaining_minutes}min left at {pnl_percent:+.1f}%"
+
+    # ── HOLD — Various sentiments based on current P&L ──
+    if pnl_percent >= 5:
+        sentiment = f"Holding — on track at {pnl_percent:+.1f}%"
+    elif pnl_percent >= 2:
+        sentiment = f"Holding — momentum intact at {pnl_percent:+.1f}%"
+    elif pnl_percent >= 0:
+        sentiment = f"Holding — watching at {pnl_percent:+.1f}%"
+    else:
+        sentiment = f"Holding — down {pnl_percent:+.1f}%, watching for reversal"
+
+    return False, "hold", sentiment
+
+# ── COMPREHENSIVE SCAN — Generate Picks ───────────────────────────────────────
+def run_comprehensive_scan(weights=None, scan_type="scheduled"):
+    """
+    Run a full scan of the entire ticker universe.
+    Scores every stock, filters by confidence floor, caches results.
+    Only stocks at or above CONFIDENCE_FLOOR (65%) are recommended.
+    """
+    if weights is None:
+        weights = get_signal_weights()
+    universe = build_ticker_universe()
+    log.info(f"Comprehensive scan: {len(universe)} tickers ({scan_type})...")
+
+    price_data = fetch_price_data(universe)
+    rsi_values = calculate_rsi_batch(list(price_data.keys()))
+    earnings_soon = check_upcoming_earnings(list(price_data.keys()))
+
+    # Prevent simultaneous long and short on the same ticker
+    database = get_database()
+    open_trades = database.execute(
+        "SELECT ticker, direction FROM virtual_trades WHERE outcome='open'"
+    ).fetchall()
+    database.close()
+    open_long_tickers = set(t["ticker"] for t in open_trades if t["direction"] == "long")
+    open_short_tickers = set(t["ticker"] for t in open_trades if t["direction"] == "short")
+
+    scored_stocks = []
     for ticker in universe:
-        if ticker not in prices: continue
-        pd = prices[ticker]
-        rsi = rsi_map.get(ticker, 50.0)
-        lc = score(ticker, pd, rsi, earn_soon, weights, "long")
-        sc = score(ticker, pd, rsi, earn_soon, weights, "short")
-        lm = est_move(pd, lc, ticker in earn_soon)
-        sm = est_move(pd, sc, ticker in earn_soon)
-        scored.append({
-            "ticker":ticker, "name":ticker, "sector":get_sector(ticker),
-            "price":pd["price"], "open_price":pd.get("open",pd["price"]),
-            "prev_close":pd.get("prev",pd["price"]), "rsi":round(rsi,1),
-            "vol_ratio":round(pd.get("vol_ratio",1),2),
-            "overnight_gap_pct":round(pd.get("gap_pct",0),2),
-            "earnings_soon":ticker in earn_soon,
-            "long_conf":lc, "long_move":lm,
-            "long_reasoning":reasoning(ticker,pd,rsi,ticker in earn_soon,"long"),
-            "short_conf":sc, "short_move":sm,
-            "short_reasoning":reasoning(ticker,pd,rsi,ticker in earn_soon,"short"),
-            "sell_time":sell_time(lc), "data_source":pd.get("source","unknown"),
+        if ticker not in price_data:
+            continue
+        stock_data = price_data[ticker]
+        rsi = rsi_values.get(ticker, 50.0)
+        has_earnings = ticker in earnings_soon
+
+        long_confidence = calculate_confidence_score(ticker, stock_data, rsi, earnings_soon, weights, "long")
+        short_confidence = calculate_confidence_score(ticker, stock_data, rsi, earnings_soon, weights, "short")
+        long_move = estimate_overnight_move(stock_data, long_confidence, has_earnings)
+        short_move = estimate_overnight_move(stock_data, short_confidence, has_earnings)
+
+        scored_stocks.append({
+            "ticker": ticker,
+            "name": ticker,
+            "sector": get_sector(ticker),
+            "price": stock_data["price"],
+            "open_price": stock_data.get("open", stock_data["price"]),
+            "prev_close": stock_data.get("previous_close", stock_data["price"]),
+            "rsi": round(rsi, 1),
+            "vol_ratio": round(stock_data.get("volume_ratio", 1), 2),
+            "overnight_gap_pct": round(stock_data.get("gap_percent", 0), 2),
+            "day_change_pct": round(stock_data.get("day_change_percent", 0), 2),
+            "earnings_soon": has_earnings,
+            "long_conf": long_confidence,
+            "long_move": long_move,
+            "long_reasoning": build_reasoning_text(ticker, stock_data, rsi, has_earnings, "long"),
+            "short_conf": short_confidence,
+            "short_move": short_move,
+            "short_reasoning": build_reasoning_text(ticker, stock_data, rsi, has_earnings, "short"),
+            "sell_time": predict_sell_time_window(long_confidence),
+            "data_source": stock_data.get("source", "unknown"),
         })
 
-    longs  = sorted([s for s in scored if s["long_move"]>=MIN_MOVE], key=lambda x:x["long_conf"], reverse=True)
-    shorts = sorted([s for s in scored if s["short_move"]>=MIN_MOVE], key=lambda x:x["short_conf"], reverse=True)
+    # Filter by confidence floor and prevent conflicting directions
+    recommended_longs = sorted(
+        [s for s in scored_stocks
+         if s["long_conf"] >= CONFIDENCE_FLOOR
+         and s["long_move"] >= MIN_EXPECTED_MOVE
+         and s["ticker"] not in open_short_tickers],
+        key=lambda x: x["long_conf"], reverse=True
+    )
+    recommended_shorts = sorted(
+        [s for s in scored_stocks
+         if s["short_conf"] >= CONFIDENCE_FLOOR
+         and s["short_move"] >= MIN_EXPECTED_MOVE
+         and s["ticker"] not in open_long_tickers],
+        key=lambda x: x["short_conf"], reverse=True
+    )
 
-    result = {
-        "longs": longs[:MAX_PICKS],
-        "shorts": shorts[:10],
-        "all_longs": len(longs),
-        "all_shorts": len(shorts),
-        "total_scanned": len(scored),
-        "generated_at": datetime.now().isoformat(),
+    scan_result = {
+        "longs": recommended_longs[:MAX_LONG_PICKS],
+        "shorts": recommended_shorts[:MAX_SHORT_PICKS],
+        "all_longs": len(recommended_longs),
+        "all_shorts": len(recommended_shorts),
+        "total_scanned": len(scored_stocks),
+        "generated_at": current_time_cst().isoformat(),
         "scan_type": scan_type,
     }
 
-    # Cache the picks
-    conn = get_db()
-    conn.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_picks', ?)", [json.dumps(result)])
-    conn.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_picks_time', ?)", [datetime.now().isoformat()])
+    # Cache picks and log scan
+    database = get_database()
+    database.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_picks',?)", [json.dumps(scan_result)])
+    database.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_picks_time',?)", [current_time_cst().isoformat()])
+    database.execute(
+        "INSERT INTO scan_cache (scan_time, scan_type, ticker_count, picks_json) VALUES (?,?,?,?)",
+        [current_time_cst().isoformat(), scan_type, len(scored_stocks), json.dumps(scan_result)]
+    )
 
-    # Save to scan_cache for historical analysis
-    conn.execute("INSERT INTO scan_cache (scan_time,scan_type,ticker_count,picks_json) VALUES (?,?,?,?)",
-                 [datetime.now().isoformat(), scan_type, len(scored), json.dumps(result)])
+    # Update candidates table (for 5-min monitoring)
+    database.execute("UPDATE candidates SET monitoring = 0 WHERE monitoring = 1")
+    all_recommended = recommended_longs[:MAX_LONG_PICKS] + recommended_shorts[:MAX_SHORT_PICKS]
+    for pick in all_recommended:
+        direction = "long" if pick in recommended_longs[:MAX_LONG_PICKS] else "short"
+        database.execute("""
+            INSERT OR REPLACE INTO candidates (ticker, direction, first_seen, last_seen, confidence, expected_move, monitoring)
+            VALUES (?, ?, COALESCE((SELECT first_seen FROM candidates WHERE ticker=?), ?), ?, ?, 1)
+        """, [pick["ticker"], direction, pick["ticker"],
+              current_time_cst().isoformat(), current_time_cst().isoformat(),
+              pick["long_conf"] if direction == "long" else pick["short_conf"],
+              pick["long_move"] if direction == "long" else pick["short_move"]])
 
-    # Log predictions & virtual trades
-    today = datetime.now().strftime("%Y-%m-%d")
-    is_friday = datetime.now().weekday() == 4
+    # Log predictions (only for 65%+ confidence)
+    today = current_time_cst().strftime("%Y-%m-%d")
+    for pick in all_recommended:
+        direction = "long" if pick in recommended_longs[:MAX_LONG_PICKS] else "short"
+        confidence = pick["long_conf"] if direction == "long" else pick["short_conf"]
+        expected_move = pick["long_move"] if direction == "long" else pick["short_move"]
+        reasoning = pick["long_reasoning"] if direction == "long" else pick["short_reasoning"]
+        prediction_id = f"{pick['ticker']}_{today}_{direction}"
 
-    for i, pick in enumerate(longs[:MAX_PICKS] + shorts[:10]):
-        dir_ = "long" if i < MAX_PICKS else "short"
-        conf = pick["long_conf"] if dir_=="long" else pick["short_conf"]
-        move = pick["long_move"] if dir_=="long" else pick["short_move"]
-        rsn  = pick["long_reasoning"] if dir_=="long" else pick["short_reasoning"]
-        pid  = f"{pick['ticker']}_{today}_{dir_}"
-        if not conn.execute("SELECT id FROM predictions WHERE id=?", [pid]).fetchone():
-            conn.execute("INSERT INTO predictions (id,ticker,name,date,direction,conf,expected_move,entry_price,sell_time,reasoning,sector,rsi,vol_ratio,weights_snapshot,logged_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                [pid,pick["ticker"],pick["name"],today,dir_,conf,move,pick["price"],
-                 pick["sell_time"],rsn,pick["sector"],pick["rsi"],pick["vol_ratio"],
-                 json.dumps(weights),datetime.now().isoformat()])
-        buy_p = pick.get("open_price", pick["price"])
-        vtid = f"{pick['ticker']}_{today}_{dir_}_vt"
-        if not conn.execute("SELECT id FROM virtual_trades WHERE id=?", [vtid]).fetchone():
-            conn.execute("INSERT INTO virtual_trades (id,ticker,direction,buy_date,buy_time,buy_price,invested,conf,expected_move,outcome,sector,reasoning,weekend_hold) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                [vtid,pick["ticker"],dir_,today,"09:30:00",buy_p,
-                 INVEST_PER_PICK,conf,move,"open",pick["sector"],rsn,
-                 1 if is_friday else 0])
-        else:
-            conn.execute("UPDATE virtual_trades SET buy_price=?,buy_time='09:30:00' WHERE id=? AND buy_time!='09:30:00'",
-                         [buy_p, vtid])
+        if not database.execute("SELECT id FROM predictions WHERE id=?", [prediction_id]).fetchone():
+            database.execute("""
+                INSERT INTO predictions (id, ticker, name, date, direction, confidence,
+                expected_move, entry_price, sell_time_window, reasoning, sector, rsi,
+                volume_ratio, weights_snapshot, logged_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, [prediction_id, pick["ticker"], pick["name"], today, direction,
+                  confidence, expected_move, pick["price"], pick["sell_time"],
+                  reasoning, pick["sector"], pick["rsi"], pick["vol_ratio"],
+                  json.dumps(weights), current_time_cst().isoformat()])
 
-    conn.commit(); conn.close()
-    log.info(f"Picks generated: {len(longs)} longs, {len(shorts)} shorts from {len(scored)} scanned")
-    return result
+    database.commit()
+    database.close()
+    log.info(f"Scan complete: {len(recommended_longs)} longs, {len(recommended_shorts)} shorts from {len(scored_stocks)} scanned")
+    return scan_result
 
 def get_cached_picks():
-    """Return cached picks instantly — no yfinance calls"""
-    conn = get_db()
-    cached = conn.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
-    cache_time = conn.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
-    conn.close()
+    """Return cached picks instantly without triggering a new scan."""
+    database = get_database()
+    cached = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
+    cache_time = database.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
+    database.close()
     if cached:
         result = json.loads(cached["value"])
         result["cached"] = True
@@ -491,252 +938,650 @@ def get_cached_picks():
         return result
     return None
 
-# ── SCORE YESTERDAY ───────────────────────────────────────────────────────────
-def score_yesterday():
-    yesterday = (datetime.now()-timedelta(days=1)).strftime("%Y-%m-%d")
-    conn = get_db()
-    trades = conn.execute("SELECT * FROM virtual_trades WHERE buy_date=? AND outcome='open'", [yesterday]).fetchall()
-    conn.close()
-    if not trades: log.info("No open trades to score"); return
-    tickers = list(set(t["ticker"] for t in trades))
-    prices = fetch_prices(tickers)
-    conn = get_db(); n=0
-    for t in trades:
-        if t["ticker"] not in prices: continue
-        cur = prices[t["ticker"]]["price"]
-        pct = (cur-t["buy_price"])/t["buy_price"]*100
-        pnl = t["invested"]*(pct/100)
-        if t["direction"]=="long":
-            outcome = "hit" if pct>=MIN_MOVE else ("partial" if pct>0 else "miss")
-        else:
-            outcome = "hit" if pct<=-MIN_MOVE else ("partial" if pct<0 else "miss")
-        conn.execute("UPDATE virtual_trades SET sell_date=?,sell_price=?,current_value=?,actual_move=?,gross_pnl=?,net_pnl=?,outcome=?,sell_time=?,sell_reason=? WHERE id=?",
-            [datetime.now().strftime("%Y-%m-%d"),cur,t["invested"]+pnl,round(pct,2),
-             round(pnl,4),round(pnl-FEE_PER_TRADE,4),outcome,
-             datetime.now().strftime("%H:%M:%S"),"end_of_day",t["id"]])
-        conn.execute("UPDATE predictions SET outcome=?,actual_move=?,resolved_at=? WHERE id=?",
-            [outcome,round(pct,2),datetime.now().isoformat(),
-             f"{t['ticker']}_{yesterday}_{t['direction']}"])
-        n+=1
-    conn.commit(); conn.close(); log.info(f"Scored {n} trades")
+# ── POSITION LIFECYCLE ────────────────────────────────────────────────────────
+def execute_opening_positions():
+    """
+    Execute at 8:45 AM CST: Convert committed picks into open positions.
+    
+    Each position's invested amount is drawn from the trade queue (FIFO).
+    If the queue is empty, falls back to DEFAULT_INVESTMENT ($10.00).
+    
+    Queue amounts are assigned to picks in randomized order to avoid
+    systematic bias when multiple positions open simultaneously.
+    """
+    today = current_time_cst().strftime("%Y-%m-%d")
+    database = get_database()
+    cached = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
+    database.close()
 
-# ── AUDIT ─────────────────────────────────────────────────────────────────────
-def run_audit():
-    log.info("Running audit...")
-    conn = get_db()
-    preds = [dict(p) for p in conn.execute("SELECT * FROM predictions WHERE outcome!='pending' ORDER BY date DESC LIMIT 200").fetchall()]
-    total = conn.execute("SELECT COUNT(*) as n FROM predictions").fetchone()["n"]
-    conn.close()
-    hits   = [p for p in preds if p["outcome"]=="hit"]
-    misses = [p for p in preds if p["outcome"]=="miss"]
-    wr     = len(hits)/len(preds) if preds else None
-    w      = get_weights()
+    if not cached:
+        log.info("No cached picks to execute")
+        return
+
+    picks = json.loads(cached["value"])
+    is_friday = current_time_cst().weekday() == 4
+
+    all_picks = (picks.get("longs", [])[:MAX_LONG_PICKS]) + (picks.get("shorts", [])[:MAX_SHORT_PICKS])
+
+    # Fetch current prices at execution time (8:45 AM)
+    tickers = [pick["ticker"] for pick in all_picks]
+    current_prices = fetch_current_prices(tickers)
+
+    # Randomize order to avoid systematic bias in queue assignment
+    indexed_picks = list(enumerate(all_picks))
+    random.shuffle(indexed_picks)
+
+    opened_count = 0
+    for original_index, pick in indexed_picks:
+        direction = "long" if original_index < MAX_LONG_PICKS else "short"
+        ticker = pick["ticker"]
+        buy_price = current_prices.get(ticker, pick.get("open_price", pick["price"]))
+        confidence = pick["long_conf"] if direction == "long" else pick["short_conf"]
+        expected_move = pick["long_move"] if direction == "long" else pick["short_move"]
+        reasoning = pick.get("long_reasoning", "") if direction == "long" else pick.get("short_reasoning", "")
+
+        # Draw investment amount from queue
+        queue_id, invested_amount = get_next_queue_amount()
+
+        trade_id = f"{ticker}_{today}_{direction}_vt"
+        existing = database if False else get_database()  # Fresh connection
+        if existing.execute("SELECT id FROM virtual_trades WHERE id=?", [trade_id]).fetchone():
+            existing.close()
+            continue
+
+        existing.execute("""
+            INSERT INTO virtual_trades
+            (id, ticker, direction, buy_date, buy_time, buy_price, invested_amount,
+             confidence, expected_move, outcome, sector, reasoning, weekend_hold,
+             status, current_value, intraday_high_pct, intraday_low_pct, queue_position)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, [trade_id, ticker, direction, today, "08:45:00", buy_price,
+              round(invested_amount, 4), confidence, expected_move, "open",
+              get_sector(ticker), reasoning, 1 if is_friday else 0,
+              "open", round(invested_amount, 4), 0.0, 0.0, queue_id])
+        existing.commit()
+        existing.close()
+
+        # Mark queue amount as consumed
+        consume_queue_amount(queue_id, trade_id)
+        opened_count += 1
+
+    log.info(f"Opened {opened_count} positions at 8:45 AM CST")
+
+def monitor_open_positions():
+    """
+    5-minute monitoring cycle for candidates and open positions.
+    
+    For open positions on their sell day (bought previous session):
+    - Evaluates sell decision using the dynamic sell engine
+    - Logs position check for intraday chart data
+    - Executes sell if engine decides to exit
+    
+    For open positions on their buy day (bought today):
+    - Only logs price data for chart tracking (no sell decisions)
+    
+    For candidates (not yet traded):
+    - Tracks price movement for brain learning
+    """
+    database = get_database()
+    open_positions = [dict(t) for t in database.execute(
+        "SELECT * FROM virtual_trades WHERE outcome='open'"
+    ).fetchall()]
+    monitored_candidates = [dict(c) for c in database.execute(
+        "SELECT * FROM candidates WHERE monitoring = 1"
+    ).fetchall()]
+    database.close()
+
+    if not open_positions and not monitored_candidates:
+        return
+
+    # Combine all tickers that need price checks
+    all_tickers = list(set(
+        [position["ticker"] for position in open_positions] +
+        [candidate["ticker"] for candidate in monitored_candidates]
+    ))
+
+    if not all_tickers:
+        return
+
+    current_prices = fetch_current_prices(all_tickers)
+    now = current_time_cst()
+    today = now.strftime("%Y-%m-%d")
+    database = get_database()
+
+    for position in open_positions:
+        ticker = position["ticker"]
+        if ticker not in current_prices:
+            continue
+
+        price = current_prices[ticker]
+        buy_price = position["buy_price"]
+        invested = position["invested_amount"] or DEFAULT_INVESTMENT
+        pnl_percent = (price - buy_price) / buy_price * 100
+        if position["direction"] == "short":
+            pnl_percent = -pnl_percent
+        pnl_dollars = invested * (pnl_percent / 100)
+
+        # Update current value and intraday extremes
+        current_value = invested + pnl_dollars
+        high_pct = max(position.get("intraday_high_pct") or 0, pnl_percent)
+        low_pct = min(position.get("intraday_low_pct") or 0, pnl_percent)
+
+        database.execute("""
+            UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?
+            WHERE id=?
+        """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2), position["id"]])
+
+        # Determine if this is the sell day (position was opened before today)
+        is_sell_day = position["buy_date"] < today
+
+        if is_sell_day and now.hour >= 8 and now.hour < 15:
+            # Evaluate sell decision
+            should_sell, reason, sentiment = evaluate_sell_decision(position, price)
+
+            database.execute("""
+                INSERT INTO position_checks (position_id, check_time, price, pnl_percent, sentiment, ticker)
+                VALUES (?,?,?,?,?,?)
+            """, [position["id"], now.isoformat(), price, round(pnl_percent, 2), sentiment, ticker])
+
+            if should_sell:
+                net_pnl = pnl_dollars - FEE_PER_TRADE
+                outcome = "hit" if pnl_percent >= MIN_EXPECTED_MOVE else ("partial" if pnl_percent > 0 else "miss")
+
+                database.execute("""
+                    UPDATE virtual_trades SET
+                        sell_date=?, sell_time=?, sell_price=?, current_value=?,
+                        actual_move=?, gross_pnl=?, net_pnl=?, outcome=?, sell_reason=?
+                    WHERE id=?
+                """, [today, now.strftime("%H:%M:%S"), price,
+                      round(current_value, 4), round(pnl_percent, 2),
+                      round(pnl_dollars, 4), round(net_pnl, 4),
+                      outcome, reason, position["id"]])
+
+                # Update corresponding prediction
+                database.execute("""
+                    UPDATE predictions SET outcome=?, actual_move=?, resolved_at=?
+                    WHERE id=?
+                """, [outcome, round(pnl_percent, 2), now.isoformat(),
+                      f"{ticker}_{position['buy_date']}_{position['direction']}"])
+
+                # Add ending value to trade queue for compounding
+                add_to_queue(current_value, position["id"])
+
+                log.info(f"CLOSED {ticker} {position['direction']} | {reason} | {pnl_percent:+.1f}% | ${pnl_dollars:+.2f}")
+        else:
+            # Not sell day — just log for chart data
+            database.execute("""
+                INSERT INTO position_checks (position_id, check_time, price, pnl_percent, sentiment, ticker)
+                VALUES (?,?,?,?,?,?)
+            """, [position["id"], now.isoformat(), price, round(pnl_percent, 2), "monitoring", ticker])
+
+    database.commit()
+    database.close()
+    log.info(f"Monitored {len(open_positions)} positions + {len(monitored_candidates)} candidates")
+
+def force_close_previous_session():
+    """
+    Force-close all positions from the previous trading session.
+    Called at 2:45 PM CST — this is a non-negotiable deadline.
+    
+    All remaining open positions are sold at current market price.
+    Their ending values are added to the trade queue for compounding.
+    Order is randomized to avoid alphabetical bias.
+    """
+    now = current_time_cst()
+    today = now.strftime("%Y-%m-%d")
+    database = get_database()
+    previous_session_positions = [dict(t) for t in database.execute(
+        "SELECT * FROM virtual_trades WHERE outcome='open' AND buy_date < ?", [today]
+    ).fetchall()]
+    database.close()
+
+    if not previous_session_positions:
+        log.info("No positions to force-close")
+        return
+
+    tickers = list(set(position["ticker"] for position in previous_session_positions))
+    current_prices = fetch_current_prices(tickers)
+
+    # Randomize close order to avoid systematic bias in queue ordering
+    random.shuffle(previous_session_positions)
+
+    database = get_database()
+    closed_count = 0
+
+    for position in previous_session_positions:
+        ticker = position["ticker"]
+        price = current_prices.get(ticker, position.get("buy_price", 0))
+        buy_price = position["buy_price"]
+        invested = position["invested_amount"] or DEFAULT_INVESTMENT
+        pnl_percent = (price - buy_price) / buy_price * 100
+        if position["direction"] == "short":
+            pnl_percent = -pnl_percent
+        pnl_dollars = invested * (pnl_percent / 100)
+        net_pnl = pnl_dollars - FEE_PER_TRADE
+        ending_value = invested + pnl_dollars
+        outcome = "hit" if pnl_percent >= MIN_EXPECTED_MOVE else ("partial" if pnl_percent > 0 else "miss")
+
+        database.execute("""
+            UPDATE virtual_trades SET
+                sell_date=?, sell_time=?, sell_price=?, current_value=?,
+                actual_move=?, gross_pnl=?, net_pnl=?, outcome=?, sell_reason=?
+            WHERE id=?
+        """, [today, "14:45:00", price, round(ending_value, 4),
+              round(pnl_percent, 2), round(pnl_dollars, 4), round(net_pnl, 4),
+              outcome, "forced_close", position["id"]])
+
+        database.execute("""
+            UPDATE predictions SET outcome=?, actual_move=?, resolved_at=?
+            WHERE id=?
+        """, [outcome, round(pnl_percent, 2), now.isoformat(),
+              f"{ticker}_{position['buy_date']}_{position['direction']}"])
+
+        # Add ending value to queue — this is where compounding happens
+        add_to_queue(ending_value, position["id"])
+        closed_count += 1
+
+    database.commit()
+    database.close()
+    log.info(f"Force-closed {closed_count} positions at 2:45 PM CST")
+
+# ── SELF-AUDIT ENGINE ─────────────────────────────────────────────────────────
+def run_self_audit():
+    """Call Claude API to analyze prediction history and update signal weights."""
+    log.info("Running self-audit...")
+    database = get_database()
+    resolved_predictions = [dict(p) for p in database.execute(
+        "SELECT * FROM predictions WHERE outcome != 'pending' ORDER BY date DESC LIMIT 200"
+    ).fetchall()]
+    total_predictions = database.execute("SELECT COUNT(*) as n FROM predictions").fetchone()["n"]
+    database.close()
+
+    hit_predictions = [p for p in resolved_predictions if p["outcome"] == "hit"]
+    miss_predictions = [p for p in resolved_predictions if p["outcome"] == "miss"]
+    win_rate = len(hit_predictions) / len(resolved_predictions) if resolved_predictions else None
+    current_weights = get_signal_weights()
+
     try:
         import anthropic
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        resp = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=800, messages=[{"role":"user","content":
-            f"Self-audit for overnight swing trading. Analyze and return updated weights.\nWEIGHTS:{json.dumps(w)}\nDATA:{json.dumps({'total':total,'resolved':len(preds),'hits':len(hits),'misses':len(misses),'win_rate':wr})}\nRules:sum=1.0,each 0.05-0.45. ONLY JSON:{{'weights':{{...}},'reasoning':['...'],'summary':'...','confidence':'low|medium|high'}}"
-        }])
-        result = json.loads(resp.content[0].text.replace("```json","").replace("```","").strip())
-        nw = result["weights"]
-        s = sum(nw.values())
-        if 0.85<s<1.15:
-            nw = {k:round(v/s,4) for k,v in nw.items()}
-            save_weights(nw)
-        else: nw = w
-        conn = get_db()
-        conn.execute("INSERT INTO audit_log (timestamp,weights_before,weights_after,reasoning,summary,total_predictions,resolved,hits,misses,win_rate) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            [datetime.now().isoformat(),json.dumps(w),json.dumps(nw),json.dumps(result.get("reasoning",[])),result.get("summary",""),total,len(preds),len(hits),len(misses),wr])
-        conn.execute("INSERT OR REPLACE INTO app_state VALUES ('last_audit',?)", [datetime.now().isoformat()])
-        conn.commit(); conn.close()
-        return {"success":True,"weights":nw,"reasoning":result.get("reasoning",[]),"summary":result.get("summary",""),"confidence":result.get("confidence","medium")}
-    except Exception as e:
-        log.error(f"Audit error: {e}"); return {"success":False,"error":str(e)}
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514", max_tokens=800,
+            messages=[{"role": "user", "content":
+                f"Self-audit for overnight swing trading brain. Analyze and return updated weights.\n"
+                f"CURRENT WEIGHTS: {json.dumps(current_weights)}\n"
+                f"PERFORMANCE: {json.dumps({'total': total_predictions, 'resolved': len(resolved_predictions), 'hits': len(hit_predictions), 'misses': len(miss_predictions), 'win_rate': win_rate})}\n"
+                f"Rules: weights must sum to 1.0, each between 0.05-0.45.\n"
+                f"Respond ONLY with valid JSON: {{\"weights\":{{...}},\"reasoning\":[\"...\"],\"summary\":\"...\",\"confidence\":\"low|medium|high\"}}"
+            }]
+        )
+        result = json.loads(response.content[0].text.replace("```json", "").replace("```", "").strip())
+        new_weights = result["weights"]
+        weight_sum = sum(new_weights.values())
+        if 0.85 < weight_sum < 1.15:
+            new_weights = {k: round(v / weight_sum, 4) for k, v in new_weights.items()}
+            save_signal_weights(new_weights)
+        else:
+            new_weights = current_weights
+
+        database = get_database()
+        database.execute("""
+            INSERT INTO audit_log (timestamp, weights_before, weights_after, reasoning, summary,
+            total_predictions, resolved_count, hit_count, miss_count, win_rate)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, [current_time_cst().isoformat(), json.dumps(current_weights), json.dumps(new_weights),
+              json.dumps(result.get("reasoning", [])), result.get("summary", ""),
+              total_predictions, len(resolved_predictions), len(hit_predictions),
+              len(miss_predictions), win_rate])
+        database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_audit',?)",
+                         [current_time_cst().isoformat()])
+        database.commit()
+        database.close()
+        return {"success": True, "weights": new_weights,
+                "reasoning": result.get("reasoning", []),
+                "summary": result.get("summary", ""),
+                "confidence": result.get("confidence", "medium")}
+    except Exception as error:
+        log.error(f"Audit error: {error}")
+        return {"success": False, "error": str(error)}
 
 # ── SCHEDULER ─────────────────────────────────────────────────────────────────
-def scheduler():
+def run_scheduler():
+    """
+    Background scheduler for all automated tasks.
+    
+    All times are specified in UTC (CST + 5 hours).
+    
+    Comprehensive scans run every 30 minutes during pre-market and post-market.
+    5-minute monitoring runs continuously during active hours (4 AM - 7 PM CST).
+    """
     import schedule
-    w = get_weights
 
-    # Post-market scans (CST = UTC-5 during CDT, but Railway runs UTC)
-    # We'll use UTC times: CST+5 = UTC
-    # 4 PM CST = 21:00 UTC, 5 PM = 22:00, 6 PM = 23:00
-    schedule.every().day.at("21:00").do(lambda: generate_picks(scan_type="post_market_1"))
-    schedule.every().day.at("22:00").do(lambda: generate_picks(scan_type="post_market_2"))
-    schedule.every().day.at("23:00").do(lambda: generate_picks(scan_type="post_market_3"))
+    # ── Pre-market comprehensive scans (every 30 min, 4:00-8:00 AM CST) ──
+    # CST + 5 = UTC
+    for hour_utc, label in [(9,"4:00am"),(9.5,"4:30am"),(10,"5:00am"),(10.5,"5:30am"),
+                             (11,"6:00am"),(11.5,"6:30am"),(12,"7:00am"),(12.5,"7:30am"),
+                             (13,"8:00am")]:
+        hour = int(hour_utc)
+        minute = int((hour_utc % 1) * 60)
+        time_str = f"{hour:02d}:{minute:02d}"
+        scan_label = f"pre_market_{label}"
+        schedule.every().day.at(time_str).do(lambda st=scan_label: run_comprehensive_scan(scan_type=st))
 
-    # Pre-market scans
-    # 4 AM CST = 09:00 UTC, 5 AM = 10:00, ... 9 AM = 14:00
-    schedule.every().day.at("09:00").do(lambda: generate_picks(scan_type="pre_market_1"))
-    schedule.every().day.at("10:00").do(lambda: generate_picks(scan_type="pre_market_2"))
-    schedule.every().day.at("11:00").do(lambda: generate_picks(scan_type="pre_market_3"))
-    schedule.every().day.at("12:00").do(lambda: generate_picks(scan_type="pre_market_4"))
-    schedule.every().day.at("13:00").do(lambda: generate_picks(scan_type="pre_market_5"))
-    schedule.every().day.at("14:00").do(lambda: generate_picks(scan_type="final_scan"))
+    # 8:15 AM CST = 13:15 UTC — Final scan, picks locked
+    schedule.every().day.at("13:15").do(lambda: run_comprehensive_scan(scan_type="final_scan"))
 
-    # Score yesterday's trades at 8:30 AM CST = 13:30 UTC
-    schedule.every().day.at("13:30").do(score_yesterday)
+    # 8:45 AM CST = 13:45 UTC — Execute positions at market open + 15 min
+    schedule.every().day.at("13:45").do(execute_opening_positions)
 
-    # Audit at 8:45 AM CST = 13:45 UTC (before final scan)
-    schedule.every().day.at("13:45").do(run_audit)
+    # 2:45 PM CST = 19:45 UTC — Force-close previous session positions
+    schedule.every().day.at("19:45").do(force_close_previous_session)
 
-    log.info("Scheduler started with full scan schedule")
+    # 3:00 PM CST = 20:00 UTC — Market close scan
+    schedule.every().day.at("20:00").do(lambda: run_comprehensive_scan(scan_type="market_close"))
+
+    # ── Post-market comprehensive scans (every 30 min, 3:30-6:00 PM CST) ──
+    for hour_utc, label in [(20.5,"3:30pm"),(21,"4:00pm"),(21.5,"4:30pm"),
+                             (22,"5:00pm"),(22.5,"5:30pm"),(23,"6:00pm")]:
+        hour = int(hour_utc)
+        minute = int((hour_utc % 1) * 60)
+        time_str = f"{hour:02d}:{minute:02d}"
+        scan_label = f"post_market_{label}"
+        schedule.every().day.at(time_str).do(lambda st=scan_label: run_comprehensive_scan(scan_type=st))
+
+    # Self-audit at 8:00 AM CST = 13:00 UTC (before final scan)
+    schedule.every().day.at("12:55").do(run_self_audit)
+
+    log.info("Scheduler started — comprehensive scans every 30min, 5-min position monitoring")
+
+    # 5-minute monitoring loop runs inline with the scheduler
+    last_monitor_time = 0
     while True:
         schedule.run_pending()
-        time.sleep(30)
+        current_time = time.time()
 
-# ── ROUTES ────────────────────────────────────────────────────────────────────
+        # Run 5-minute monitoring during active hours (4 AM - 7 PM CST)
+        if current_time - last_monitor_time >= MONITOR_INTERVAL:
+            try:
+                now = current_time_cst()
+                if now.weekday() < 5 and 4 <= now.hour < 19:
+                    monitor_open_positions()
+                last_monitor_time = current_time
+            except Exception as error:
+                log.error(f"Monitor error: {error}")
+
+        time.sleep(15)
+
+# ── API ROUTES ────────────────────────────────────────────────────────────────
 @app.route("/api/health")
 def health():
-    return jsonify({"status":"ok","time":datetime.now().isoformat()})
+    return jsonify({
+        "status": "ok",
+        "time_cst": current_time_cst().isoformat(),
+        "time_utc": datetime.utcnow().isoformat(),
+    })
 
 @app.route("/api/picks")
 def api_picks():
-    """Serve cached picks instantly. Use ?fresh=true to force new scan."""
-    fresh = request.args.get("fresh","false").lower() == "true"
-    if not fresh:
+    """Serve cached picks instantly. Use ?fresh=true to force a new scan."""
+    force_fresh = request.args.get("fresh", "false").lower() == "true"
+    if not force_fresh:
         cached = get_cached_picks()
         if cached:
             return jsonify(cached)
     try:
-        return jsonify(generate_picks(scan_type="manual"))
-    except Exception as e:
-        return jsonify({"error":str(e)}), 500
+        return jsonify(run_comprehensive_scan(scan_type="manual"))
+    except Exception as error:
+        return jsonify({"error": str(error)}), 500
 
 @app.route("/api/picks/fresh")
 def api_picks_fresh():
-    """Force a fresh scan — use sparingly"""
+    """Force a fresh comprehensive scan."""
     try:
-        return jsonify(generate_picks(scan_type="manual_fresh"))
-    except Exception as e:
-        return jsonify({"error":str(e)}), 500
+        return jsonify(run_comprehensive_scan(scan_type="manual_fresh"))
+    except Exception as error:
+        return jsonify({"error": str(error)}), 500
 
 @app.route("/api/weights")
 def api_weights():
-    return jsonify(get_weights())
+    return jsonify(get_signal_weights())
 
 @app.route("/api/predictions")
 def api_predictions():
-    conn = get_db()
-    rows = [dict(r) for r in conn.execute("SELECT * FROM predictions ORDER BY logged_at DESC LIMIT 200").fetchall()]
-    conn.close(); return jsonify(rows)
+    database = get_database()
+    rows = [dict(r) for r in database.execute(
+        "SELECT * FROM predictions ORDER BY logged_at DESC LIMIT 200"
+    ).fetchall()]
+    database.close()
+    return jsonify(rows)
 
-@app.route("/api/predictions/<pid>/outcome", methods=["POST"])
-def api_outcome(pid):
-    o = request.json.get("outcome")
-    if o not in ["hit","miss","partial"]: return jsonify({"error":"invalid"}), 400
-    conn = get_db()
-    conn.execute("UPDATE predictions SET outcome=?,resolved_at=? WHERE id=?", [o,datetime.now().isoformat(),pid])
-    conn.commit(); conn.close(); return jsonify({"success":True})
+@app.route("/api/predictions/<prediction_id>/outcome", methods=["POST"])
+def api_update_outcome(prediction_id):
+    outcome = request.json.get("outcome")
+    if outcome not in ["hit", "miss", "partial"]:
+        return jsonify({"error": "invalid outcome"}), 400
+    database = get_database()
+    database.execute("UPDATE predictions SET outcome=?, resolved_at=? WHERE id=?",
+                     [outcome, current_time_cst().isoformat(), prediction_id])
+    database.commit()
+    database.close()
+    return jsonify({"success": True})
 
 @app.route("/api/virtual-trades")
-def api_vt():
-    direction = request.args.get("direction")  # optional filter: "long" or "short"
-    conn = get_db()
-    if direction:
-        rows = [dict(r) for r in conn.execute("SELECT * FROM virtual_trades WHERE direction=? ORDER BY buy_date DESC LIMIT 500", [direction]).fetchall()]
+def api_virtual_trades():
+    direction_filter = request.args.get("direction")
+    database = get_database()
+    if direction_filter:
+        rows = [dict(r) for r in database.execute(
+            "SELECT * FROM virtual_trades WHERE direction=? ORDER BY buy_date DESC LIMIT 500",
+            [direction_filter]
+        ).fetchall()]
     else:
-        rows = [dict(r) for r in conn.execute("SELECT * FROM virtual_trades ORDER BY buy_date DESC LIMIT 500").fetchall()]
-    conn.close(); return jsonify(rows)
+        rows = [dict(r) for r in database.execute(
+            "SELECT * FROM virtual_trades ORDER BY buy_date DESC LIMIT 500"
+        ).fetchall()]
+    database.close()
+    return jsonify(rows)
+
+@app.route("/api/open-positions")
+def api_open_positions():
+    database = get_database()
+    rows = [dict(r) for r in database.execute(
+        "SELECT * FROM virtual_trades WHERE outcome='open' ORDER BY buy_date DESC"
+    ).fetchall()]
+    database.close()
+    return jsonify(rows)
+
+@app.route("/api/queue")
+def api_queue():
+    """Return current trade queue status and recent entries."""
+    return jsonify(get_queue_status())
 
 @app.route("/api/audit", methods=["POST"])
 def api_audit():
-    return jsonify(run_audit())
+    return jsonify(run_self_audit())
 
 @app.route("/api/audit/log")
 def api_audit_log():
-    conn = get_db()
-    rows = [dict(r) for r in conn.execute("SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT 30").fetchall()]
-    conn.close(); return jsonify(rows)
-
-@app.route("/api/score-yesterday", methods=["POST"])
-def api_score():
-    score_yesterday(); return jsonify({"success":True})
+    database = get_database()
+    rows = [dict(r) for r in database.execute(
+        "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT 30"
+    ).fetchall()]
+    database.close()
+    return jsonify(rows)
 
 @app.route("/api/perf-history")
-def api_perf():
-    conn = get_db()
-    rows = conn.execute("SELECT buy_date as date, SUM(COALESCE(gross_pnl,0)) as daily_pnl, COUNT(*) as trades FROM virtual_trades GROUP BY buy_date ORDER BY buy_date ASC").fetchall()
-    conn.close()
-    hist=[]; running=1000.0
-    for r in rows:
-        running+=float(r["daily_pnl"] or 0)
-        hist.append({"date":r["date"],"virtual":round(running,2),"daily_pnl":round(float(r["daily_pnl"] or 0),4),"trades":r["trades"]})
-    return jsonify(hist)
+def api_performance_history():
+    """
+    Build performance history from resolved trades and intraday position checks.
+    Combines daily settled P&L with 5-minute intraday data points for smooth charts.
+    """
+    database = get_database()
+    daily_results = database.execute("""
+        SELECT sell_date as date,
+               SUM(COALESCE(gross_pnl, 0)) as daily_pnl,
+               COUNT(*) as trade_count
+        FROM virtual_trades
+        WHERE outcome != 'open' AND sell_date IS NOT NULL
+        GROUP BY sell_date
+        ORDER BY sell_date ASC
+    """).fetchall()
+
+    today = current_time_cst().strftime("%Y-%m-%d")
+    intraday_checks = database.execute("""
+        SELECT check_time, SUM(pnl_percent) as total_pnl_percent
+        FROM position_checks
+        WHERE check_time LIKE ?
+        GROUP BY check_time
+        ORDER BY check_time ASC
+    """, [today + "%"]).fetchall()
+    database.close()
+
+    history = []
+    running_balance = 1000.0
+
+    for row in daily_results:
+        running_balance += float(row["daily_pnl"] or 0)
+        history.append({
+            "date": row["date"],
+            "virtual": round(running_balance, 2),
+            "daily_pnl": round(float(row["daily_pnl"] or 0), 4),
+            "trades": row["trade_count"],
+            "ts": int(datetime.fromisoformat(row["date"]).timestamp() * 1000),
+        })
+
+    # Append intraday data points for smooth chart during market hours
+    for check in intraday_checks:
+        intraday_pnl = float(check["total_pnl_percent"] or 0) * DEFAULT_INVESTMENT / 100
+        history.append({
+            "date": today,
+            "virtual": round(running_balance + intraday_pnl, 2),
+            "daily_pnl": round(intraday_pnl, 4),
+            "trades": 0,
+            "ts": int(datetime.fromisoformat(check["check_time"]).timestamp() * 1000),
+            "intraday": True,
+        })
+
+    history.sort(key=lambda point: point["ts"])
+    return jsonify(history)
 
 @app.route("/api/stats")
 def api_stats():
-    conn = get_db()
-    tp  = conn.execute("SELECT COUNT(*) as n FROM predictions").fetchone()["n"]
-    res = conn.execute("SELECT COUNT(*) as n FROM predictions WHERE outcome!='pending'").fetchone()["n"]
-    h   = conn.execute("SELECT COUNT(*) as n FROM predictions WHERE outcome='hit'").fetchone()["n"]
-    m   = conn.execute("SELECT COUNT(*) as n FROM predictions WHERE outcome='miss'").fetchone()["n"]
-    vt  = conn.execute("SELECT COUNT(*) as n FROM virtual_trades").fetchone()["n"]
-    vo  = conn.execute("SELECT COUNT(*) as n FROM virtual_trades WHERE outcome='open'").fetchone()["n"]
-    la  = conn.execute("SELECT value FROM app_state WHERE key='last_audit'").fetchone()
-    ct  = conn.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
-    conn.close()
+    database = get_database()
+    total_predictions = database.execute("SELECT COUNT(*) as n FROM predictions").fetchone()["n"]
+    resolved_count = database.execute("SELECT COUNT(*) as n FROM predictions WHERE outcome!='pending'").fetchone()["n"]
+    hit_count = database.execute("SELECT COUNT(*) as n FROM predictions WHERE outcome='hit'").fetchone()["n"]
+    miss_count = database.execute("SELECT COUNT(*) as n FROM predictions WHERE outcome='miss'").fetchone()["n"]
+    virtual_trade_count = database.execute("SELECT COUNT(*) as n FROM virtual_trades").fetchone()["n"]
+    open_position_count = database.execute("SELECT COUNT(*) as n FROM virtual_trades WHERE outcome='open'").fetchone()["n"]
+    last_audit = database.execute("SELECT value FROM app_state WHERE key='last_audit'").fetchone()
+    last_scan = database.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
+    database.close()
+
     return jsonify({
-        "total_predictions":tp,"resolved":res,"hits":h,"misses":m,
-        "win_rate":round(h/res*100,1) if res else None,
-        "virtual_trades":vt,"virtual_open":vo,
-        "last_audit":la["value"] if la else None,
-        "last_scan":ct["value"] if ct else None,
-        "weights":get_weights()
+        "total_predictions": total_predictions,
+        "resolved": resolved_count,
+        "hits": hit_count,
+        "misses": miss_count,
+        "win_rate": round(hit_count / resolved_count * 100, 1) if resolved_count else None,
+        "virtual_trades": virtual_trade_count,
+        "virtual_open": open_position_count,
+        "last_audit": last_audit["value"] if last_audit else None,
+        "last_scan": last_scan["value"] if last_scan else None,
+        "weights": get_signal_weights(),
+        "queue": get_queue_status(),
     })
 
-@app.route("/api/scan-history")
-def api_scan_history():
-    conn = get_db()
-    rows = [dict(r) for r in conn.execute("SELECT id,scan_time,scan_type,ticker_count FROM scan_cache ORDER BY scan_time DESC LIMIT 50").fetchall()]
-    conn.close(); return jsonify(rows)
+@app.route("/api/position-checks/<position_id>")
+def api_position_checks(position_id):
+    database = get_database()
+    rows = [dict(r) for r in database.execute(
+        "SELECT * FROM position_checks WHERE position_id=? ORDER BY check_time ASC",
+        [position_id]
+    ).fetchall()]
+    database.close()
+    return jsonify(rows)
+
+@app.route("/api/candidates")
+def api_candidates():
+    database = get_database()
+    rows = [dict(r) for r in database.execute(
+        "SELECT * FROM candidates WHERE monitoring = 1 ORDER BY confidence DESC"
+    ).fetchall()]
+    database.close()
+    return jsonify(rows)
 
 @app.route("/api/intraday-pnl")
 def api_intraday_pnl():
-    """Fetch retroactive 5-min intraday data for open positions to build smooth performance chart"""
-    conn = get_db()
-    open_trades = conn.execute("SELECT * FROM virtual_trades WHERE outcome='open'").fetchall()
-    conn.close()
-    if not open_trades:
-        return jsonify({"points":[],"message":"No open positions"})
+    """Fetch retroactive 5-min intraday data for open positions."""
+    database = get_database()
+    open_positions = [dict(t) for t in database.execute(
+        "SELECT * FROM virtual_trades WHERE outcome='open'"
+    ).fetchall()]
+    database.close()
+
+    if not open_positions:
+        return jsonify({"points": [], "positions": 0})
+
     try:
         import yfinance as yf
-        total_invested = sum(t["invested"] for t in open_trades)
-        # Fetch 5-min data for all open position tickers
-        tickers = list(set(t["ticker"] for t in open_trades))
+        tickers = list(set(position["ticker"] for position in open_positions))
         data = yf.download(tickers, period="2d", interval="5m",
                            group_by="ticker", auto_adjust=True, progress=False)
         points = []
         if data is not None and len(data) > 0:
-            for idx in range(len(data)):
-                ts = data.index[idx]
+            for index in range(len(data)):
+                timestamp = data.index[index]
                 total_pnl = 0
-                for t in open_trades:
+                for position in open_positions:
                     try:
-                        if len(tickers) == 1:
-                            price = float(data["Close"].iloc[idx])
-                        else:
-                            price = float(data[t["ticker"]]["Close"].iloc[idx])
-                        if price != price: continue
-                        pct = (price - t["buy_price"]) / t["buy_price"] * 100
-                        total_pnl += t["invested"] * (pct / 100)
-                    except: pass
+                        price = (float(data["Close"].iloc[index]) if len(tickers) == 1
+                                 else float(data[position["ticker"]]["Close"].iloc[index]))
+                        if price != price:
+                            continue
+                        pnl_pct = (price - position["buy_price"]) / position["buy_price"] * 100
+                        if position["direction"] == "short":
+                            pnl_pct = -pnl_pct
+                        total_pnl += (position["invested_amount"] or DEFAULT_INVESTMENT) * (pnl_pct / 100)
+                    except:
+                        pass
                 points.append({
-                    "ts": int(ts.timestamp() * 1000),
-                    "time": ts.strftime("%H:%M"),
-                    "date": ts.strftime("%Y-%m-%d"),
+                    "ts": int(timestamp.timestamp() * 1000),
+                    "time": timestamp.strftime("%H:%M"),
+                    "date": timestamp.strftime("%Y-%m-%d"),
                     "virtual": round(1000 + total_pnl, 2),
-                    "pnl": round(total_pnl, 4)
+                    "pnl": round(total_pnl, 4),
                 })
-        return jsonify({"points": points, "positions": len(open_trades)})
-    except Exception as e:
-        log.error(f"Intraday PnL error: {e}")
-        return jsonify({"points":[],"error":str(e)})
+        return jsonify({"points": points, "positions": len(open_positions)})
+    except Exception as error:
+        return jsonify({"points": [], "error": str(error)})
 
-# ── INIT ──────────────────────────────────────────────────────────────────────
-init_db()
-threading.Thread(target=scheduler, daemon=True).start()
-log.info("Brain v3 initialized — expanded universe, scan schedule, caching")
+@app.route("/api/scan-history")
+def api_scan_history():
+    database = get_database()
+    rows = [dict(r) for r in database.execute(
+        "SELECT id, scan_time, scan_type, ticker_count FROM scan_cache ORDER BY scan_time DESC LIMIT 50"
+    ).fetchall()]
+    database.close()
+    return jsonify(rows)
+
+# ── KEEP ALIVE ────────────────────────────────────────────────────────────────
+def keep_server_alive():
+    """Ping self every 10 minutes to prevent Railway from sleeping the container."""
+    import urllib.request
+    while True:
+        try:
+            port = os.environ.get("PORT", 5000)
+            urllib.request.urlopen(f"http://localhost:{port}/api/health", timeout=5)
+        except:
+            pass
+        time.sleep(600)
+
+# ── INITIALIZATION ────────────────────────────────────────────────────────────
+initialize_database()
+threading.Thread(target=run_scheduler, daemon=True).start()
+threading.Thread(target=keep_server_alive, daemon=True).start()
+log.info("Brain v4 initialized — full trading engine with self-regulating queue system")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
