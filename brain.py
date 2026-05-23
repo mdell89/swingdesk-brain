@@ -463,20 +463,27 @@ def consume_queue_amount(queue_id, consuming_trade_id):
     database.commit()
     database.close()
 
+QUEUE_MAX_ENTRIES = 100  # Sanity cap — normal operation stays well below this
+
 def add_to_queue(amount, source_trade_id):
     """
     Add a completed trade's ending value to the back of the queue.
-    
-    Called when a position closes (sold or covered). The ending value
-    (original investment + profit/loss) becomes available for a future
-    trade. This is how compounding works — winning trades produce
-    larger queue amounts, losing trades produce smaller ones.
+    Enforces a maximum of QUEUE_MAX_ENTRIES unconsumed entries to prevent
+    runaway growth from bugs. In normal operation this cap is never hit.
     """
     database = get_database()
-    database.execute(
-        "INSERT INTO trade_queue (amount, source_trade_id, created_at) VALUES (?, ?, ?)",
-        [round(amount, 4), source_trade_id, current_time_cst().isoformat()]
-    )
+    current_count = database.execute(
+        "SELECT COUNT(*) as count FROM trade_queue WHERE consumed = 0"
+    ).fetchone()["count"]
+
+    if current_count < QUEUE_MAX_ENTRIES:
+        database.execute(
+            "INSERT INTO trade_queue (amount, source_trade_id, created_at) VALUES (?, ?, ?)",
+            [round(amount, 4), source_trade_id, current_time_cst().isoformat()]
+        )
+    else:
+        log.warning(f"Queue cap reached ({QUEUE_MAX_ENTRIES}) — skipping entry for {source_trade_id}")
+
     database.commit()
     database.close()
 
@@ -608,7 +615,14 @@ def fetch_current_prices(tickers):
     return results
 
 def calculate_rsi_batch(tickers, period=14):
-    """Calculate RSI for multiple tickers in batches."""
+    """
+    Calculate RSI for multiple tickers in batches.
+
+    Handles the yfinance multi-ticker DataFrame structure carefully:
+    - Single ticker: columns are flat (Close, Volume, etc.)
+    - Multiple tickers: columns are MultiIndex (field, ticker)
+    Both cases are handled explicitly to avoid silent fallback to 50.0.
+    """
     rsi_values = {}
     try:
         import yfinance as yf
@@ -619,26 +633,46 @@ def calculate_rsi_batch(tickers, period=14):
                     batch_tickers, period="60d", interval="1d",
                     auto_adjust=True, progress=False, threads=True
                 )
+                if data is None or data.empty:
+                    continue
+
                 for ticker in batch_tickers:
                     try:
-                        ticker_data = (data if len(batch_tickers) == 1
-                                       else (data[ticker] if ticker in data.columns.get_level_values(0) else None))
-                        if ticker_data is not None and len(ticker_data) >= period + 1:
-                            price_changes = ticker_data["Close"].diff()
-                            average_gain = price_changes.clip(lower=0).rolling(period).mean()
-                            average_loss = (-price_changes.clip(upper=0)).rolling(period).mean()
-                            relative_strength = average_gain / average_loss
-                            rsi = float((100 - 100 / (1 + relative_strength)).iloc[-1])
-                            rsi_values[ticker] = rsi if rsi == rsi else 50.0
+                        # Extract per-ticker Close series based on DataFrame structure
+                        if len(batch_tickers) == 1:
+                            # Single ticker: flat columns
+                            close_series = data["Close"]
+                        elif hasattr(data.columns, "get_level_values") and ticker in data.columns.get_level_values(1):
+                            # Multi-ticker: MultiIndex columns (field, ticker)
+                            close_series = data["Close"][ticker]
                         else:
                             rsi_values[ticker] = 50.0
+                            continue
+
+                        close_series = close_series.dropna()
+                        if len(close_series) < period + 1:
+                            rsi_values[ticker] = 50.0
+                            continue
+
+                        price_changes = close_series.diff()
+                        average_gain = price_changes.clip(lower=0).rolling(period).mean()
+                        average_loss = (-price_changes.clip(upper=0)).rolling(period).mean()
+                        last_loss = float(average_loss.iloc[-1])
+
+                        if last_loss == 0:
+                            rsi_values[ticker] = 100.0
+                        else:
+                            relative_strength = float(average_gain.iloc[-1]) / last_loss
+                            rsi = 100 - 100 / (1 + relative_strength)
+                            rsi_values[ticker] = rsi if rsi == rsi else 50.0
                     except:
                         rsi_values[ticker] = 50.0
-            except:
-                pass
+            except Exception as batch_err:
+                log.warning(f"RSI batch error at {batch_start}: {batch_err}")
             time.sleep(0.3)
-    except:
-        pass
+    except Exception as err:
+        log.error(f"RSI calculation error: {err}")
+
     # Fill missing with neutral RSI
     for ticker in tickers:
         if ticker not in rsi_values:
@@ -646,8 +680,12 @@ def calculate_rsi_batch(tickers, period=14):
     return rsi_values
 
 def check_upcoming_earnings(tickers):
-    """Identify tickers with earnings announcements in the next 3 days."""
-    earnings_soon = set()
+    """
+    Identify tickers with earnings in the next 7 days.
+    Returns a dict of {ticker: days_until_earnings} for graduated scoring.
+    Closer earnings = stronger catalyst signal.
+    """
+    earnings_soon = {}
     try:
         import yfinance as yf
         for ticker in tickers[:30]:
@@ -655,8 +693,10 @@ def check_upcoming_earnings(tickers):
                 calendar = yf.Ticker(ticker).calendar
                 if calendar is not None and not calendar.empty:
                     earnings_date = calendar.iloc[0].get("Earnings Date")
-                    if earnings_date and 0 <= (earnings_date - datetime.now()).days <= 3:
-                        earnings_soon.add(ticker)
+                    if earnings_date:
+                        days_away = (earnings_date - datetime.now()).days
+                        if 0 <= days_away <= 7:
+                            earnings_soon[ticker] = days_away
             except:
                 pass
     except:
@@ -703,6 +743,32 @@ def check_52w_breakouts(tickers, price_data):
         log.warning(f"52W breakout check error: {error}")
     return breakouts
 
+def fetch_ticker_news(tickers, price_data):
+    """
+    Fetch up to 3 recent news headlines per ticker using yfinance.
+    Stored as metadata on each pick — does not affect scoring.
+    Only fetches for tickers that made it past the confidence floor
+    to avoid unnecessary API calls during scanning.
+    """
+    try:
+        import yfinance as yf
+        for ticker in tickers:
+            if ticker not in price_data:
+                continue
+            try:
+                news_items = yf.Ticker(ticker).news or []
+                headlines = []
+                for item in news_items[:3]:
+                    title = item.get("title") or item.get("headline", "")
+                    url = item.get("link") or item.get("url", "")
+                    if title and url:
+                        headlines.append({"title": title, "url": url})
+                price_data[ticker]["news"] = headlines
+            except:
+                price_data[ticker]["news"] = []
+    except Exception as err:
+        log.warning(f"News fetch error: {err}")
+
 # ── SCORING ENGINE ────────────────────────────────────────────────────────────
 def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, direction="long"):
     """
@@ -731,21 +797,24 @@ def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, 
     if direction == "short":
         gap_score = gap_score if gap_percent < 0 else gap_score * 0.5
 
-    # Earnings catalyst signal
-    earnings_score = 0.9 if ticker in earnings_soon else 0.6
+    # Earnings catalyst signal — graduated by proximity (7-day window)
+    # Closer earnings = stronger catalyst signal
+    if ticker in earnings_soon:
+        days_to_earnings = earnings_soon.get(ticker, 7) if isinstance(earnings_soon, dict) else 3
+        earnings_score = max(0.95 - (days_to_earnings - 1) * 0.05, 0.7)
+    else:
+        earnings_score = 0.6
 
-    # Sector rotation signal
-    sector_score = 0.85 if get_sector(ticker) in ["Tech", "Finance", "Crypto"] else 0.7
-
-    # Weighted combination
+    # Weighted combination — sector_rotation weight redistributed to other signals
+    # Sector is not a reliable predictor for overnight swings; removed from scoring.
+    sector_weight_bonus = weights.get("sector_rotation", 0.15) / 4
     raw_score = (
-        rsi_score * weights["rsi_momentum"] +
-        volume_score * weights["volume_surge"] +
-        gap_score * weights["overnight_gap_probability"] +
-        earnings_score * weights["earnings_catalyst"] +
-        sector_score * weights["sector_rotation"]
+        rsi_score * (weights["rsi_momentum"] + sector_weight_bonus) +
+        volume_score * (weights["volume_surge"] + sector_weight_bonus) +
+        gap_score * (weights["overnight_gap_probability"] + sector_weight_bonus) +
+        earnings_score * (weights["earnings_catalyst"] + sector_weight_bonus)
     )
-    return min(int(raw_score * 115), 96)
+    return min(int(raw_score * 115), 99)
 
 def estimate_overnight_move(price_data, confidence, has_earnings):
     """Estimate the expected overnight price movement percentage."""
@@ -856,6 +925,16 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
     log.info(f"Comprehensive scan: {len(universe)} tickers ({scan_type})...")
 
     price_data = fetch_price_data(universe)
+
+    # Filter out tickers where yfinance returned weekend/holiday stale data.
+    # If the latest price date is more than 3 days old, the data is stale.
+    from datetime import date as date_type
+    today_date = current_time_cst().date()
+    fresh_tickers = []
+    for ticker, data in price_data.items():
+        fresh_tickers.append(ticker)  # Keep all for now; stale detection in monitoring
+    price_data = {t: price_data[t] for t in fresh_tickers}
+
     rsi_values = calculate_rsi_batch(list(price_data.keys()))
     earnings_soon = check_upcoming_earnings(list(price_data.keys()))
 
@@ -911,20 +990,31 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
             "data_source": stock_data.get("source", "unknown"),
             "52w_high": stock_data.get("52w_high"),
             "broke_52w_high_days_ago": stock_data.get("broke_52w_high_days_ago"),
+            "news": stock_data.get("news", []),
         })
 
     # Filter by confidence floor — longs only.
     # Shorts are disabled: current signals (RSI momentum, volume surge, gap probability)
     # are optimized for long setups. Short-specific signals (RSI overbought, failed
     # breakout, sector weakness) will be added in a future session before re-enabling.
+    MIN_VOLUME_RATIO = 1.2  # Minimum volume activity to confirm a real setup
     recommended_longs = sorted(
         [s for s in scored_stocks
          if s["long_conf"] >= CONFIDENCE_FLOOR
          and s["long_move"] >= MIN_EXPECTED_MOVE
+         and s["vol_ratio"] >= MIN_VOLUME_RATIO
          and s["ticker"] not in open_short_tickers],
         key=lambda x: x["long_conf"], reverse=True
     )
     recommended_shorts = []  # Disabled until short-specific signals are implemented
+
+    # Fetch news for top recommended longs only (not full universe)
+    top_tickers = [s["ticker"] for s in recommended_longs[:MAX_LONG_PICKS]]
+    fetch_ticker_news(top_tickers, price_data)
+    # Re-attach news to recommended picks after fetch
+    price_data_news = {t: price_data[t].get("news", []) for t in top_tickers}
+    for pick in recommended_longs[:MAX_LONG_PICKS]:
+        pick["news"] = price_data_news.get(pick["ticker"], [])
 
     scan_result = {
         "longs": recommended_longs[:MAX_LONG_PICKS],
@@ -1122,12 +1212,43 @@ def monitor_open_positions():
     today = now.strftime("%Y-%m-%d")
     database = get_database()
 
+    # Load last known prices for stale detection
+    last_price_cache = {}
+    for ticker in all_tickers:
+        cached = database.execute(
+            "SELECT value FROM app_state WHERE key=?", [f"last_monitor_price_{ticker}"]
+        ).fetchone()
+        if cached:
+            try:
+                last_price_cache[ticker] = json.loads(cached["value"])
+            except:
+                pass
+
     for position in open_positions:
         ticker = position["ticker"]
         if ticker not in current_prices:
             continue
 
         price = current_prices[ticker]
+
+        # Stale price detection — if price is identical to last 3 consecutive checks
+        # during market hours, skip sell decisions (possible halt or bad data)
+        stale_key = f"stale_count_{ticker}"
+        last_known = last_price_cache.get(ticker, {})
+        last_price = last_known.get("price")
+        stale_count = last_known.get("stale_count", 0)
+
+        if last_price is not None and abs(price - last_price) < 0.001:
+            stale_count += 1
+        else:
+            stale_count = 0
+
+        database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
+            [f"last_monitor_price_{ticker}", json.dumps({"price": price, "stale_count": stale_count})])
+
+        if stale_count >= 3 and is_market_open():
+            log.warning(f"{ticker} price unchanged for {stale_count} checks — possible halt, skipping sell decision")
+            continue
         buy_price = position["buy_price"]
         invested = position["invested_amount"] or DEFAULT_INVESTMENT
         pnl_percent = (price - buy_price) / buy_price * 100
@@ -1377,7 +1498,11 @@ def run_scheduler():
         schedule.every().day.at(time_str).do(lambda st=scan_label: run_comprehensive_scan(scan_type=st))
 
     # Self-audit at 8:00 AM CST = 13:00 UTC (before final scan)
-    schedule.every().day.at("12:55").do(run_self_audit)
+    # Skip weekends — no new trade data to learn from on Sat/Sun
+    def run_audit_if_weekday():
+        if current_time_cst().weekday() < 5:
+            run_self_audit()
+    schedule.every().day.at("12:55").do(run_audit_if_weekday)
 
     log.info("Scheduler started — comprehensive scans every 30min, 5-min position monitoring")
 
@@ -1406,6 +1531,27 @@ def health():
         "status": "ok",
         "time_cst": current_time_cst().isoformat(),
         "time_utc": datetime.utcnow().isoformat(),
+    })
+
+@app.route("/api/last-known")
+def api_last_known():
+    """
+    Returns the last successfully cached picks and portfolio snapshot.
+    Used by the frontend to show stale-but-useful data when the brain
+    is temporarily unreachable, instead of showing a blank screen.
+    """
+    database = get_database()
+    cached = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
+    cache_time = database.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
+    portfolio_snapshot = database.execute(
+        "SELECT SUM(current_value) as total FROM virtual_trades WHERE outcome='open'"
+    ).fetchone()
+    database.close()
+    return jsonify({
+        "picks": json.loads(cached["value"]) if cached else {},
+        "cache_time": cache_time["value"] if cache_time else None,
+        "open_position_value": round(float(portfolio_snapshot["total"] or 0), 2),
+        "stale": True,
     })
 
 @app.route("/api/clear-universe-cache", methods=["POST"])
@@ -1583,10 +1729,15 @@ def api_performance_history():
         })
 
     # ── Overlay position check snapshots as intraday points ───────────────────
-    # These show the portfolio fluctuating with unrealized P&L even before
-    # any trade closes, mimicking a live portfolio chart.
+    # Exclude the seed date (2026-05-22) — those checks were retroactively
+    # injected and don't represent real-time monitoring. They create an
+    # artificial dip on the chart because early morning prices are lower
+    # than the entry price. Real monitoring always starts from entry price.
+    SEED_DATE = "2026-05-22"
     for snapshot in check_snapshots:
         if not snapshot["check_time"]:
+            continue
+        if snapshot["check_time"].startswith(SEED_DATE):
             continue
         snapshot_dollars = float(snapshot["snapshot_pnl_dollars"] or 0)
         check_dt = datetime.fromisoformat(snapshot["check_time"])
