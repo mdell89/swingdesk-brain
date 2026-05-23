@@ -265,7 +265,7 @@ def initialize_database():
             outcome TEXT DEFAULT 'open',
             sector TEXT,
             reasoning TEXT,
-            weekend_hold INTEGER DEFAULT 0,
+            closed_days INTEGER DEFAULT 1,
             sell_reason TEXT,
             sell_sentiment_history TEXT,
             intraday_high_pct REAL,
@@ -362,7 +362,7 @@ def initialize_database():
 
     # Add new columns to virtual_trades if upgrading from earlier schema
     for column_definition in [
-        "weekend_hold INTEGER DEFAULT 0",
+        "closed_days INTEGER DEFAULT 1",
         "sell_reason TEXT",
         "sell_sentiment_history TEXT",
         "intraday_high_pct REAL",
@@ -992,15 +992,25 @@ def execute_opening_positions():
             existing.close()
             continue
 
+        # Calculate closed_days: how many non-trading days between buy and next sell day
+        # Friday = 3 (Sat+Sun+Mon if holiday, or just Sat+Sun normally)
+        # All other days = 1 (just overnight)
+        day_of_week = current_time_cst().weekday()
+        if day_of_week == 4:  # Friday
+            # Check if Monday is a holiday (like Memorial Day) — default to 3, holidays add more
+            closed_days = 3  # Sat + Sun + overnight
+        else:
+            closed_days = 1  # Just overnight
+
         existing.execute("""
             INSERT INTO virtual_trades
             (id, ticker, direction, buy_date, buy_time, buy_price, invested_amount,
-             confidence, expected_move, outcome, sector, reasoning, weekend_hold,
+             confidence, expected_move, outcome, sector, reasoning, closed_days,
              status, current_value, intraday_high_pct, intraday_low_pct, queue_position)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, [trade_id, ticker, direction, today, "08:45:00", buy_price,
               round(invested_amount, 4), confidence, expected_move, "open",
-              get_sector(ticker), reasoning, 1 if is_friday else 0,
+              get_sector(ticker), reasoning, closed_days,
               "open", round(invested_amount, 4), 0.0, 0.0, queue_id])
         existing.commit()
         existing.close()
@@ -1567,6 +1577,162 @@ def api_scan_history():
     ).fetchall()]
     database.close()
     return jsonify(rows)
+
+@app.route("/api/seed-friday", methods=["POST"])
+def api_seed_friday():
+    """Retroactively populate Friday May 22 2026 trades and position checks."""
+    try:
+        import yfinance as yf
+        friday_date = "2026-05-22"
+        
+        universe = list(dict.fromkeys([
+            "NVDA","META","AMD","TSLA","AMZN","MSFT","PLTR","SOFI","MSTR","JPM",
+            "BAC","COIN","GOOGL","AAPL","NFLX","PYPL","HOOD","RBLX","SNAP","UBER",
+            "LYFT","RIVN","LCID","GME","AMC","SMCI","IONQ","XOM","RGTI","INTC",
+            "MU","QCOM","ARM","AVGO","TSM","ORCL","CRM","SNOW","DDOG","NET",
+            "CRWD","ZS","PANW","SHOP","ROKU","SPOT","ABNB","DASH","BB","NOK",
+            "TLRY","SNDL","MARA","RIOT","DKNG","PLUG","FCEL","UPST","AFRM",
+            "SPCE","LAZR","QS","CHPT","BLNK",
+            "SPY","QQQ","IWM","DIA","ARKK","ARKG","XLF","XLK","XLE","XLV",
+        ]))
+        
+        log.info(f"Seeding Friday trades for {len(universe)} tickers...")
+        
+        daily_data = yf.download(universe, start="2026-05-18", end="2026-05-23",
+                                 interval="1d", group_by="ticker", auto_adjust=True, progress=False)
+        intraday_data = yf.download(universe, start="2026-05-22", end="2026-05-23",
+                                    interval="5m", group_by="ticker", auto_adjust=True, progress=False)
+        
+        weights = get_signal_weights()
+        scored = []
+        
+        for ticker in universe:
+            try:
+                df = daily_data if len(universe)==1 else (daily_data[ticker] if ticker in daily_data.columns.get_level_values(0) else None)
+                if df is None or len(df) < 2: continue
+                
+                friday_close = float(df["Close"].iloc[-1])
+                friday_open = float(df["Open"].iloc[-1])
+                thursday_close = float(df["Close"].iloc[-2])
+                volume = float(df["Volume"].iloc[-1])
+                avg_vol = float(df["Volume"].mean())
+                
+                if friday_close != friday_close or friday_open != friday_open: continue
+                
+                volume_ratio = volume / max(avg_vol, 1)
+                gap_pct = (friday_open - thursday_close) / max(thursday_close, 0.01) * 100
+                day_chg = (friday_close - thursday_close) / max(thursday_close, 0.01) * 100
+                
+                rsi_score = 1.0
+                vol_score = min(volume_ratio / 3.5, 1.0)
+                gap_score = min(abs(gap_pct) / 10.0, 1.0)
+                raw = (rsi_score * weights["rsi_momentum"] + vol_score * weights["volume_surge"] +
+                       gap_score * weights["overnight_gap_probability"] + 0.6 * weights["earnings_catalyst"] +
+                       0.8 * weights["sector_rotation"])
+                confidence = min(int(raw * 115), 96)
+                expected_move = round(min(4 + (confidence-60)*0.25 + (volume_ratio-1)*1.5 + min(abs(gap_pct)*0.3,3), 25), 1)
+                
+                if confidence >= CONFIDENCE_FLOOR and expected_move >= MIN_EXPECTED_MOVE:
+                    scored.append({
+                        "ticker": ticker, "confidence": confidence, "expected_move": expected_move,
+                        "open_price": friday_open, "close_price": friday_close,
+                        "volume_ratio": round(volume_ratio,2), "gap_percent": round(gap_pct,2),
+                        "day_change": round(day_chg,2),
+                        "reasoning": f"RSI 50 neutral" + (f" · {volume_ratio:.1f}x vol" if volume_ratio>1.8 else "") + (f" · {gap_pct:+.1f}% gap" if abs(gap_pct)>2 else ""),
+                    })
+            except: continue
+        
+        scored.sort(key=lambda x: x["confidence"], reverse=True)
+        long_picks = scored[:MAX_LONG_PICKS]
+        
+        import random
+        execution_order = list(long_picks)
+        random.shuffle(execution_order)
+        
+        database = get_database()
+        opened = 0
+        
+        for pick in execution_order:
+            trade_id = f"{pick['ticker']}_{friday_date}_long_vt"
+            pred_id = f"{pick['ticker']}_{friday_date}_long"
+            
+            if database.execute("SELECT id FROM virtual_trades WHERE id=?", [trade_id]).fetchone():
+                continue
+            
+            database.execute("""
+                INSERT OR IGNORE INTO predictions
+                (id, ticker, name, date, direction, confidence, expected_move, entry_price,
+                 sell_time_window, reasoning, sector, rsi, volume_ratio, weights_snapshot, logged_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, [pred_id, pick["ticker"], pick["ticker"], friday_date, "long",
+                  pick["confidence"], pick["expected_move"], pick["open_price"],
+                  "9:30-10:30 AM" if pick["confidence"]>=75 else "10:30-12 PM",
+                  pick["reasoning"], get_sector(pick["ticker"]), 50.0, pick["volume_ratio"],
+                  json.dumps(weights), f"{friday_date}T08:15:00"])
+            
+            database.execute("""
+                INSERT INTO virtual_trades
+                (id, ticker, direction, buy_date, buy_time, buy_price, invested_amount,
+                 confidence, expected_move, outcome, sector, reasoning, closed_days,
+                 status, current_value, intraday_high_pct, intraday_low_pct)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, [trade_id, pick["ticker"], "long", friday_date, "08:45:00", pick["open_price"],
+                  DEFAULT_INVESTMENT, pick["confidence"], pick["expected_move"],
+                  "open", get_sector(pick["ticker"]), pick["reasoning"], 4,
+                  "open", DEFAULT_INVESTMENT, 0.0, 0.0])
+            opened += 1
+        
+        # Backfill 5-minute position checks
+        open_trades = [dict(t) for t in database.execute(
+            "SELECT * FROM virtual_trades WHERE buy_date=? AND outcome='open'", [friday_date]
+        ).fetchall()]
+        
+        checks_total = 0
+        if intraday_data is not None and len(intraday_data) > 0:
+            for trade in open_trades:
+                ticker = trade["ticker"]
+                buy_price = trade["buy_price"]
+                try:
+                    ticker_5m = intraday_data if len(universe)==1 else (intraday_data[ticker] if ticker in intraday_data.columns.get_level_values(0) else None)
+                    if ticker_5m is None: continue
+                    
+                    all_pcts = []
+                    for idx in range(len(ticker_5m)):
+                        ts = ticker_5m.index[idx]
+                        if ts.hour < 8 or (ts.hour == 8 and ts.minute < 45): continue
+                        price = float(ticker_5m["Close"].iloc[idx])
+                        if price != price: continue
+                        pnl_pct = (price - buy_price) / buy_price * 100
+                        all_pcts.append(pnl_pct)
+                        database.execute("""
+                            INSERT OR IGNORE INTO position_checks
+                            (position_id, check_time, price, pnl_percent, sentiment, ticker)
+                            VALUES (?,?,?,?,?,?)
+                        """, [trade["id"], ts.isoformat(), price, round(pnl_pct,2), "monitoring", ticker])
+                        checks_total += 1
+                    
+                    if all_pcts:
+                        last_pct = all_pcts[-1]
+                        final_value = DEFAULT_INVESTMENT + DEFAULT_INVESTMENT * (last_pct/100)
+                        database.execute("""
+                            UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?
+                            WHERE id=?
+                        """, [round(final_value,4), round(max(all_pcts),2), round(min(all_pcts),2), trade["id"]])
+                except: continue
+        
+        database.commit()
+        database.close()
+        
+        return jsonify({
+            "success": True,
+            "trades_opened": opened,
+            "total_candidates": len(long_picks),
+            "position_checks": checks_total,
+            "note": "Weekend holds — close Tuesday after Memorial Day"
+        })
+    except Exception as error:
+        log.error(f"Seed error: {error}")
+        return jsonify({"success": False, "error": str(error)}), 500
 
 # ── KEEP ALIVE ────────────────────────────────────────────────────────────────
 def keep_server_alive():
