@@ -48,7 +48,7 @@ load_dotenv()
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_KEY") or os.getenv("ANTHROPIC_API_KEY")
 ALPHA_VANTAGE_KEY    = os.getenv("ALPHA_VANTAGE_KEY")
-DATABASE_PATH        = Path(__file__).parent / "portfolio_brain.db"
+DATABASE_PATH        = Path(os.environ.get("DATABASE_PATH", "/app/data/portfolio_brain.db"))
 FEE_PER_TRADE        = 0.02      # Cash App sell fee
 DEFAULT_INVESTMENT   = 10.00     # Fallback when queue is empty
 CONFIDENCE_FLOOR     = 65        # Minimum confidence to recommend/trade
@@ -87,48 +87,45 @@ def minutes_until_forced_close():
 
 # ── TICKER UNIVERSE ───────────────────────────────────────────────────────────
 def fetch_sp500_tickers():
-    """Fetch S&P 500 ticker list from Wikipedia."""
+    """
+    Fetch S&P 500 ticker list from a GitHub-hosted CSV.
+    Wikipedia blocks Railway's IP with 403; GitHub is reliable and fast.
+    Falls back to empty list so build_ticker_universe() can handle gracefully.
+    """
     try:
         import urllib.request
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; SwingDesk/1.0)"})
-        with urllib.request.urlopen(request, timeout=10) as response:
-            html = response.read().decode()
+        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+        with urllib.request.urlopen(url, timeout=10) as response:
+            content = response.read().decode()
         tickers = []
-        rows = html.split("<tbody>")[1].split("</tbody>")[0].split("<tr>")
-        for row in rows[1:]:
-            cells = row.split("<td>")
-            if len(cells) > 1:
-                ticker = cells[1].split("</td>")[0].split(">")[-1].strip()
-                if ticker and ticker.isalpha():
-                    tickers.append(ticker.replace(".", "-"))
-        log.info(f"Fetched {len(tickers)} S&P 500 tickers")
+        for line in content.strip().split("\n")[1:]:
+            ticker = line.split(",")[0].strip()
+            if ticker:
+                tickers.append(ticker.replace(".", "-"))
+        log.info(f"Fetched {len(tickers)} S&P 500 tickers from GitHub")
         return tickers
     except Exception as error:
         log.warning(f"S&P 500 fetch failed: {error}")
         return []
 
 def fetch_nasdaq100_tickers():
-    """Fetch Nasdaq 100 ticker list from Wikipedia."""
-    try:
-        import urllib.request
-        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; SwingDesk/1.0)"})
-        with urllib.request.urlopen(request, timeout=10) as response:
-            html = response.read().decode()
-        tickers = []
-        rows = html.split("<tbody>")[1].split("</tbody>")[0].split("<tr>")
-        for row in rows[1:]:
-            cells = row.split("<td>")
-            if len(cells) > 1:
-                ticker = cells[1].split("</td>")[0].split(">")[-1].strip()
-                if ticker and len(ticker) <= 5:
-                    tickers.append(ticker.replace(".", "-"))
-        log.info(f"Fetched {len(tickers)} Nasdaq 100 tickers")
-        return tickers
-    except Exception as error:
-        log.warning(f"Nasdaq 100 fetch failed: {error}")
-        return []
+    """
+    Return a hardcoded Nasdaq 100 ticker list.
+    Wikipedia and most free APIs block Railway; hardcoding is bulletproof.
+    This list changes only a few times per year — update manually as needed.
+    """
+    return [
+        "ADBE","ADP","ABNB","ALGN","GOOGL","GOOG","AMZN","AMD","AMGN","AAPL",
+        "AMAT","APP","ASML","TEAM","ADSK","AZN","AXON","BIIB","BKNG","AVGO",
+        "CDNS","CDW","CHTR","CTAS","CSCO","CCEP","CTSH","CMCSA","CEG","COP",
+        "CSGP","COST","CRWD","CSX","DDOG","DXCM","FANG","DLTR","DASH","EA",
+        "EXC","FAST","META","FTNT","GEHC","GILD","HON","IDXX","INTC","INTU",
+        "ISRG","KDP","KLAC","KHC","LRCX","LULU","MRVL","MELI","MCHP","MU",
+        "MSFT","MNST","MDLZ","MDB","NFLX","NVDA","NXPI","ORLY","ON","PCAR",
+        "PLTR","PANW","PAYX","PYPL","PEP","QCOM","REGN","ROP","ROST","CRM",
+        "SBUX","SMCI","SNPS","TTWO","TMUS","TSLA","TXN","TTD","VRSK","VRTX",
+        "WBD","WDAY","ARM","MSTR","COIN","HOOD","SOFI","RIVN",
+    ]
 
 # High-volatility and popular retail tickers not always in major indices
 HIGH_VOLATILITY_TICKERS = [
@@ -1341,6 +1338,23 @@ def health():
         "time_utc": datetime.utcnow().isoformat(),
     })
 
+@app.route("/api/clear-universe-cache", methods=["POST"])
+def api_clear_universe_cache():
+    """
+    Force a fresh ticker universe rebuild on next scan.
+    Clears the cached universe and date so build_ticker_universe()
+    fetches fresh S&P 500 data from GitHub instead of waiting until tomorrow.
+    """
+    try:
+        database = get_database()
+        database.execute("DELETE FROM app_state WHERE key IN ('universe', 'universe_date')")
+        database.commit()
+        database.close()
+        fresh_universe = build_ticker_universe()
+        return jsonify({"success": True, "ticker_count": len(fresh_universe)})
+    except Exception as error:
+        return jsonify({"success": False, "error": str(error)}), 500
+
 @app.route("/api/picks")
 def api_picks():
     """Serve cached picks instantly. Use ?fresh=true to force a new scan."""
@@ -1868,6 +1882,7 @@ def keep_server_alive():
         time.sleep(600)
 
 # ── INITIALIZATION ────────────────────────────────────────────────────────────
+DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 initialize_database()
 threading.Thread(target=run_scheduler, daemon=True).start()
 threading.Thread(target=keep_server_alive, daemon=True).start()
