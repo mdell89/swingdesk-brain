@@ -745,29 +745,34 @@ def check_52w_breakouts(tickers, price_data):
 
 def fetch_ticker_news(tickers, price_data):
     """
-    Fetch up to 3 recent news headlines per ticker using yfinance.
-    Stored as metadata on each pick — does not affect scoring.
-    Only fetches for tickers that made it past the confidence floor
-    to avoid unnecessary API calls during scanning.
+    Fetch up to 3 recent news headlines per ticker using Yahoo Finance RSS.
+    More reliable than yfinance .news which breaks when Yahoo changes their API.
+    RSS format: https://finance.yahoo.com/rss/headline?s=TICKER
     """
-    try:
-        import yfinance as yf
-        for ticker in tickers:
-            if ticker not in price_data:
-                continue
-            try:
-                news_items = yf.Ticker(ticker).news or []
-                headlines = []
-                for item in news_items[:3]:
-                    title = item.get("title") or item.get("headline", "")
-                    url = item.get("link") or item.get("url", "")
-                    if title and url:
-                        headlines.append({"title": title, "url": url})
-                price_data[ticker]["news"] = headlines
-            except:
-                price_data[ticker]["news"] = []
-    except Exception as err:
-        log.warning(f"News fetch error: {err}")
+    import urllib.request
+    import xml.etree.ElementTree as ET
+
+    for ticker in tickers:
+        if ticker not in price_data:
+            continue
+        try:
+            url = f"https://finance.yahoo.com/rss/headline?s={ticker}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; SwingDesk/1.0)"})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                xml_content = response.read().decode("utf-8", errors="ignore")
+            root = ET.fromstring(xml_content)
+            headlines = []
+            for item in root.findall(".//item")[:3]:
+                title_el = item.find("title")
+                link_el = item.find("link")
+                title = title_el.text.strip() if title_el is not None and title_el.text else ""
+                link = link_el.text.strip() if link_el is not None and link_el.text else ""
+                if title and link:
+                    headlines.append({"title": title, "url": link})
+            price_data[ticker]["news"] = headlines
+        except Exception as err:
+            price_data[ticker]["news"] = []
+            log.debug(f"News fetch failed for {ticker}: {err}")
 
 # ── SCORING ENGINE ────────────────────────────────────────────────────────────
 def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, direction="long"):
@@ -1497,12 +1502,13 @@ def run_scheduler():
         scan_label = f"post_market_{label}"
         schedule.every().day.at(time_str).do(lambda st=scan_label: run_comprehensive_scan(scan_type=st))
 
-    # Self-audit at 8:00 AM CST = 13:00 UTC (before final scan)
-    # Skip weekends — no new trade data to learn from on Sat/Sun
+    # Self-audit at 7:00 PM CST = 00:00 UTC (midnight) — end of trading day
+    # Runs after post-market closes so brain has full day of data to learn from
+    # Skip weekends — no trading data on Sat/Sun
     def run_audit_if_weekday():
         if current_time_cst().weekday() < 5:
             run_self_audit()
-    schedule.every().day.at("12:55").do(run_audit_if_weekday)
+    schedule.every().day.at("23:55").do(run_audit_if_weekday)
 
     log.info("Scheduler started — comprehensive scans every 30min, 5-min position monitoring")
 
