@@ -2498,9 +2498,15 @@ def api_fix_buy_prices():
             buy_date = position["buy_date"]  # e.g. "2026-05-23"
 
             try:
-                # Fetch 1-minute data for that day
-                raw = yf.download(ticker, period="5d", interval="1m", 
-                                  auto_adjust=True, progress=False)
+                # Fetch 1-minute data using explicit date range for the buy date
+                import datetime
+                buy_dt = datetime.datetime.strptime(buy_date, "%Y-%m-%d")
+                next_dt = buy_dt + datetime.timedelta(days=1)
+                start_str = buy_dt.strftime("%Y-%m-%d")
+                end_str = next_dt.strftime("%Y-%m-%d")
+
+                raw = yf.download(ticker, start=start_str, end=end_str,
+                                  interval="1m", auto_adjust=True, progress=False)
 
                 if raw.empty:
                     results.append({"ticker": ticker, "status": "no_data"})
