@@ -830,6 +830,129 @@ def check_52w_breakouts(tickers, price_data):
         log.warning(f"52W breakout check error: {error}")
     return breakouts
 
+def calculate_method_confluence(ticker, price_data, scored_stocks=None):
+    """
+    Score a ticker against 7 trading methods and return confluence count.
+    Each method returns True/False based on its rules applied to daily OHLCV data.
+    
+    Methods:
+    1. Darvas Box — near 52W high + volume + positive gap
+    2. Gap and Go — gap up >2% + volume surge
+    3. Donchian Channel — price above 20-day high
+    4. Inside Day — today's range inside yesterday's + breaking up
+    5. NR7 — narrowest range of last 7 days
+    6. Bull Flag — strong prior move + tight consolidation
+    7. Pocket Pivot — up day with volume > any down-day vol of last 10 days
+    
+    Returns: {"count": int, "methods": [list of method names that agree]}
+    """
+    if ticker not in price_data:
+        return {"count": 0, "methods": []}
+
+    data = price_data[ticker]
+    price = data.get("price", 0)
+    volume_ratio = data.get("volume_ratio", 1)
+    gap_pct = data.get("gap_percent", 0)
+    day_change = data.get("day_change_percent", 0)
+    high = data.get("high", price)
+    low = data.get("low", price)
+    prev_close = data.get("previous_close", price)
+    week_high = data.get("52w_high")
+    daily_history = data.get("daily_history", [])  # List of {high, low, close, volume} dicts
+
+    methods_agree = []
+
+    # 1. Darvas Box
+    if week_high and price >= week_high * 0.95 and volume_ratio >= 1.5 and gap_pct > 0:
+        methods_agree.append("Darvas")
+
+    # 2. Gap and Go
+    if gap_pct >= 2.0 and volume_ratio >= 1.5 and day_change >= 0:
+        methods_agree.append("Gap & Go")
+
+    # 3. Donchian Channel — price above 20-day high
+    if daily_history and len(daily_history) >= 20:
+        twenty_day_high = max(d["high"] for d in daily_history[-20:])
+        if price >= twenty_day_high * 0.99:
+            methods_agree.append("Donchian")
+    elif week_high and price >= week_high * 0.97:
+        # Fallback if no history: near 52W high is a strong proxy
+        methods_agree.append("Donchian")
+
+    # 4. Inside Day breakout — today's range inside yesterday's, now breaking up
+    if daily_history and len(daily_history) >= 2:
+        prev_high = daily_history[-2]["high"] if len(daily_history) >= 2 else high
+        prev_low = daily_history[-2]["low"] if len(daily_history) >= 2 else low
+        prev_day_high = daily_history[-1]["high"] if len(daily_history) >= 1 else high
+        prev_day_low = daily_history[-1]["low"] if len(daily_history) >= 1 else low
+        inside_day = prev_day_high <= prev_high and prev_day_low >= prev_low
+        if inside_day and gap_pct > 0:
+            methods_agree.append("Inside Day")
+
+    # 5. NR7 — today's range is narrowest of last 7 days (compression)
+    if daily_history and len(daily_history) >= 7:
+        ranges = [(d["high"] - d["low"]) for d in daily_history[-7:]]
+        today_range = high - low
+        if today_range <= min(ranges) * 1.05 and gap_pct > 0:
+            methods_agree.append("NR7")
+
+    # 6. Bull Flag — strong move in last 3-5 days + today consolidating/breaking up
+    if daily_history and len(daily_history) >= 5:
+        five_day_move = (price - daily_history[-5]["close"]) / max(daily_history[-5]["close"], 0.01) * 100
+        recent_consolidation = abs(day_change) < 3  # Tight day = flag
+        if five_day_move >= 8 and recent_consolidation and gap_pct >= 0:
+            methods_agree.append("Bull Flag")
+
+    # 7. Pocket Pivot — up day with volume exceeding any down-day volume of last 10 days
+    if daily_history and len(daily_history) >= 10 and day_change > 0:
+        down_day_volumes = [d["volume"] for d in daily_history[-10:] if d.get("close", 0) < d.get("open", 0)]
+        current_volume = data.get("volume", 0)
+        if down_day_volumes and current_volume > max(down_day_volumes):
+            methods_agree.append("Pocket Pivot")
+        elif not down_day_volumes and volume_ratio >= 1.5 and day_change > 0:
+            # No down days in 10 days — strong uptrend, volume surge qualifies
+            methods_agree.append("Pocket Pivot")
+
+    return {"count": len(methods_agree), "methods": methods_agree}
+
+
+def enrich_price_data_with_history(tickers, price_data):
+    """
+    Fetch daily OHLCV history for confluence scoring methods that need it.
+    Adds 'daily_history' list to each ticker's price_data entry.
+    """
+    try:
+        import yfinance as yf
+        batch_data = yf.download(
+            tickers, period="30d", interval="1d",
+            auto_adjust=True, progress=False, threads=True
+        )
+        for ticker in tickers:
+            if ticker not in price_data:
+                continue
+            try:
+                if len(tickers) == 1:
+                    td = batch_data
+                else:
+                    td = batch_data[ticker] if ticker in batch_data.columns.get_level_values(0) else None
+                if td is None or td.empty:
+                    continue
+                history = []
+                for i in range(len(td)):
+                    row = td.iloc[i]
+                    history.append({
+                        "high": float(row["High"]),
+                        "low": float(row["Low"]),
+                        "close": float(row["Close"]),
+                        "open": float(row["Open"]),
+                        "volume": float(row["Volume"]),
+                    })
+                price_data[ticker]["daily_history"] = history
+            except:
+                pass
+    except Exception as e:
+        log.warning(f"History enrichment error: {e}")
+
 def run_darvas_silent_collection(price_data, scored_stocks):
     """
     Silently record Darvas Box picks for future performance comparison.
@@ -1115,6 +1238,9 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
     # Check for 52-week breakouts (informational only, does not affect scoring)
     check_52w_breakouts(list(price_data.keys()), price_data)
 
+    # Enrich price data with daily history for confluence method scoring
+    enrich_price_data_with_history(list(price_data.keys()), price_data)
+
     # Prevent simultaneous long and short on the same ticker
     database = get_database()
     open_trades = database.execute(
@@ -1147,6 +1273,9 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
         long_move = estimate_overnight_move(stock_data, long_confidence, has_earnings)
         short_move = estimate_overnight_move(stock_data, short_confidence, has_earnings)
 
+        # Calculate method confluence
+        confluence = calculate_method_confluence(ticker, price_data)
+
         scored_stocks.append({
             "ticker": ticker,
             "name": ticker,
@@ -1170,6 +1299,8 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
             "52w_high": stock_data.get("52w_high"),
             "broke_52w_high_days_ago": stock_data.get("broke_52w_high_days_ago"),
             "news": stock_data.get("news", []),
+            "confluence_count": confluence["count"],
+            "confluence_methods": confluence["methods"],
         })
 
     # Filter by confidence floor — longs only.
