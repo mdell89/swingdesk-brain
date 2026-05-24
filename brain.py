@@ -2292,6 +2292,10 @@ def api_open_positions_dynamic():
         earnings_soon = check_upcoming_earnings(tickers)
         fetch_ticker_news(tickers, current_price_data)
 
+        # Enrich with 52W breakout and confluence data
+        check_52w_breakouts(tickers, current_price_data)
+        enrich_price_data_with_history(tickers, current_price_data)
+
         now_cst = current_time_cst()
         market_is_live = (now_cst.weekday() < 5 and
                           now_cst.hour >= 8 and
@@ -2356,6 +2360,10 @@ def api_open_positions_dynamic():
                 enriched["current_rsi"] = round(rsi, 1)
                 enriched["current_volume_ratio"] = round(stock_data.get("volume_ratio", 1), 2)
                 enriched["news"] = current_price_data.get(ticker, {}).get("news", [])
+                enriched["broke_52w_high_days_ago"] = current_price_data.get(ticker, {}).get("broke_52w_high_days_ago")
+                confluence = calculate_method_confluence(ticker, current_price_data)
+                enriched["confluence_count"] = confluence["count"]
+                enriched["confluence_methods"] = confluence["methods"]
 
                 # Sentiment with time-aware CUT thresholds
                 frozen_target = position["expected_move"] or 10
@@ -2402,11 +2410,12 @@ def api_open_positions_dynamic():
         def sort_priority(pos):
             pnl = pos.get("current_pnl_percent") or 0
             target = pos.get("expected_move") or 10
-            if pnl >= target: return (1, -pnl)
-            if pnl >= target * 0.7: return (2, -pnl)
-            if pnl >= 0: return (3, -pnl)
-            if pnl >= -(target * 0.25): return (4, -pnl)
-            return (0, -pnl)  # CUT
+            icon = pos.get("sentiment_icon", "")
+            if pnl >= target: return (1, -pnl)           # SELL
+            if pnl >= target * 0.7: return (2, -pnl)     # NEAR
+            if pnl >= 0: return (3, -pnl)                # HOLD
+            if icon == "x": return (0, -pnl)             # CUT — only when backend flagged it
+            return (4, -pnl)                              # WEAK
 
         enriched_positions.sort(key=sort_priority)
         return jsonify(enriched_positions)
