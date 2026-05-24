@@ -357,6 +357,52 @@ def initialize_database():
             consumed_by_trade_id TEXT,
             consumed_at TEXT
         );
+
+        /*
+         * Extended Runner Tracking
+         * ════════════════════════
+         * Tracks positions the user continues holding after the brain sells.
+         * Brain sells at its target; user may choose to hold for larger gains.
+         * This table records the divergence for educational display.
+         */
+        CREATE TABLE IF NOT EXISTS extended_runners (
+            id TEXT PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            buy_date TEXT NOT NULL,
+            buy_price REAL,
+            brain_sell_date TEXT,
+            brain_sell_price REAL,
+            brain_pnl_percent REAL,
+            current_price REAL,
+            current_pnl_percent REAL,
+            invested_amount REAL DEFAULT 10.0,
+            status TEXT DEFAULT 'running',
+            last_updated TEXT
+        );
+
+        /*
+         * Darvas Box Silent Tracking
+         * ══════════════════════════
+         * Silently records which stocks would have been picked by the Darvas Box
+         * method each day, and tracks their outcomes. No UI, no virtual trades,
+         * no position monitoring — just data collection for future comparison
+         * against the custom brain's performance.
+         *
+         * Must be built within 60 days of brain launch (2026-05-23) to enable
+         * retroactive 5-minute data backfill via yfinance.
+         */
+        CREATE TABLE IF NOT EXISTS darvas_picks (
+            id TEXT PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            date TEXT NOT NULL,
+            entry_price REAL,
+            week_high REAL,
+            volume_ratio REAL,
+            would_have_bought INTEGER DEFAULT 1,
+            outcome TEXT DEFAULT 'open',
+            actual_move REAL,
+            logged_at TEXT
+        );
     """)
 
     # Add new columns to virtual_trades if upgrading from earlier schema
@@ -743,6 +789,78 @@ def check_52w_breakouts(tickers, price_data):
         log.warning(f"52W breakout check error: {error}")
     return breakouts
 
+def run_darvas_silent_collection(price_data, scored_stocks):
+    """
+    Silently record Darvas Box picks for future performance comparison.
+
+    Darvas Box rules (simplified for overnight swing):
+    1. Stock is within 5% of its 52-week high (near the top of its box)
+    2. Volume is at least 1.5x average (confirms breakout conviction)
+    3. Price gapped up or is showing positive momentum
+
+    No virtual trades, no position monitoring, no UI impact.
+    Just logging which stocks Darvas would have picked and tracking outcomes.
+    Must run within 60 days of 2026-05-23 to enable retroactive backfill.
+    """
+    try:
+        database = get_database()
+        today = current_time_cst().strftime("%Y-%m-%d")
+        darvas_picks = []
+
+        for stock in scored_stocks:
+            ticker = stock["ticker"]
+            if ticker not in price_data:
+                continue
+            data = price_data[ticker]
+            week_high = data.get("52w_high")
+            if not week_high:
+                continue
+            current_price = data.get("price", 0)
+            volume_ratio = data.get("volume_ratio", 0)
+
+            # Darvas rule: within 5% of 52W high + volume confirmation
+            near_high = current_price >= week_high * 0.95
+            volume_confirmed = volume_ratio >= 1.5
+            positive_gap = data.get("gap_percent", 0) > 0
+
+            if near_high and volume_confirmed and positive_gap:
+                pick_id = f"{ticker}_{today}_darvas"
+                existing = database.execute(
+                    "SELECT id FROM darvas_picks WHERE id=?", [pick_id]
+                ).fetchone()
+                if not existing:
+                    database.execute("""
+                        INSERT INTO darvas_picks
+                        (id, ticker, date, entry_price, week_high, volume_ratio, would_have_bought, outcome, logged_at)
+                        VALUES (?,?,?,?,?,?,1,'open',?)
+                    """, [pick_id, ticker, today, current_price, week_high,
+                          round(volume_ratio, 2), current_time_cst().isoformat()])
+                    darvas_picks.append(ticker)
+
+        # Resolve open Darvas picks older than 2 days
+        open_picks = database.execute(
+            "SELECT * FROM darvas_picks WHERE outcome='open' AND date < ?",
+            [(current_time_cst() - timedelta(days=2)).strftime("%Y-%m-%d")]
+        ).fetchall()
+
+        for pick in open_picks:
+            if pick["ticker"] in price_data:
+                entry = pick["entry_price"] or 1
+                current = price_data[pick["ticker"]]["price"]
+                actual_move = (current - entry) / entry * 100
+                outcome = "hit" if actual_move >= 5 else "miss"
+                database.execute(
+                    "UPDATE darvas_picks SET outcome=?, actual_move=? WHERE id=?",
+                    [outcome, round(actual_move, 2), pick["id"]]
+                )
+
+        database.commit()
+        database.close()
+        if darvas_picks:
+            log.info(f"Darvas silent: {len(darvas_picks)} picks logged — {darvas_picks}")
+    except Exception as err:
+        log.warning(f"Darvas silent collection error: {err}")
+
 def fetch_ticker_news(tickers, price_data):
     """
     Fetch up to 3 recent news headlines per ticker using Yahoo Finance RSS.
@@ -1012,6 +1130,9 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
         key=lambda x: x["long_conf"], reverse=True
     )
     recommended_shorts = []  # Disabled until short-specific signals are implemented
+
+    # Run Darvas silent collection on all scored stocks
+    run_darvas_silent_collection(price_data, scored_stocks)
 
     # Fetch news for top recommended longs only (not full universe)
     top_tickers = [s["ticker"] for s in recommended_longs[:MAX_LONG_PICKS]]
@@ -1539,6 +1660,85 @@ def health():
         "time_utc": datetime.utcnow().isoformat(),
     })
 
+@app.route("/api/extended-runners")
+def api_extended_runners():
+    """
+    Return extended runner positions — trades the user is holding after the brain sold.
+    Fetches current price from yfinance to calculate live user P&L vs brain P&L.
+    """
+    database = get_database()
+    runners = database.execute(
+        "SELECT * FROM extended_runners WHERE status='running' ORDER BY buy_date DESC"
+    ).fetchall()
+    database.close()
+
+    if not runners:
+        return jsonify([])
+
+    tickers = [r["ticker"] for r in runners]
+    price_data = fetch_price_data(tickers)
+    result = []
+
+    for runner in runners:
+        ticker = runner["ticker"]
+        current_price = price_data.get(ticker, {}).get("price", runner["current_price"] or runner["buy_price"])
+        buy_price = runner["buy_price"] or 1
+        current_pnl = (current_price - buy_price) / buy_price * 100
+        invested = runner["invested_amount"] or 10
+        current_value = invested * (1 + current_pnl / 100)
+
+        result.append({
+            **dict(runner),
+            "current_price": round(current_price, 4),
+            "current_pnl_percent": round(current_pnl, 2),
+            "current_value": round(current_value, 4),
+        })
+
+        # Update DB with latest price
+        database = get_database()
+        database.execute(
+            "UPDATE extended_runners SET current_price=?, current_pnl_percent=?, last_updated=? WHERE id=?",
+            [round(current_price, 4), round(current_pnl, 2), current_time_cst().isoformat(), runner["id"]]
+        )
+        database.commit()
+        database.close()
+
+    return jsonify(result)
+
+@app.route("/api/extended-runners/add", methods=["POST"])
+def api_add_extended_runner():
+    """
+    Mark a closed brain trade as an extended runner — user is still holding.
+    Called manually or when user taps "extend" on a closed position.
+    """
+    data = request.get_json()
+    trade_id = data.get("trade_id")
+    if not trade_id:
+        return jsonify({"error": "trade_id required"}), 400
+
+    database = get_database()
+    trade = database.execute(
+        "SELECT * FROM virtual_trades WHERE id=?", [trade_id]
+    ).fetchone()
+
+    if not trade:
+        database.close()
+        return jsonify({"error": "Trade not found"}), 404
+
+    runner_id = f"{trade['ticker']}_{trade['buy_date']}_runner"
+    database.execute("""
+        INSERT OR REPLACE INTO extended_runners
+        (id, ticker, buy_date, buy_price, brain_sell_date, brain_sell_price,
+         brain_pnl_percent, current_price, invested_amount, status, last_updated)
+        VALUES (?,?,?,?,?,?,?,?,?,'running',?)
+    """, [runner_id, trade["ticker"], trade["buy_date"], trade["buy_price"],
+          trade["sell_date"], trade["sell_price"], trade["actual_move"],
+          trade["sell_price"], trade["invested_amount"],
+          current_time_cst().isoformat()])
+    database.commit()
+    database.close()
+    return jsonify({"success": True, "runner_id": runner_id})
+
 @app.route("/api/last-known")
 def api_last_known():
     """
@@ -1735,15 +1935,10 @@ def api_performance_history():
         })
 
     # ── Overlay position check snapshots as intraday points ───────────────────
-    # Exclude the seed date (2026-05-22) — those checks were retroactively
-    # injected and don't represent real-time monitoring. They create an
-    # artificial dip on the chart because early morning prices are lower
-    # than the entry price. Real monitoring always starts from entry price.
-    SEED_DATE = "2026-05-22"
+    # Include all position checks — natural data accumulation will smooth
+    # out any early dips over time as real trading days accumulate.
     for snapshot in check_snapshots:
         if not snapshot["check_time"]:
-            continue
-        if snapshot["check_time"].startswith(SEED_DATE):
             continue
         snapshot_dollars = float(snapshot["snapshot_pnl_dollars"] or 0)
         check_dt = datetime.fromisoformat(snapshot["check_time"])
