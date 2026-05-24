@@ -1372,9 +1372,16 @@ def monitor_open_positions():
         database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
             [f"last_monitor_price_{ticker}", json.dumps({"price": price, "stale_count": stale_count})])
 
+        # Stale price guard — if price unchanged 3+ checks OR outside market hours,
+        # skip all DB writes to preserve last known good P&L values.
         if stale_count >= 3 and is_market_open():
-            log.warning(f"{ticker} price unchanged for {stale_count} checks — possible halt, skipping sell decision")
+            log.warning(f"{ticker} price unchanged for {stale_count} checks — possible halt, freezing P&L")
             continue
+
+        # Outside market hours (weekends, after-hours) — freeze P&L, no writes
+        if not is_market_open():
+            continue
+
         buy_price = position["buy_price"]
         invested = position["invested_amount"] or DEFAULT_INVESTMENT
         pnl_percent = (price - buy_price) / buy_price * 100
@@ -2152,10 +2159,12 @@ def api_open_positions_dynamic():
             elif pnl_pct >= 2:
                 enriched["sentiment"] = f"Holding. On track. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
                 enriched["sentiment_icon"] = "check"
-            elif pnl_pct >= 0:
-                enriched["sentiment"] = f"Watching. Weak move. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
+            elif pnl_pct >= -1.0:
+                # Flat or very slightly negative — not a true reversal, just noise
+                enriched["sentiment"] = f"Watching. Weak move. {pnl_pct:+.1f}% of {frozen_target:.1f}% target."
                 enriched["sentiment_icon"] = "warning"
             else:
+                # Genuinely reversing — meaningful loss exceeding -1%
                 enriched["sentiment"] = f"Watching for reversal. {pnl_pct:.1f}%. Consider exiting."
                 enriched["sentiment_icon"] = "x"
         else:
