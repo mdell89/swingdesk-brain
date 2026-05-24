@@ -2121,24 +2121,32 @@ def api_open_positions_dynamic():
             if market_is_live:
                 current_price = stock_data["price"]
             else:
-                # Use the stored current_value from DB to back-calculate a stable price,
-                # or fall back to the daily close from fetch_price_data (period=5d, iloc[-1])
-                stored_pnl = position.get("current_value")
-                if stored_pnl and stored_pnl != position["invested_amount"]:
-                    # Trust the last value written by the monitoring loop
-                    current_price = buy_price * (stored_pnl / max(position["invested_amount"], 0.01))
+                # Outside market hours — freeze at last known stored value.
+                # Do NOT fall back to yfinance price; it returns stale/zero data
+                # on weekends that overwrites real gains.
+                stored_value = position.get("current_value")
+                invested = position.get("invested_amount") or 10.0
+                if stored_value and abs(stored_value - invested) > 0.001:
+                    # Back-calculate price from stored P&L value
+                    current_price = buy_price * (stored_value / max(invested, 0.01))
                 else:
-                    # Use daily close — fetch_price_data period="5d" returns the last trading day's close
-                    current_price = stock_data["price"]
+                    # No stored movement — hold at buy price (flat, not wrong)
+                    current_price = buy_price
 
             pnl_pct = (current_price - buy_price) / max(buy_price, 0.01) * 100
             if position["direction"] == "short":
                 pnl_pct = -pnl_pct
 
+            # Clamp floating point negative zero
+            if abs(pnl_pct) < 0.005:
+                pnl_pct = 0.0
+
             # Compute dollar P&L from invested amount, not just price ratio,
             # so fractional share positions display correctly
             invested_amount = position["invested_amount"] or 10.0
             current_value = invested_amount * (1 + pnl_pct / 100)
+            if abs(current_value - invested_amount) < 0.005:
+                current_value = invested_amount
 
             enriched["dynamic_confidence"] = dynamic_confidence
             enriched["dynamic_estimate"] = dynamic_estimate
