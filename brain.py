@@ -2404,8 +2404,8 @@ def api_backfill_close_prices():
             current_value = invested * (1 + pnl_pct / 100)
 
             database.execute(
-                "UPDATE virtual_trades SET current_value=?, current_pnl_percent=? WHERE id=?",
-                [round(current_value, 4), round(pnl_pct, 2), position["id"]]
+                "UPDATE virtual_trades SET current_value=? WHERE id=?",
+                [round(current_value, 4), position["id"]]
             )
             updated += 1
             results.append({
