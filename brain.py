@@ -2194,25 +2194,50 @@ def api_open_positions_dynamic():
             enriched["current_rsi"] = round(rsi, 1)
             enriched["current_volume_ratio"] = round(stock_data.get("volume_ratio", 1), 2)
 
-            # Generate first-person sentiment using frozen target
+            # Generate sentiment using time-aware CUT thresholds
             frozen_target = position["expected_move"] or 10
+            now_cst = current_time_cst()
+            minute_of_day = now_cst.hour * 60 + now_cst.minute
+            is_weekday = now_cst.weekday() < 5
+
+            WINDOW1 = 9  * 60 + 30  # 9:30 AM CST
+            WINDOW2 = 11 * 60 + 20  # 11:20 AM CST
+            WINDOW3 = 13 * 60 + 10  # 1:10 PM CST
+            MARKET_OPEN  = 8  * 60 + 30
+            MARKET_CLOSE = 15 * 60
+
+            # Determine CUT threshold based on time
+            cut_threshold = None
+            if is_weekday and MARKET_OPEN <= minute_of_day < MARKET_CLOSE:
+                if minute_of_day < WINDOW1:
+                    cut_threshold = None  # Grace period
+                elif minute_of_day < WINDOW2:
+                    cut_threshold = frozen_target * 0.75
+                elif minute_of_day < WINDOW3:
+                    cut_threshold = frozen_target * 0.50
+                else:
+                    cut_threshold = frozen_target * 0.25
+
+            is_cut = cut_threshold is not None and pnl_pct < -(cut_threshold)
+
             if pnl_pct >= frozen_target:
                 enriched["sentiment"] = f"Target exceeded. +{pnl_pct:.1f}% vs {frozen_target:.1f}% target. Considering early exit."
                 enriched["sentiment_icon"] = "flash"
             elif pnl_pct >= frozen_target * 0.7:
                 enriched["sentiment"] = f"Approaching target. +{pnl_pct:.1f}% of {frozen_target:.1f}% target. Watching closely."
                 enriched["sentiment_icon"] = "flash"
+            elif is_cut:
+                enriched["sentiment"] = f"Reversing. {pnl_pct:.1f}% exceeds cut threshold. Consider exiting."
+                enriched["sentiment_icon"] = "x"
             elif pnl_pct >= 2:
                 enriched["sentiment"] = f"Holding. On track. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
                 enriched["sentiment_icon"] = "check"
-            elif pnl_pct >= -1.0:
-                # Flat or very slightly negative — not a true reversal, just noise
-                enriched["sentiment"] = f"Watching. Weak move. {pnl_pct:+.1f}% of {frozen_target:.1f}% target."
+            elif pnl_pct < 0:
+                enriched["sentiment"] = f"Watching. Behind pace. {pnl_pct:+.1f}% of {frozen_target:.1f}% target."
                 enriched["sentiment_icon"] = "warning"
             else:
-                # Genuinely reversing — meaningful loss exceeding -1%
-                enriched["sentiment"] = f"Watching for reversal. {pnl_pct:.1f}%. Consider exiting."
-                enriched["sentiment_icon"] = "x"
+                enriched["sentiment"] = f"Holding. Flat. {pnl_pct:+.1f}% of {frozen_target:.1f}% target."
+                enriched["sentiment_icon"] = "check"
         else:
             enriched["dynamic_confidence"] = position.get("confidence", 0)
             enriched["dynamic_estimate"] = position.get("expected_move", 0)
