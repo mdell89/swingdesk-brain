@@ -1597,12 +1597,18 @@ def monitor_open_positions():
             dyn_conf = position.get("dynamic_confidence") or position.get("confidence", 0)
             dyn_est = position.get("dynamic_estimate") or position.get("expected_move", 0)
 
-        database.execute("""
-            UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?,
-            dynamic_confidence=?, dynamic_estimate=?
-            WHERE id=?
-        """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2),
-              dyn_conf, round(dyn_est, 1), position["id"]])
+        try:
+            database.execute("""
+                UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?,
+                dynamic_confidence=?, dynamic_estimate=?
+                WHERE id=?
+            """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2),
+                  dyn_conf, round(dyn_est, 1), position["id"]])
+        except:
+            database.execute("""
+                UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?
+                WHERE id=?
+            """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2), position["id"]])
 
         # Determine if this is the sell day (position was opened before today)
         is_sell_day = position["buy_date"] < today
@@ -2268,158 +2274,154 @@ def api_scan_history():
 
 @app.route("/api/open-positions-dynamic")
 def api_open_positions_dynamic():
-    """
-    Return open positions with dynamic confidence and estimate scores.
-    
-    Dynamic confidence: recalculated using current indicators (RSI, volume, etc.)
-    Dynamic estimate: predicted move from BUY PRICE to forced close, using current data
-    
-    Both are anchored to the buy price and the 2:45 PM forced close deadline,
-    making them directly comparable to the frozen entry values.
-    """
-    database = get_database()
-    open_positions = [dict(t) for t in database.execute(
-        "SELECT * FROM virtual_trades WHERE outcome='open'"
-    ).fetchall()]
-    database.close()
+    """Return open positions with dynamic scoring, sorted by sentiment priority."""
+    try:
+        database = get_database()
+        open_positions = [dict(t) for t in database.execute(
+            "SELECT * FROM virtual_trades WHERE outcome='open'"
+        ).fetchall()]
+        database.close()
 
-    if not open_positions:
-        return jsonify([])
+        if not open_positions:
+            return jsonify([])
 
-    tickers = list(set(position["ticker"] for position in open_positions))
-    weights = get_signal_weights()
+        tickers = list(set(p["ticker"] for p in open_positions))
+        weights = get_signal_weights()
+        current_price_data = fetch_price_data(tickers)
+        current_rsi = calculate_rsi_batch(tickers)
+        earnings_soon = check_upcoming_earnings(tickers)
+        fetch_ticker_news(tickers, current_price_data)
 
-    # Fetch current data for dynamic scoring
-    current_price_data = fetch_price_data(tickers)
-    current_rsi = calculate_rsi_batch(tickers)
-    earnings_soon = check_upcoming_earnings(tickers)
+        now_cst = current_time_cst()
+        market_is_live = (now_cst.weekday() < 5 and
+                          now_cst.hour >= 8 and
+                          (now_cst.hour < 15 or (now_cst.hour == 15 and now_cst.minute == 0)))
 
-    # Fetch news for open positions
-    fetch_ticker_news(tickers, current_price_data)
+        minute_of_day = now_cst.hour * 60 + now_cst.minute
+        is_weekday = now_cst.weekday() < 5
+        WINDOW1 = 9 * 60 + 30
+        WINDOW2 = 11 * 60 + 20
+        WINDOW3 = 13 * 60 + 10
+        MARKET_OPEN = 8 * 60 + 30
+        MARKET_CLOSE = 15 * 60
 
-    enriched_positions = []
-    for position in open_positions:
-        ticker = position["ticker"]
-        enriched = dict(position)
+        enriched_positions = []
+        for position in open_positions:
+            ticker = position["ticker"]
+            enriched = dict(position)
 
-        if ticker in current_price_data:
-            stock_data = current_price_data[ticker]
-            rsi = current_rsi.get(ticker, 50.0)
-            has_earnings = ticker in earnings_soon
+            if ticker in current_price_data:
+                stock_data = current_price_data[ticker]
+                rsi = current_rsi.get(ticker, 50.0)
+                has_earnings = ticker in earnings_soon
 
-            # Dynamic confidence and estimate:
-            # During market hours — recalculate from live intraday data
-            # Outside market hours — freeze at last stored values from monitoring loop
-            if market_is_live:
-                dynamic_confidence = calculate_confidence_score(
-                    ticker, stock_data, rsi, earnings_soon, weights, position["direction"]
-                )
-                dynamic_estimate = estimate_overnight_move(stock_data, dynamic_confidence, has_earnings)
-            else:
-                dynamic_confidence = position.get("dynamic_confidence") or position.get("confidence", 0)
-                dynamic_estimate = position.get("dynamic_estimate") or position.get("expected_move", 0)
-
-            # Current P&L — use live price only during market hours on weekdays.
-            # On weekends or after hours, freeze at last known good price from DB
-            # to avoid yfinance returning stale intraday data that wipes real gains.
-            buy_price = position["buy_price"] or 0
-            now_cst = current_time_cst()
-            market_is_live = (now_cst.weekday() < 5 and
-                              now_cst.hour >= 8 and
-                              (now_cst.hour < 15 or (now_cst.hour == 15 and now_cst.minute == 0)))
-
-            if market_is_live:
-                current_price = stock_data["price"]
-            else:
-                # Outside market hours — freeze at last known stored value.
-                # Do NOT fall back to yfinance price; it returns stale/zero data
-                # on weekends that overwrites real gains.
-                stored_value = position.get("current_value")
-                invested = position.get("invested_amount") or 10.0
-                if stored_value and abs(stored_value - invested) > 0.001:
-                    # Back-calculate price from stored P&L value
-                    current_price = buy_price * (stored_value / max(invested, 0.01))
+                # Dynamic confidence/estimate: live during market hours, frozen otherwise
+                if market_is_live:
+                    dynamic_confidence = calculate_confidence_score(
+                        ticker, stock_data, rsi, earnings_soon, weights, position["direction"]
+                    )
+                    dynamic_estimate = estimate_overnight_move(stock_data, dynamic_confidence, has_earnings)
                 else:
-                    # No stored movement — hold at buy price (flat, not wrong)
-                    current_price = buy_price
+                    dynamic_confidence = position.get("dynamic_confidence") or position.get("confidence", 0)
+                    dynamic_estimate = position.get("dynamic_estimate") or position.get("expected_move", 0)
 
-            pnl_pct = (current_price - buy_price) / max(buy_price, 0.01) * 100
-            if position["direction"] == "short":
-                pnl_pct = -pnl_pct
-
-            # Clamp floating point negative zero
-            if abs(pnl_pct) < 0.005:
-                pnl_pct = 0.0
-
-            # Compute dollar P&L from invested amount, not just price ratio,
-            # so fractional share positions display correctly
-            invested_amount = position["invested_amount"] or 10.0
-            current_value = invested_amount * (1 + pnl_pct / 100)
-            if abs(current_value - invested_amount) < 0.005:
-                current_value = invested_amount
-
-            enriched["dynamic_confidence"] = dynamic_confidence
-            enriched["dynamic_estimate"] = dynamic_estimate
-            enriched["current_price"] = round(current_price, 4)
-            enriched["current_pnl_percent"] = round(pnl_pct, 2)
-            enriched["current_value"] = round(current_value, 4)
-            enriched["current_rsi"] = round(rsi, 1)
-            enriched["current_volume_ratio"] = round(stock_data.get("volume_ratio", 1), 2)
-            enriched["news"] = current_price_data.get(ticker, {}).get("news", [])
-
-            # Generate sentiment using time-aware CUT thresholds
-            frozen_target = position["expected_move"] or 10
-            now_cst = current_time_cst()
-            minute_of_day = now_cst.hour * 60 + now_cst.minute
-            is_weekday = now_cst.weekday() < 5
-
-            WINDOW1 = 9  * 60 + 30  # 9:30 AM CST
-            WINDOW2 = 11 * 60 + 20  # 11:20 AM CST
-            WINDOW3 = 13 * 60 + 10  # 1:10 PM CST
-            MARKET_OPEN  = 8  * 60 + 30
-            MARKET_CLOSE = 15 * 60
-
-            # Determine CUT threshold based on time
-            cut_threshold = None
-            if is_weekday and MARKET_OPEN <= minute_of_day < MARKET_CLOSE:
-                if minute_of_day < WINDOW1:
-                    cut_threshold = None  # Grace period
-                elif minute_of_day < WINDOW2:
-                    cut_threshold = frozen_target * 0.75
-                elif minute_of_day < WINDOW3:
-                    cut_threshold = frozen_target * 0.50
+                # P&L: live during market hours, frozen otherwise
+                buy_price = position["buy_price"] or 0
+                if market_is_live:
+                    current_price = stock_data["price"]
                 else:
-                    cut_threshold = frozen_target * 0.25
+                    stored_value = position.get("current_value")
+                    invested = position.get("invested_amount") or 10.0
+                    if stored_value and abs(stored_value - invested) > 0.001:
+                        current_price = buy_price * (stored_value / max(invested, 0.01))
+                    else:
+                        current_price = buy_price
 
-            is_cut = cut_threshold is not None and pnl_pct < -(cut_threshold)
+                pnl_pct = (current_price - buy_price) / max(buy_price, 0.01) * 100
+                if position["direction"] == "short":
+                    pnl_pct = -pnl_pct
+                if abs(pnl_pct) < 0.005:
+                    pnl_pct = 0.0
 
-            if pnl_pct >= frozen_target:
-                enriched["sentiment"] = f"Target exceeded. +{pnl_pct:.1f}% vs {frozen_target:.1f}% target. Considering early exit."
-                enriched["sentiment_icon"] = "flash"
-            elif pnl_pct >= frozen_target * 0.7:
-                enriched["sentiment"] = f"Approaching target. +{pnl_pct:.1f}% of {frozen_target:.1f}% target. Watching closely."
-                enriched["sentiment_icon"] = "flash"
-            elif is_cut:
-                enriched["sentiment"] = f"Reversing. {pnl_pct:.1f}% exceeds cut threshold. Consider exiting."
-                enriched["sentiment_icon"] = "x"
-            elif pnl_pct >= 2:
-                enriched["sentiment"] = f"Holding. On track. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
-                enriched["sentiment_icon"] = "check"
-            elif pnl_pct < 0:
-                enriched["sentiment"] = f"Watching. Behind pace. {pnl_pct:+.1f}% of {frozen_target:.1f}% target."
+                invested_amount = position["invested_amount"] or 10.0
+                current_value = invested_amount * (1 + pnl_pct / 100)
+                if abs(current_value - invested_amount) < 0.005:
+                    current_value = invested_amount
+
+                enriched["dynamic_confidence"] = dynamic_confidence
+                enriched["dynamic_estimate"] = dynamic_estimate
+                enriched["current_price"] = round(current_price, 4)
+                enriched["current_pnl_percent"] = round(pnl_pct, 2)
+                enriched["current_value"] = round(current_value, 4)
+                enriched["current_rsi"] = round(rsi, 1)
+                enriched["current_volume_ratio"] = round(stock_data.get("volume_ratio", 1), 2)
+                enriched["news"] = current_price_data.get(ticker, {}).get("news", [])
+
+                # Sentiment with time-aware CUT thresholds
+                frozen_target = position["expected_move"] or 10
+                cut_threshold = None
+                if is_weekday and MARKET_OPEN <= minute_of_day < MARKET_CLOSE:
+                    if minute_of_day < WINDOW1:
+                        cut_threshold = None
+                    elif minute_of_day < WINDOW2:
+                        cut_threshold = frozen_target * 0.75
+                    elif minute_of_day < WINDOW3:
+                        cut_threshold = frozen_target * 0.50
+                    else:
+                        cut_threshold = frozen_target * 0.25
+
+                is_cut = cut_threshold is not None and pnl_pct < -(cut_threshold)
+
+                if pnl_pct >= frozen_target:
+                    enriched["sentiment"] = f"Target exceeded. +{pnl_pct:.1f}% vs {frozen_target:.1f}% target."
+                    enriched["sentiment_icon"] = "flash"
+                elif pnl_pct >= frozen_target * 0.7:
+                    enriched["sentiment"] = f"Approaching target. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
+                    enriched["sentiment_icon"] = "flash"
+                elif is_cut:
+                    enriched["sentiment"] = f"Reversing. {pnl_pct:.1f}% exceeds cut threshold."
+                    enriched["sentiment_icon"] = "x"
+                elif pnl_pct >= 2:
+                    enriched["sentiment"] = f"Holding. On track. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
+                    enriched["sentiment_icon"] = "check"
+                elif pnl_pct < 0:
+                    enriched["sentiment"] = f"Watching. Behind pace. {pnl_pct:+.1f}%."
+                    enriched["sentiment_icon"] = "warning"
+                else:
+                    enriched["sentiment"] = f"Holding. Flat. {pnl_pct:+.1f}%."
+                    enriched["sentiment_icon"] = "check"
+            else:
+                enriched["dynamic_confidence"] = position.get("confidence", 0)
+                enriched["dynamic_estimate"] = position.get("expected_move", 0)
+                enriched["sentiment"] = "Monitoring. Waiting for data."
                 enriched["sentiment_icon"] = "warning"
-            else:
-                enriched["sentiment"] = f"Holding. Flat. {pnl_pct:+.1f}% of {frozen_target:.1f}% target."
-                enriched["sentiment_icon"] = "check"
-        else:
-            enriched["dynamic_confidence"] = position.get("confidence", 0)
-            enriched["dynamic_estimate"] = position.get("expected_move", 0)
-            enriched["sentiment"] = "Monitoring. Waiting for data."
-            enriched["sentiment_icon"] = "warning"
 
-        enriched_positions.append(enriched)
+            enriched_positions.append(enriched)
 
-    return jsonify(enriched_positions)
+        # Sort server-side: SELL first, then NEAR, HOLD, WEAK, CUT last
+        def sort_priority(pos):
+            pnl = pos.get("current_pnl_percent") or 0
+            target = pos.get("expected_move") or 10
+            if pnl >= target: return (1, -pnl)
+            if pnl >= target * 0.7: return (2, -pnl)
+            if pnl >= 0: return (3, -pnl)
+            if pnl >= -(target * 0.25): return (4, -pnl)
+            return (0, -pnl)  # CUT
+
+        enriched_positions.sort(key=sort_priority)
+        return jsonify(enriched_positions)
+
+    except Exception as e:
+        log.error(f"open-positions-dynamic error: {e}")
+        try:
+            database = get_database()
+            positions = [dict(t) for t in database.execute(
+                "SELECT * FROM virtual_trades WHERE outcome='open'"
+            ).fetchall()]
+            database.close()
+            return jsonify(positions)
+        except:
+            return jsonify([]), 500
 
 @app.route("/api/seed-friday", methods=["POST"])
 def api_seed_friday():
