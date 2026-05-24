@@ -2341,6 +2341,91 @@ def api_seed_friday():
         log.error(f"Seed error: {error}")
         return jsonify({"success": False, "error": str(error)}), 500
 
+# ── BACKFILL CLOSE PRICES ─────────────────────────────────────────────────────
+@app.route("/api/backfill-close-prices", methods=["POST"])
+def api_backfill_close_prices():
+    """
+    One-time (or on-demand) fix: fetch the last trading day's closing price
+    for every open position and write it into current_value in the DB.
+    Call this on weekends when positions are showing 0.0% because the monitor
+    never wrote a real price before market close.
+    """
+    try:
+        import yfinance as yf
+        database = get_database()
+        open_positions = [dict(r) for r in database.execute(
+            "SELECT * FROM virtual_trades WHERE outcome='open'"
+        ).fetchall()]
+
+        if not open_positions:
+            database.close()
+            return jsonify({"success": True, "updated": 0, "message": "No open positions"})
+
+        tickers = list(set(p["ticker"] for p in open_positions))
+        log.info(f"Backfilling close prices for {tickers}")
+
+        raw = yf.download(tickers, period="5d", auto_adjust=True, progress=False)
+        close_prices = {}
+
+        if len(tickers) == 1:
+            ticker = tickers[0]
+            closes = raw["Close"] if "Close" in raw else raw
+            if not closes.empty:
+                close_prices[ticker] = float(closes.dropna().iloc[-1])
+        else:
+            if "Close" in raw:
+                for ticker in tickers:
+                    try:
+                        col = raw["Close"][ticker].dropna()
+                        if not col.empty:
+                            close_prices[ticker] = float(col.iloc[-1])
+                    except Exception as e:
+                        log.warning(f"Could not get close for {ticker}: {e}")
+
+        updated = 0
+        results = []
+        for position in open_positions:
+            ticker = position["ticker"]
+            if ticker not in close_prices:
+                results.append({"ticker": ticker, "status": "no_price"})
+                continue
+
+            close = close_prices[ticker]
+            buy_price = position["buy_price"] or 0
+            invested = position["invested_amount"] or 10.0
+
+            if buy_price <= 0:
+                results.append({"ticker": ticker, "status": "no_buy_price"})
+                continue
+
+            pnl_pct = (close - buy_price) / buy_price * 100
+            if position["direction"] == "short":
+                pnl_pct = -pnl_pct
+            current_value = invested * (1 + pnl_pct / 100)
+
+            database.execute(
+                "UPDATE virtual_trades SET current_value=?, current_pnl_percent=? WHERE id=?",
+                [round(current_value, 4), round(pnl_pct, 2), position["id"]]
+            )
+            updated += 1
+            results.append({
+                "ticker": ticker,
+                "buy_price": buy_price,
+                "close_price": round(close, 4),
+                "pnl_pct": round(pnl_pct, 2),
+                "current_value": round(current_value, 4),
+                "status": "updated"
+            })
+            log.info(f"Backfilled {ticker}: buy={buy_price} close={close} pnl={pnl_pct:.2f}%")
+
+        database.commit()
+        database.close()
+        return jsonify({"success": True, "updated": updated, "results": results})
+
+    except Exception as e:
+        log.error(f"Backfill error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 # ── KEEP ALIVE ────────────────────────────────────────────────────────────────
 def keep_server_alive():
     """Ping self every 10 minutes to prevent Railway from sleeping the container."""
