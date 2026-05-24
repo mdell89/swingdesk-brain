@@ -637,25 +637,63 @@ def fetch_price_data(tickers):
     database.close()
     return results
 
-def fetch_current_prices(tickers):
-    """Quick price fetch for 5-minute monitoring — returns {ticker: price}."""
+def fetch_current_prices(tickers, pin_to_845=False):
+    """Quick price fetch for 5-minute monitoring — returns {ticker: price}.
+    
+    If pin_to_845=True (used at trade open time), fetches 1-minute data and
+    returns the 8:45 AM CST candle open price for accuracy. This ensures buy
+    prices are always anchored to the correct entry time, not a random 5m close.
+    """
     results = {}
     try:
         import yfinance as yf
-        batch_data = yf.download(
-            tickers, period="1d", interval="5m",
-            group_by="ticker", auto_adjust=True, progress=False, threads=True
-        )
-        for ticker in tickers:
-            try:
-                ticker_data = (batch_data if len(tickers) == 1
-                               else (batch_data[ticker] if ticker in batch_data.columns.get_level_values(0) else None))
-                if ticker_data is not None and len(ticker_data) >= 1:
-                    price = float(ticker_data["Close"].iloc[-1])
-                    if price == price:  # Not NaN
-                        results[ticker] = price
-            except:
-                pass
+        import pytz
+
+        if pin_to_845:
+            # Use 1-minute data and find the exact 8:45 AM CST candle
+            cst = pytz.timezone("America/Chicago")
+            today_str = current_time_cst().strftime("%Y-%m-%d")
+            batch_data = yf.download(
+                tickers, period="1d", interval="1m",
+                auto_adjust=True, progress=False, threads=True
+            )
+            for ticker in tickers:
+                try:
+                    ticker_data = (batch_data if len(tickers) == 1
+                                   else (batch_data[ticker] if ticker in batch_data.columns.get_level_values(0) else None))
+                    if ticker_data is None or ticker_data.empty:
+                        continue
+                    # Convert to CST and find 8:45 candle
+                    ticker_data.index = ticker_data.index.tz_convert(cst)
+                    candle = ticker_data[ticker_data.index.strftime("%H:%M") == "08:45"]
+                    if candle.empty:
+                        candle = ticker_data[ticker_data.index.strftime("%H:%M") == "08:46"]
+                    if not candle.empty:
+                        price = float(candle["Open"].iloc[0])
+                        if price == price:  # Not NaN
+                            results[ticker] = price
+                    else:
+                        # Fallback to first candle of the day if 8:45 not found
+                        price = float(ticker_data["Open"].iloc[0])
+                        if price == price:
+                            results[ticker] = price
+                except:
+                    pass
+        else:
+            batch_data = yf.download(
+                tickers, period="1d", interval="5m",
+                group_by="ticker", auto_adjust=True, progress=False, threads=True
+            )
+            for ticker in tickers:
+                try:
+                    ticker_data = (batch_data if len(tickers) == 1
+                                   else (batch_data[ticker] if ticker in batch_data.columns.get_level_values(0) else None))
+                    if ticker_data is not None and len(ticker_data) >= 1:
+                        price = float(ticker_data["Close"].iloc[-1])
+                        if price == price:  # Not NaN
+                            results[ticker] = price
+                except:
+                    pass
     except:
         pass
     return results
@@ -1242,9 +1280,9 @@ def execute_opening_positions():
     # Virtual short execution requires short-specific signals to be meaningful.
     all_picks = picks.get("longs", [])[:MAX_LONG_PICKS]
 
-    # Fetch current prices at execution time (8:45 AM)
+    # Fetch current prices at execution time (8:45 AM) — pin to 8:45 candle for accuracy
     tickers = [pick["ticker"] for pick in all_picks]
-    current_prices = fetch_current_prices(tickers)
+    current_prices = fetch_current_prices(tickers, pin_to_845=True)
 
     # Randomize order to avoid systematic bias in queue assignment
     indexed_picks = list(enumerate(all_picks))
@@ -2424,6 +2462,106 @@ def api_backfill_close_prices():
 
     except Exception as e:
         log.error(f"Backfill error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+# ── FIX BUY PRICES ───────────────────────────────────────────────────────────
+@app.route("/api/fix-buy-prices", methods=["POST"])
+def api_fix_buy_prices():
+    """
+    Fetch the correct 8:45 AM CST price for open positions where the stored
+    buy price looks wrong (i.e. intraday_high_pct and intraday_low_pct are both 0,
+    meaning the monitor never ran). Uses yfinance 1-minute data for the buy_date.
+    """
+    try:
+        import yfinance as yf
+        import pytz
+
+        database = get_database()
+        # Only fix positions where monitor never ran (intraday highs/lows still 0)
+        suspect_positions = [dict(r) for r in database.execute(
+            """SELECT * FROM virtual_trades 
+               WHERE outcome='open' 
+               AND intraday_high_pct=0.0 
+               AND intraday_low_pct=0.0"""
+        ).fetchall()]
+
+        if not suspect_positions:
+            database.close()
+            return jsonify({"success": True, "updated": 0, "message": "No suspect positions found"})
+
+        cst = pytz.timezone("America/Chicago")
+        results = []
+        updated = 0
+
+        for position in suspect_positions:
+            ticker = position["ticker"]
+            buy_date = position["buy_date"]  # e.g. "2026-05-23"
+
+            try:
+                # Fetch 1-minute data for that day
+                raw = yf.download(ticker, period="5d", interval="1m", 
+                                  auto_adjust=True, progress=False)
+
+                if raw.empty:
+                    results.append({"ticker": ticker, "status": "no_data"})
+                    continue
+
+                # Convert index to CST
+                raw.index = raw.index.tz_convert(cst)
+
+                # Filter to buy_date at 8:45 AM CST
+                target = f"{buy_date} 08:45"
+                matched = raw[raw.index.strftime("%Y-%m-%d %H:%M") == target]
+
+                if matched.empty:
+                    # Try 8:46 as fallback
+                    target = f"{buy_date} 08:46"
+                    matched = raw[raw.index.strftime("%Y-%m-%d %H:%M") == target]
+
+                if matched.empty:
+                    results.append({"ticker": ticker, "status": "no_845_candle", "buy_date": buy_date})
+                    continue
+
+                correct_price = float(matched["Open"].iloc[0])
+                invested = position["invested_amount"] or 10.0
+
+                # Now get Friday close for current P&L
+                day_data = raw[raw.index.strftime("%Y-%m-%d") == buy_date]
+                close_price = float(day_data["Close"].iloc[-1]) if not day_data.empty else correct_price
+
+                pnl_pct = (close_price - correct_price) / correct_price * 100
+                if position["direction"] == "short":
+                    pnl_pct = -pnl_pct
+                current_value = invested * (1 + pnl_pct / 100)
+
+                database.execute("""
+                    UPDATE virtual_trades 
+                    SET buy_price=?, current_value=?
+                    WHERE id=?
+                """, [round(correct_price, 4), round(current_value, 4), position["id"]])
+
+                updated += 1
+                results.append({
+                    "ticker": ticker,
+                    "old_buy_price": position["buy_price"],
+                    "correct_buy_price": round(correct_price, 4),
+                    "close_price": round(close_price, 4),
+                    "pnl_pct": round(pnl_pct, 2),
+                    "current_value": round(current_value, 4),
+                    "status": "updated"
+                })
+                log.info(f"Fixed {ticker}: old={position['buy_price']} correct={correct_price} pnl={pnl_pct:.2f}%")
+
+            except Exception as e:
+                log.error(f"Error fixing {ticker}: {e}")
+                results.append({"ticker": ticker, "status": f"error: {str(e)}"})
+
+        database.commit()
+        database.close()
+        return jsonify({"success": True, "updated": updated, "results": results})
+
+    except Exception as e:
+        log.error(f"Fix buy prices error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 # ── KEEP ALIVE ────────────────────────────────────────────────────────────────
