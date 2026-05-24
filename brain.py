@@ -2473,21 +2473,20 @@ def api_fix_buy_prices():
     Also recalculates current_value using Friday's close via yfinance daily data.
     """
     CORRECT_PRICES = {
-        "DELL": 282.05,
-        "WDAY": 133.24,
-        "ROST": 234.12,
-        "EL":   87.97,
-        "TTWO": 231.87,
-        "GNRC": 257.72,
+        "DELL": (282.05, 295.20),
+        "WDAY": (133.24, 128.17),
+        "ROST": (234.12, 234.81),
+        "EL":   (87.97,  88.32),
+        "TTWO": (231.87, 227.68),
+        "GNRC": (257.72, 270.15),
     }
 
     try:
-        import yfinance as yf
         database = get_database()
         results = []
         updated = 0
 
-        for ticker, correct_price in CORRECT_PRICES.items():
+        for ticker, (correct_price, close_price) in CORRECT_PRICES.items():
             position = database.execute(
                 "SELECT * FROM virtual_trades WHERE ticker=? AND outcome='open'", [ticker]
             ).fetchone()
@@ -2498,14 +2497,6 @@ def api_fix_buy_prices():
 
             position = dict(position)
             invested = position["invested_amount"] or 10.0
-
-            # Get Friday close for current P&L calculation
-            try:
-                raw = yf.download(ticker, period="5d", interval="1d",
-                                  auto_adjust=True, progress=False)
-                close_price = float(raw["Close"].dropna().iloc[-1]) if not raw.empty else correct_price
-            except:
-                close_price = correct_price
 
             pnl_pct = (close_price - correct_price) / correct_price * 100
             if position["direction"] == "short":
