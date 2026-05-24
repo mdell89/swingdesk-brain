@@ -414,6 +414,9 @@ def initialize_database():
         "intraday_low_pct REAL",
         "status TEXT DEFAULT 'recommended'",
         "queue_position INTEGER",
+        "dynamic_confidence INTEGER",
+        "dynamic_estimate REAL",
+        "weekend_hold INTEGER DEFAULT 0",
     ]:
         try:
             column_name = column_definition.split()[0]
@@ -958,13 +961,23 @@ def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, 
     if direction == "short":
         gap_score = gap_score if gap_percent < 0 else gap_score * 0.5
 
-    # Earnings catalyst signal — graduated by proximity (7-day window)
-    # Closer earnings = stronger catalyst signal
+    # Earnings catalyst signal
+    # Hard disqualify if earnings tonight (0 days) or tomorrow (1 day) — never hold through earnings
+    # Mild positive for run-up period (2-7 days out) — graduated by proximity
+    # Neutral if no earnings in sight
     if ticker in earnings_soon:
         days_to_earnings = earnings_soon.get(ticker, 7) if isinstance(earnings_soon, dict) else 3
-        earnings_score = max(0.95 - (days_to_earnings - 1) * 0.05, 0.7)
+        if days_to_earnings <= 1:
+            # Hard disqualify — return 0 confidence to prevent this pick entirely
+            return 0
+        elif days_to_earnings <= 3:
+            earnings_score = 0.75  # Mild positive — 2-3 days out, solid run-up window
+        elif days_to_earnings <= 7:
+            earnings_score = 0.65  # Very mild positive — early run-up, less certain
+        else:
+            earnings_score = 0.5   # Neutral
     else:
-        earnings_score = 0.6
+        earnings_score = 0.5       # Neutral — no earnings, no penalty no bonus
 
     # Weighted combination — sector_rotation weight redistributed to other signals
     # Sector is not a reliable predictor for overnight swings; removed from scoring.
@@ -1123,6 +1136,11 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
         stock_data = price_data[ticker]
         rsi = rsi_values.get(ticker, 50.0)
         has_earnings = ticker in earnings_soon
+
+        # Hard disqualify if earnings tonight or tomorrow — never hold through earnings
+        days_to_earnings = earnings_soon.get(ticker, 99) if isinstance(earnings_soon, dict) else 99
+        if has_earnings and days_to_earnings <= 1:
+            continue
 
         long_confidence = calculate_confidence_score(ticker, stock_data, rsi, earnings_soon, weights, "long")
         short_confidence = calculate_confidence_score(ticker, stock_data, rsi, earnings_soon, weights, "short")
@@ -1427,15 +1445,33 @@ def monitor_open_positions():
             pnl_percent = -pnl_percent
         pnl_dollars = invested * (pnl_percent / 100)
 
-        # Update current value and intraday extremes
+        # Update current value, intraday extremes, and dynamic scores
         current_value = invested + pnl_dollars
         high_pct = max(position.get("intraday_high_pct") or 0, pnl_percent)
         low_pct = min(position.get("intraday_low_pct") or 0, pnl_percent)
 
+        # Calculate and persist dynamic confidence and estimate
+        try:
+            weights = get_signal_weights()
+            earnings_soon = check_upcoming_earnings([ticker])
+            price_data_for_dynamic = fetch_price_data([ticker])
+            if ticker in price_data_for_dynamic:
+                rsi_val = calculate_rsi_batch([ticker]).get(ticker, 50.0)
+                dyn_conf = calculate_confidence_score(ticker, price_data_for_dynamic[ticker], rsi_val, earnings_soon, weights, position["direction"])
+                dyn_est = estimate_overnight_move(price_data_for_dynamic[ticker], dyn_conf, ticker in earnings_soon)
+            else:
+                dyn_conf = position.get("dynamic_confidence") or position.get("confidence", 0)
+                dyn_est = position.get("dynamic_estimate") or position.get("expected_move", 0)
+        except:
+            dyn_conf = position.get("dynamic_confidence") or position.get("confidence", 0)
+            dyn_est = position.get("dynamic_estimate") or position.get("expected_move", 0)
+
         database.execute("""
-            UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?
+            UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?,
+            dynamic_confidence=?, dynamic_estimate=?
             WHERE id=?
-        """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2), position["id"]])
+        """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2),
+              dyn_conf, round(dyn_est, 1), position["id"]])
 
         # Determine if this is the sell day (position was opened before today)
         is_sell_day = position["buy_date"] < today
@@ -2127,6 +2163,9 @@ def api_open_positions_dynamic():
     current_rsi = calculate_rsi_batch(tickers)
     earnings_soon = check_upcoming_earnings(tickers)
 
+    # Fetch news for open positions
+    fetch_ticker_news(tickers, current_price_data)
+
     enriched_positions = []
     for position in open_positions:
         ticker = position["ticker"]
@@ -2137,15 +2176,17 @@ def api_open_positions_dynamic():
             rsi = current_rsi.get(ticker, 50.0)
             has_earnings = ticker in earnings_soon
 
-            # Dynamic confidence: how confident is the brain RIGHT NOW
-            # that this trade will hit the original target by forced close
-            dynamic_confidence = calculate_confidence_score(
-                ticker, stock_data, rsi, earnings_soon, weights, position["direction"]
-            )
-
-            # Dynamic estimate: predicted move from BUY PRICE to forced close
-            # using current indicator data (not current price as anchor)
-            dynamic_estimate = estimate_overnight_move(stock_data, dynamic_confidence, has_earnings)
+            # Dynamic confidence and estimate:
+            # During market hours — recalculate from live intraday data
+            # Outside market hours — freeze at last stored values from monitoring loop
+            if market_is_live:
+                dynamic_confidence = calculate_confidence_score(
+                    ticker, stock_data, rsi, earnings_soon, weights, position["direction"]
+                )
+                dynamic_estimate = estimate_overnight_move(stock_data, dynamic_confidence, has_earnings)
+            else:
+                dynamic_confidence = position.get("dynamic_confidence") or position.get("confidence", 0)
+                dynamic_estimate = position.get("dynamic_estimate") or position.get("expected_move", 0)
 
             # Current P&L — use live price only during market hours on weekdays.
             # On weekends or after hours, freeze at last known good price from DB
@@ -2193,6 +2234,7 @@ def api_open_positions_dynamic():
             enriched["current_value"] = round(current_value, 4)
             enriched["current_rsi"] = round(rsi, 1)
             enriched["current_volume_ratio"] = round(stock_data.get("volume_ratio", 1), 2)
+            enriched["news"] = current_price_data.get(ticker, {}).get("news", [])
 
             # Generate sentiment using time-aware CUT thresholds
             frozen_target = position["expected_move"] or 10
@@ -2403,6 +2445,56 @@ def api_seed_friday():
     except Exception as error:
         log.error(f"Seed error: {error}")
         return jsonify({"success": False, "error": str(error)}), 500
+
+# ── BANNER PRICES ─────────────────────────────────────────────────────────────
+@app.route("/api/banner-prices")
+def api_banner_prices():
+    """Return latest prices for VIX, SPY, QQQ + any open position tickers."""
+    try:
+        import yfinance as yf
+        database = get_database()
+        open_tickers = [r["ticker"] for r in database.execute(
+            "SELECT ticker FROM virtual_trades WHERE outcome='open'"
+        ).fetchall()]
+        database.close()
+
+        base = ["VIX", "SPY", "QQQ"]
+        all_tickers = list(dict.fromkeys(base + open_tickers))
+
+        raw = yf.download(all_tickers, period="5d", interval="1d",
+                          auto_adjust=True, progress=False)
+
+        results = {}
+        for ticker in all_tickers:
+            try:
+                if len(all_tickers) == 1:
+                    close = raw["Close"].dropna()
+                    prev = raw["Close"].dropna()
+                else:
+                    close = raw["Close"][ticker].dropna()
+                    prev = raw["Close"][ticker].dropna()
+
+                if len(close) < 2:
+                    continue
+
+                price = float(close.iloc[-1])
+                prev_close = float(close.iloc[-2])
+                change = price - prev_close
+                change_pct = (change / prev_close) * 100
+
+                results[ticker] = {
+                    "price": round(price, 2),
+                    "prev_close": round(prev_close, 2),
+                    "change": round(change, 2),
+                    "change_pct": round(change_pct, 2),
+                }
+            except Exception as e:
+                log.warning(f"Banner price error for {ticker}: {e}")
+
+        return jsonify(results)
+    except Exception as e:
+        log.error(f"Banner prices error: {e}")
+        return jsonify({}), 500
 
 # ── BACKFILL CLOSE PRICES ─────────────────────────────────────────────────────
 @app.route("/api/backfill-close-prices", methods=["POST"])
