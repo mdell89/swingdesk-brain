@@ -2468,99 +2468,67 @@ def api_backfill_close_prices():
 @app.route("/api/fix-buy-prices", methods=["POST"])
 def api_fix_buy_prices():
     """
-    Fetch the correct 8:45 AM CST price for open positions where the stored
-    buy price looks wrong (i.e. intraday_high_pct and intraday_low_pct are both 0,
-    meaning the monitor never ran). Uses yfinance 1-minute data for the buy_date.
+    One-time correction: write the verified 8:45 AM CST open prices for the
+    May 24 positions whose buy prices were recorded incorrectly.
+    Also recalculates current_value using Friday's close via yfinance daily data.
     """
+    CORRECT_PRICES = {
+        "DELL": 282.05,
+        "WDAY": 133.24,
+        "ROST": 234.12,
+        "EL":   87.97,
+        "TTWO": 231.87,
+        "GNRC": 257.72,
+    }
+
     try:
         import yfinance as yf
-        import pytz
-
         database = get_database()
-        # Only fix positions where monitor never ran (intraday highs/lows still 0)
-        suspect_positions = [dict(r) for r in database.execute(
-            """SELECT * FROM virtual_trades 
-               WHERE outcome='open' 
-               AND intraday_high_pct=0.0 
-               AND intraday_low_pct=0.0"""
-        ).fetchall()]
-
-        if not suspect_positions:
-            database.close()
-            return jsonify({"success": True, "updated": 0, "message": "No suspect positions found"})
-
-        cst = pytz.timezone("America/Chicago")
         results = []
         updated = 0
 
-        for position in suspect_positions:
-            ticker = position["ticker"]
-            buy_date = position["buy_date"]  # e.g. "2026-05-23"
+        for ticker, correct_price in CORRECT_PRICES.items():
+            position = database.execute(
+                "SELECT * FROM virtual_trades WHERE ticker=? AND outcome='open'", [ticker]
+            ).fetchone()
 
+            if not position:
+                results.append({"ticker": ticker, "status": "not_found"})
+                continue
+
+            position = dict(position)
+            invested = position["invested_amount"] or 10.0
+
+            # Get Friday close for current P&L calculation
             try:
-                # Fetch 1-minute data using explicit date range for the buy date
-                import datetime
-                buy_dt = datetime.datetime.strptime(buy_date, "%Y-%m-%d")
-                next_dt = buy_dt + datetime.timedelta(days=1)
-                start_str = buy_dt.strftime("%Y-%m-%d")
-                end_str = next_dt.strftime("%Y-%m-%d")
+                raw = yf.download(ticker, period="5d", interval="1d",
+                                  auto_adjust=True, progress=False)
+                close_price = float(raw["Close"].dropna().iloc[-1]) if not raw.empty else correct_price
+            except:
+                close_price = correct_price
 
-                raw = yf.download(ticker, start=start_str, end=end_str,
-                                  interval="1m", auto_adjust=True, progress=False)
+            pnl_pct = (close_price - correct_price) / correct_price * 100
+            if position["direction"] == "short":
+                pnl_pct = -pnl_pct
+            if abs(pnl_pct) < 0.005:
+                pnl_pct = 0.0
+            current_value = invested * (1 + pnl_pct / 100)
 
-                if raw.empty:
-                    results.append({"ticker": ticker, "status": "no_data"})
-                    continue
-
-                # Convert index to CST
-                raw.index = raw.index.tz_convert(cst)
-
-                # Filter to buy_date at 8:45 AM CST
-                target = f"{buy_date} 08:45"
-                matched = raw[raw.index.strftime("%Y-%m-%d %H:%M") == target]
-
-                if matched.empty:
-                    # Try 8:46 as fallback
-                    target = f"{buy_date} 08:46"
-                    matched = raw[raw.index.strftime("%Y-%m-%d %H:%M") == target]
-
-                if matched.empty:
-                    results.append({"ticker": ticker, "status": "no_845_candle", "buy_date": buy_date})
-                    continue
-
-                correct_price = float(matched["Open"].iloc[0])
-                invested = position["invested_amount"] or 10.0
-
-                # Now get Friday close for current P&L
-                day_data = raw[raw.index.strftime("%Y-%m-%d") == buy_date]
-                close_price = float(day_data["Close"].iloc[-1]) if not day_data.empty else correct_price
-
-                pnl_pct = (close_price - correct_price) / correct_price * 100
-                if position["direction"] == "short":
-                    pnl_pct = -pnl_pct
-                current_value = invested * (1 + pnl_pct / 100)
-
-                database.execute("""
-                    UPDATE virtual_trades 
-                    SET buy_price=?, current_value=?
-                    WHERE id=?
-                """, [round(correct_price, 4), round(current_value, 4), position["id"]])
-
-                updated += 1
-                results.append({
-                    "ticker": ticker,
-                    "old_buy_price": position["buy_price"],
-                    "correct_buy_price": round(correct_price, 4),
-                    "close_price": round(close_price, 4),
-                    "pnl_pct": round(pnl_pct, 2),
-                    "current_value": round(current_value, 4),
-                    "status": "updated"
-                })
-                log.info(f"Fixed {ticker}: old={position['buy_price']} correct={correct_price} pnl={pnl_pct:.2f}%")
-
-            except Exception as e:
-                log.error(f"Error fixing {ticker}: {e}")
-                results.append({"ticker": ticker, "status": f"error: {str(e)}"})
+            database.execute(
+                "UPDATE virtual_trades SET buy_price=?, current_value=? WHERE id=?",
+                [correct_price, round(current_value, 4), position["id"]]
+            )
+            updated += 1
+            results.append({
+                "ticker": ticker,
+                "old_buy_price": position["buy_price"],
+                "correct_buy_price": correct_price,
+                "close_price": round(close_price, 4),
+                "pnl_pct": round(pnl_pct, 2),
+                "current_value": round(current_value, 4),
+                "status": "updated"
+            })
+            log.info(f"Fixed {ticker}: old={position['buy_price']} correct={correct_price} pnl={pnl_pct:.2f}%")
 
         database.commit()
         database.close()
