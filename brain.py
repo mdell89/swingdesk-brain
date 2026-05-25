@@ -1,7 +1,20 @@
 """
-brain.py — Overnight Swing Desk Backend v6 (Push 30)
+brain.py — Overnight Swing Desk Backend v7 (Push 32)
 ══════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
+
+Changes in Push 32:
+  - Support & Resistance: ATR-14 adaptive swing pivot detection + zone clustering
+  - S&R added as 6th scoring indicator, replacing sector_rotation ghost weight
+  - sector_rotation weight migrated → support_resistance on DB startup
+  - weights_history schema: sector_rotation column kept, support_resistance added
+  - calculate_confidence_score: real 5-signal scoring, multiplier recalibrated to 110
+  - calculate_method_confluence: S&R added as 8th method
+  - method-stats API: S&R included in methods list
+  - enrich_price_data_with_history: 30d → 60d for meaningful pivot history
+  - Audit prompt updated: explains S&R signal to Claude for weight learning
+  - All backfill endpoints updated to use support_resistance column
+  - 1D chart / Day's P&L weekend fix: prior-day close used as baseline anchor
 
 Architecture:
     - Comprehensive scans every 30 min during pre/post market (~1,500 tickers)
@@ -295,6 +308,7 @@ def initialize_database():
             overnight_gap_probability REAL,
             earnings_catalyst REAL,
             sector_rotation REAL,
+            support_resistance REAL,
             win_rate REAL,
             total_resolved INTEGER,
             audit_reasoning TEXT
@@ -425,6 +439,12 @@ def initialize_database():
         );
     """)
 
+    # Add support_resistance column to weights_history if upgrading from earlier schema
+    try:
+        database.execute("ALTER TABLE weights_history ADD COLUMN support_resistance REAL")
+    except:
+        pass  # Column already exists
+
     # Add new columns to virtual_trades if upgrading from earlier schema
     for column_definition in [
         "closed_days INTEGER DEFAULT 1",
@@ -454,9 +474,19 @@ def initialize_database():
             "volume_surge": 0.22,
             "overnight_gap_probability": 0.25,
             "earnings_catalyst": 0.18,
-            "sector_rotation": 0.15,
+            "support_resistance": 0.15,
         }
         database.execute("INSERT INTO app_state VALUES ('weights',?)", [json.dumps(default_weights)])
+    else:
+        # Migrate existing weights: rename sector_rotation → support_resistance if needed
+        try:
+            w = json.loads(existing_weights["value"])
+            if "sector_rotation" in w and "support_resistance" not in w:
+                w["support_resistance"] = w.pop("sector_rotation")
+                database.execute("INSERT OR REPLACE INTO app_state VALUES ('weights',?)", [json.dumps(w)])
+                log.info("Migrated weights: sector_rotation → support_resistance")
+        except:
+            pass
 
     database.commit()
     database.close()
@@ -475,7 +505,7 @@ def get_signal_weights():
     return {
         "rsi_momentum": 0.20, "volume_surge": 0.22,
         "overnight_gap_probability": 0.25, "earnings_catalyst": 0.18,
-        "sector_rotation": 0.15,
+        "support_resistance": 0.15,
     }
 
 def save_signal_weights(weights):
@@ -852,20 +882,188 @@ def check_52w_breakouts(tickers, price_data):
         log.warning(f"52W breakout check error: {error}")
     return breakouts
 
+def calculate_atr(daily_history, period=14):
+    """
+    Calculate Average True Range (ATR-14) from daily OHLCV history.
+    ATR is the volatility ruler — it normalizes all price-based thresholds
+    to the stock's actual daily movement, making S&R detection scale-invariant.
+
+    True Range = max(High-Low, |High-PrevClose|, |Low-PrevClose|)
+    ATR = EMA of True Range over `period` days
+    """
+    if not daily_history or len(daily_history) < period + 1:
+        return None
+    true_ranges = []
+    for i in range(1, len(daily_history)):
+        h = daily_history[i]["high"]
+        l = daily_history[i]["low"]
+        pc = daily_history[i - 1]["close"]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        true_ranges.append(tr)
+    if len(true_ranges) < period:
+        return None
+    # Seed with simple mean of first `period` values, then EMA forward
+    atr = sum(true_ranges[:period]) / period
+    multiplier = 2 / (period + 1)
+    for tr in true_ranges[period:]:
+        atr = tr * multiplier + atr * (1 - multiplier)
+    return atr
+
+
+def calculate_support_resistance(ticker, price_data):
+    """
+    Detect support and resistance zones using ATR-adaptive swing pivot clustering.
+
+    Algorithm:
+    1. Pull 60-day daily_history (already populated by enrich_price_data_with_history)
+    2. Calculate ATR-14 as the volatility ruler
+    3. Identify swing highs (high[i] > neighbors 2 each side) → resistance pivots
+       Identify swing lows  (low[i]  < neighbors 2 each side) → support pivots
+    4. Cluster pivots within 0.5×ATR of each other → zones with touch counts
+    5. Score relative to current price and expected move:
+       - Resistance zone within expected move above price  → mild negative (ceiling)
+       - Clean breakout above all resistance (open air)    → mild positive
+       - Support zone close below current price            → mild positive (floor)
+       - Price sitting directly at resistance              → moderate negative
+       - Price bouncing off support (near support now)     → mild positive
+    6. Store result in price_data for use in scoring and method_signals logging
+
+    Returns: {"score": float 0-1, "signal": str, "nearest_resistance": float|None,
+              "nearest_support": float|None, "zone_count": int, "rationale": str}
+    """
+    DEFAULT = {"score": 0.5, "signal": "neutral", "nearest_resistance": None,
+               "nearest_support": None, "zone_count": 0, "rationale": "insufficient data"}
+
+    if ticker not in price_data:
+        return DEFAULT
+
+    data = price_data[ticker]
+    history = data.get("daily_history", [])
+    current_price = data.get("price", 0)
+    expected_move_pct = data.get("expected_move_pct", 5.0)  # fallback 5%
+
+    if len(history) < 15 or current_price <= 0:
+        return DEFAULT
+
+    atr = calculate_atr(history)
+    if not atr or atr <= 0:
+        return DEFAULT
+
+    cluster_radius = atr * 0.5  # Two pivots within half an ATR → same zone
+
+    # ── Swing pivot detection (2-neighbor rule each side) ──
+    resistance_pivots = []
+    support_pivots = []
+    for i in range(2, len(history) - 2):
+        h = history[i]["high"]
+        l = history[i]["low"]
+        # Swing high: higher than both neighbors on each side
+        if (h > history[i-1]["high"] and h > history[i-2]["high"] and
+                h > history[i+1]["high"] and h > history[i+2]["high"]):
+            resistance_pivots.append(h)
+        # Swing low: lower than both neighbors on each side
+        if (l < history[i-1]["low"] and l < history[i-2]["low"] and
+                l < history[i+1]["low"] and l < history[i+2]["low"]):
+            support_pivots.append(l)
+
+    def cluster_levels(pivots):
+        """Group pivots within cluster_radius into zones. Returns list of (price, touch_count)."""
+        if not pivots:
+            return []
+        sorted_pivots = sorted(pivots)
+        zones = []
+        current_group = [sorted_pivots[0]]
+        for p in sorted_pivots[1:]:
+            if p - current_group[0] <= cluster_radius:
+                current_group.append(p)
+            else:
+                zone_price = sum(current_group) / len(current_group)
+                zones.append((round(zone_price, 4), len(current_group)))
+                current_group = [p]
+        zone_price = sum(current_group) / len(current_group)
+        zones.append((round(zone_price, 4), len(current_group)))
+        return zones
+
+    resistance_zones = cluster_levels(resistance_pivots)
+    support_zones = cluster_levels(support_pivots)
+    total_zones = len(resistance_zones) + len(support_zones)
+
+    # Zones above and below current price
+    zones_above = [(z, n) for z, n in resistance_zones if z > current_price]
+    zones_below = [(z, n) for z, n in support_zones if z < current_price]
+
+    nearest_resistance = min(zones_above, key=lambda x: x[0])[0] if zones_above else None
+    nearest_support = max(zones_below, key=lambda x: x[0])[0] if zones_below else None
+
+    # Expected move ceiling
+    move_ceiling = current_price * (1 + expected_move_pct / 100)
+
+    # ── Scoring logic ──
+    score = 0.5
+    signal = "neutral"
+    rationale = "no clear S&R signal"
+
+    if nearest_resistance is not None:
+        dist_to_resistance = (nearest_resistance - current_price) / current_price * 100
+        resistance_in_move_range = current_price < nearest_resistance <= move_ceiling
+        sitting_at_resistance = dist_to_resistance < (atr / current_price * 100 * 0.3)
+
+        if sitting_at_resistance:
+            score = 0.2
+            signal = "at_resistance"
+            rationale = f"price at resistance ${nearest_resistance:.2f} — likely ceiling"
+        elif resistance_in_move_range:
+            score = 0.35
+            signal = "resistance_in_range"
+            rationale = f"resistance ${nearest_resistance:.2f} within expected move — may cap gains"
+        elif dist_to_resistance > expected_move_pct * 1.5:
+            # Resistance well beyond expected move — open air
+            score = 0.75
+            signal = "open_air"
+            rationale = f"open air to ${nearest_resistance:.2f} — no overhead supply in range"
+    else:
+        # No resistance detected above — truly open air
+        score = 0.80
+        signal = "open_air"
+        rationale = "no resistance detected above current price"
+
+    # Support floor bonus (additive, capped at 1.0)
+    if nearest_support is not None:
+        dist_to_support = (current_price - nearest_support) / current_price * 100
+        near_support = dist_to_support < (atr / current_price * 100 * 0.5)
+        if near_support:
+            score = min(score + 0.15, 0.90)
+            signal = signal + "+support_floor"
+            rationale += f" · near support ${nearest_support:.2f}"
+
+    result = {
+        "score": round(score, 4),
+        "signal": signal,
+        "nearest_resistance": nearest_resistance,
+        "nearest_support": nearest_support,
+        "zone_count": total_zones,
+        "rationale": rationale,
+    }
+    # Store on price_data so calculate_confidence_score can read it without recomputing
+    price_data[ticker]["sr_analysis"] = result
+    return result
+
+
 def calculate_method_confluence(ticker, price_data, scored_stocks=None):
     """
-    Score a ticker against 7 trading methods and return confluence count.
+    Score a ticker against 8 trading methods and return confluence count.
     Each method returns True/False based on its rules applied to daily OHLCV data.
-    
+
     Methods:
-    1. Darvas Box — near 52W high + volume + positive gap
-    2. Gap and Go — gap up >2% + volume surge
+    1. Darvas Box      — near 52W high + volume + positive gap
+    2. Gap and Go      — gap up >2% + volume surge
     3. Donchian Channel — price above 20-day high
-    4. Inside Day — today's range inside yesterday's + breaking up
-    5. NR7 — narrowest range of last 7 days
-    6. Bull Flag — strong prior move + tight consolidation
-    7. Pocket Pivot — up day with volume > any down-day vol of last 10 days
-    
+    4. Inside Day      — today's range inside yesterday's + breaking up
+    5. NR7             — narrowest range of last 7 days
+    6. Bull Flag       — strong prior move + tight consolidation
+    7. Pocket Pivot    — up day with volume > any down-day vol of last 10 days
+    8. Support & Resistance — ATR-adaptive zone analysis (open air or near support)
+
     Returns: {"count": int, "methods": [list of method names that agree]}
     """
     if ticker not in price_data:
@@ -935,6 +1133,14 @@ def calculate_method_confluence(ticker, price_data, scored_stocks=None):
             # No down days in 10 days — strong uptrend, volume surge qualifies
             methods_agree.append("Pocket Pivot")
 
+    # 8. Support & Resistance — ATR-adaptive zone analysis
+    # Qualifies if open air above (no resistance in expected move range)
+    # or price is near a support floor with room to run
+    sr = data.get("sr_analysis") or calculate_support_resistance(ticker, price_data)
+    if sr["signal"] in ("open_air", "open_air+support_floor") or \
+       ("support_floor" in sr["signal"] and sr["score"] >= 0.65):
+        methods_agree.append("S&R")
+
     return {"count": len(methods_agree), "methods": methods_agree}
 
 
@@ -942,11 +1148,12 @@ def enrich_price_data_with_history(tickers, price_data):
     """
     Fetch daily OHLCV history for confluence scoring methods that need it.
     Adds 'daily_history' list to each ticker's price_data entry.
+    Uses 60 days so S&R pivot detection has enough swing history to cluster from.
     """
     try:
         import yfinance as yf
         batch_data = yf.download(
-            tickers, period="30d", interval="1d",
+            tickers, period="60d", interval="1d",
             auto_adjust=True, progress=False, threads=True
         )
         for ticker in tickers:
@@ -1198,8 +1405,13 @@ def fetch_ticker_news(tickers, price_data):
 def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, direction="long"):
     """
     Calculate a confidence score (0-96) for a potential trade.
-    Combines RSI, volume, overnight gap, earnings, and sector signals
+    Combines RSI, volume, overnight gap, earnings, and S&R signals
     weighted by the brain's current learned weights.
+
+    S&R replaces the former sector_rotation placeholder. Unlike sector_rotation
+    which had no actual signal and redistributed its weight to other indicators,
+    S&R produces a real 0-1 score based on ATR-adaptive pivot zone analysis.
+    The audit loop can now tune all 5 weights against real signal performance.
     """
     # Guard against NaN values
     rsi = rsi if rsi == rsi else 50.0
@@ -1229,27 +1441,36 @@ def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, 
     if ticker in earnings_soon:
         days_to_earnings = earnings_soon.get(ticker, 7) if isinstance(earnings_soon, dict) else 3
         if days_to_earnings <= 1:
-            # Hard disqualify — return 0 confidence to prevent this pick entirely
             return 0
         elif days_to_earnings <= 3:
-            earnings_score = 0.75  # Mild positive — 2-3 days out, solid run-up window
+            earnings_score = 0.75
         elif days_to_earnings <= 7:
-            earnings_score = 0.65  # Very mild positive — early run-up, less certain
+            earnings_score = 0.65
         else:
-            earnings_score = 0.5   # Neutral
+            earnings_score = 0.5
     else:
-        earnings_score = 0.5       # Neutral — no earnings, no penalty no bonus
+        earnings_score = 0.5
 
-    # Weighted combination — sector_rotation weight redistributed to other signals
-    # Sector is not a reliable predictor for overnight swings; removed from scoring.
-    sector_weight_bonus = weights.get("sector_rotation", 0.15) / 4
+    # Support & Resistance signal — ATR-adaptive zone analysis
+    # Uses pre-computed sr_analysis if available (set by calculate_support_resistance),
+    # otherwise falls back to neutral 0.5 so missing data never tanks a score.
+    sr_analysis = price_data.get("sr_analysis")
+    sr_score = sr_analysis["score"] if sr_analysis else 0.5
+    if direction == "short":
+        # For shorts, invert S&R logic: resistance above is good (price likely to stall)
+        sr_score = 1.0 - sr_score
+
+    # Weighted combination — all 5 signals now have real scores
     raw_score = (
-        rsi_score * (weights["rsi_momentum"] + sector_weight_bonus) +
-        volume_score * (weights["volume_surge"] + sector_weight_bonus) +
-        gap_score * (weights["overnight_gap_probability"] + sector_weight_bonus) +
-        earnings_score * (weights["earnings_catalyst"] + sector_weight_bonus)
+        rsi_score    * weights.get("rsi_momentum", 0.20) +
+        volume_score * weights.get("volume_surge", 0.22) +
+        gap_score    * weights.get("overnight_gap_probability", 0.25) +
+        earnings_score * weights.get("earnings_catalyst", 0.18) +
+        sr_score     * weights.get("support_resistance", weights.get("sector_rotation", 0.15))
     )
-    return min(int(raw_score * 115), 99)
+    # Multiplier calibrated to keep scores in 65-96 range for qualified setups.
+    # 5 real signals at average 0.65 score × sum(weights=1.0) × 110 ≈ 71 — floor clears CONFIDENCE_FLOOR.
+    return min(int(raw_score * 110), 99)
 
 def estimate_overnight_move(price_data, confidence, has_earnings):
     """Estimate the expected overnight price movement percentage."""
@@ -1378,6 +1599,16 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
 
     # Enrich price data with daily history for confluence method scoring
     enrich_price_data_with_history(list(price_data.keys()), price_data)
+
+    # Pre-compute S&R analysis for all tickers — stored on price_data["sr_analysis"]
+    # so calculate_confidence_score can read it without recomputing per-ticker
+    for ticker in list(price_data.keys()):
+        try:
+            expected_move_pct = 5.0  # Rough default; refined per-pick after scoring
+            price_data[ticker]["expected_move_pct"] = expected_move_pct
+            calculate_support_resistance(ticker, price_data)
+        except Exception as sr_err:
+            log.debug(f"S&R pre-compute skipped for {ticker}: {sr_err}")
 
     # Prevent simultaneous long and short on the same ticker
     database = get_database()
@@ -1922,6 +2153,8 @@ def run_self_audit():
                 f"CURRENT WEIGHTS: {json.dumps(current_weights)}\n"
                 f"PERFORMANCE: {json.dumps({'total': total_predictions, 'resolved': len(resolved_predictions), 'hits': len(hit_predictions), 'misses': len(miss_predictions), 'win_rate': win_rate})}\n"
                 f"HOLD DURATION BREAKDOWN: {json.dumps(closed_days_summary)}\n"
+                f"Indicators: rsi_momentum, volume_surge, overnight_gap_probability, earnings_catalyst, support_resistance.\n"
+                f"support_resistance scores open-air setups (no overhead resistance) higher and resistance-capped setups lower.\n"
                 f"Rules: weights must sum to 1.0, each between 0.05-0.45.\n"
                 f"Respond ONLY with valid JSON: {{\"weights\":{{...}},\"reasoning\":[\"...\"],\"summary\":\"...\",\"confidence\":\"low|medium|high\"}}"
             }]
@@ -1947,14 +2180,14 @@ def run_self_audit():
         # Also write to weights_history for chart visualization
         database.execute("""
             INSERT INTO weights_history (timestamp, rsi_momentum, volume_surge,
-            overnight_gap_probability, earnings_catalyst, sector_rotation, win_rate, total_resolved)
+            overnight_gap_probability, earnings_catalyst, support_resistance, win_rate, total_resolved)
             VALUES (?,?,?,?,?,?,?,?)
         """, [current_time_cst().isoformat(),
               new_weights.get("rsi_momentum", 0),
               new_weights.get("volume_surge", 0),
               new_weights.get("overnight_gap_probability", 0),
               new_weights.get("earnings_catalyst", 0),
-              new_weights.get("sector_rotation", 0),
+              new_weights.get("support_resistance", new_weights.get("sector_rotation", 0)),
               win_rate, len(resolved_predictions)])
         database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_audit',?)",
                          [current_time_cst().isoformat()])
@@ -2377,7 +2610,7 @@ def api_method_stats():
     """Return win rate and signal history for all 7 trading methods."""
     try:
         database = get_database()
-        methods = ["Darvas", "Gap & Go", "Donchian", "Inside Day", "NR7", "Bull Flag", "Pocket Pivot"]
+        methods = ["Darvas", "Gap & Go", "Donchian", "Inside Day", "NR7", "Bull Flag", "Pocket Pivot", "S&R"]
         result = {}
 
         for method in methods:
@@ -2804,8 +3037,8 @@ def api_seed_friday():
                 gap_score = min(abs(gap_pct) / 10.0, 1.0)
                 raw = (rsi_score * weights["rsi_momentum"] + vol_score * weights["volume_surge"] +
                        gap_score * weights["overnight_gap_probability"] + 0.6 * weights["earnings_catalyst"] +
-                       0.8 * weights["sector_rotation"])
-                confidence = min(int(raw * 115), 96)
+                       0.6 * weights.get("support_resistance", weights.get("sector_rotation", 0.15)))
+                confidence = min(int(raw * 110), 96)
                 expected_move = round(min(4 + (confidence-60)*0.25 + (volume_ratio-1)*1.5 + min(abs(gap_pct)*0.3,3), 25), 1)
                 
                 if confidence >= CONFIDENCE_FLOOR and expected_move >= MIN_EXPECTED_MOVE:
@@ -3185,14 +3418,14 @@ def api_backfill_weights_history():
                 if not existing:
                     database.execute("""
                         INSERT INTO weights_history (timestamp, rsi_momentum, volume_surge,
-                        overnight_gap_probability, earnings_catalyst, sector_rotation, win_rate, total_resolved)
+                        overnight_gap_probability, earnings_catalyst, support_resistance, win_rate, total_resolved)
                         VALUES (?,?,?,?,?,?,?,?)
                     """, [row["timestamp"],
                           weights.get("rsi_momentum", 0),
                           weights.get("volume_surge", 0),
                           weights.get("overnight_gap_probability", 0),
                           weights.get("earnings_catalyst", 0),
-                          weights.get("sector_rotation", 0),
+                          weights.get("support_resistance", weights.get("sector_rotation", 0)),
                           row.get("win_rate", 0),
                           row.get("resolved_count", 0)])
                     inserted += 1
