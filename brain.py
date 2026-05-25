@@ -2666,6 +2666,48 @@ def api_open_positions_dynamic():
                 enriched["dynamic_estimate"] = position.get("expected_move", 0)
                 enriched["sentiment"] = "Monitoring. Waiting for data."
                 enriched["sentiment_icon"] = "warning"
+                # Set P&L from stored values so cards show correctly
+                stored_value = position.get("current_value")
+                invested = position.get("invested_amount") or 10.0
+                buy_price = position.get("buy_price") or 0
+                if stored_value and buy_price > 0:
+                    pnl_pct = (stored_value - invested) / max(invested, 0.01) * 100
+                    if abs(pnl_pct) < 0.005: pnl_pct = 0.0
+                    enriched["current_pnl_percent"] = round(pnl_pct, 2)
+                    enriched["current_value"] = round(stored_value, 4)
+
+            # ── Tags: confluence + 52W — always calculated regardless of market hours ──
+            stored_count = position.get("confluence_count")
+            stored_methods_raw = position.get("confluence_methods")
+            if stored_count is not None and stored_count > 0:
+                enriched["confluence_count"] = stored_count
+                enriched["confluence_methods"] = json.loads(stored_methods_raw) if isinstance(stored_methods_raw, str) else (stored_methods_raw or [])
+            else:
+                # Fetch history and calculate fresh
+                try:
+                    tag_data = {ticker: {"price": position.get("buy_price", 0)}}
+                    enrich_price_data_with_history([ticker], tag_data)
+                    check_52w_breakouts([ticker], tag_data)
+                    confluence = calculate_method_confluence(ticker, tag_data)
+                    enriched["confluence_count"] = confluence["count"]
+                    enriched["confluence_methods"] = confluence["methods"]
+                    enriched["broke_52w_high_days_ago"] = tag_data.get(ticker, {}).get("broke_52w_high_days_ago")
+                    # Persist to DB so next call is instant
+                    try:
+                        _db = get_database()
+                        _db.execute("UPDATE virtual_trades SET confluence_count=?, confluence_methods=? WHERE id=?",
+                            [confluence["count"], json.dumps(confluence["methods"]), position["id"]])
+                        _db.commit()
+                        _db.close()
+                    except:
+                        pass
+                except:
+                    enriched["confluence_count"] = 0
+                    enriched["confluence_methods"] = []
+            if "broke_52w_high_days_ago" not in enriched:
+                enriched["broke_52w_high_days_ago"] = None
+            if "news" not in enriched:
+                enriched["news"] = []
 
             enriched_positions.append(enriched)
 
