@@ -1171,7 +1171,7 @@ def fetch_ticker_news(tickers, price_data):
                     headlines.append({"title": title, "url": link, "date": pub_date, "ts": pub_ts})
             # Sort by full timestamp newest first, then cap at 3
             headlines.sort(key=lambda x: x.get("ts", 0), reverse=True)
-            headlines = headlines[:3]
+            headlines = headlines[:1]
             price_data[ticker]["news"] = headlines
         except Exception as err:
             price_data[ticker]["news"] = []
@@ -2585,18 +2585,25 @@ def api_open_positions_dynamic():
                     enriched["confluence_methods"] = confluence["methods"]
                 else:
                     # Outside market hours — use stored confluence from DB if available
-                    # If NULL (never written), calculate fresh using basic price data
                     stored_count = position.get("confluence_count")
                     stored_methods_raw = position.get("confluence_methods")
                     if stored_count is not None and stored_count > 0:
                         enriched["confluence_count"] = stored_count
                         enriched["confluence_methods"] = json.loads(stored_methods_raw) if isinstance(stored_methods_raw, str) else (stored_methods_raw or [])
                     else:
-                        # Never been written — calculate now using basic available data
-                        confluence = calculate_method_confluence(ticker, current_price_data)
+                        # Never been written — fetch history and calculate properly
+                        try:
+                            enriched_data = {ticker: dict(current_price_data.get(ticker, {"price": position.get("buy_price", 0)}))}
+                            enrich_price_data_with_history([ticker], enriched_data)
+                            check_52w_breakouts([ticker], enriched_data)
+                            confluence = calculate_method_confluence(ticker, enriched_data)
+                            # Also grab 52W from the enriched data
+                            enriched["broke_52w_high_days_ago"] = enriched_data.get(ticker, {}).get("broke_52w_high_days_ago")
+                        except:
+                            confluence = {"count": 0, "methods": []}
+                            enriched["broke_52w_high_days_ago"] = None
                         enriched["confluence_count"] = confluence["count"]
                         enriched["confluence_methods"] = confluence["methods"]
-                        # Persist so future requests don't need to recalculate
                         try:
                             _db = get_database()
                             _db.execute("UPDATE virtual_trades SET confluence_count=?, confluence_methods=? WHERE id=?",
@@ -2605,23 +2612,21 @@ def api_open_positions_dynamic():
                             _db.close()
                         except:
                             pass
-                    # For 52W, use stored week_high from darvas_picks if available
-                    try:
-                        db2 = get_database()
-                        darvas_row = db2.execute(
-                            "SELECT * FROM darvas_picks WHERE ticker=? ORDER BY date DESC LIMIT 1", [ticker]
-                        ).fetchone()
-                        db2.close()
-                        if darvas_row and darvas_row["week_high"]:
-                            buy_p = position["buy_price"] or 0
-                            if buy_p >= darvas_row["week_high"] * 0.95:
-                                enriched["broke_52w_high_days_ago"] = 1
+                    if "broke_52w_high_days_ago" not in enriched:
+                        # For 52W use darvas_picks as fallback
+                        try:
+                            db2 = get_database()
+                            darvas_row = db2.execute(
+                                "SELECT * FROM darvas_picks WHERE ticker=? ORDER BY date DESC LIMIT 1", [ticker]
+                            ).fetchone()
+                            db2.close()
+                            if darvas_row and darvas_row["week_high"]:
+                                buy_p = position["buy_price"] or 0
+                                enriched["broke_52w_high_days_ago"] = 1 if buy_p >= darvas_row["week_high"] * 0.95 else None
                             else:
                                 enriched["broke_52w_high_days_ago"] = None
-                        else:
+                        except:
                             enriched["broke_52w_high_days_ago"] = None
-                    except:
-                        enriched["broke_52w_high_days_ago"] = None
 
                 # Sentiment with time-aware CUT thresholds
                 frozen_target = position["expected_move"] or 10
