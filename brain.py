@@ -414,6 +414,15 @@ def initialize_database():
             actual_move REAL,
             logged_at TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS day_trades (
+            id TEXT PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            date TEXT NOT NULL,
+            buy_time TEXT,
+            sell_time TEXT,
+            logged_at TEXT
+        );
     """)
 
     # Add new columns to virtual_trades if upgrading from earlier schema
@@ -1037,6 +1046,39 @@ def run_darvas_silent_collection(price_data, scored_stocks):
             log.info(f"Darvas silent: {len(darvas_picks)} picks logged — {darvas_picks}")
     except Exception as err:
         log.warning(f"Darvas silent collection error: {err}")
+
+def get_pdt_count():
+    """Return number of day trades used in the rolling 5-day window."""
+    try:
+        database = get_database()
+        five_days_ago = (current_time_cst() - timedelta(days=5)).strftime("%Y-%m-%d")
+        count = database.execute(
+            "SELECT COUNT(*) as n FROM day_trades WHERE date >= ?", [five_days_ago]
+        ).fetchone()["n"]
+        database.close()
+        return count
+    except:
+        return 0
+
+def record_day_trade(ticker, buy_time=None, sell_time=None):
+    """Record a day trade (same-day open and close)."""
+    try:
+        today = current_time_cst().strftime("%Y-%m-%d")
+        trade_id = f"{ticker}_{today}_dt"
+        database = get_database()
+        database.execute("""
+            INSERT OR REPLACE INTO day_trades (id, ticker, date, buy_time, sell_time, logged_at)
+            VALUES (?,?,?,?,?,?)
+        """, [trade_id, ticker, today, buy_time, sell_time, current_time_cst().isoformat()])
+        database.commit()
+        database.close()
+    except Exception as e:
+        log.warning(f"PDT record error: {e}")
+
+def can_day_trade():
+    """Return True if we have day trades remaining (< 3 in rolling 5-day window)."""
+    return get_pdt_count() < 3
+
 
 def run_method_signal_logging(price_data, scored_stocks):
     """
@@ -1705,6 +1747,14 @@ def monitor_open_positions():
             # Evaluate sell decision
             should_sell, reason, sentiment = evaluate_sell_decision(position, price)
 
+            # PDT check: if this would be a same-day close (day trade), verify we have capacity
+            is_day_trade = position["buy_date"] == today
+            if should_sell and is_day_trade and reason in ("cut_loss", "stop_loss"):
+                if not can_day_trade():
+                    log.warning(f"PDT limit reached — cannot CUT {ticker} today (day trade #{get_pdt_count()+1}). Downgrading to WEAK.")
+                    should_sell = False
+                    sentiment = f"PDT limit — holding {ticker} despite loss. Max 3 day trades/week."
+
             database.execute("""
                 INSERT INTO position_checks (position_id, check_time, price, pnl_percent, sentiment, ticker)
                 VALUES (?,?,?,?,?,?)
@@ -1724,6 +1774,10 @@ def monitor_open_positions():
                       round(pnl_dollars, 4), round(net_pnl, 4),
                       outcome, reason, position["id"]])
 
+                # Record as day trade if opened and closed same day
+                if is_day_trade:
+                    record_day_trade(ticker, position.get("buy_time"), now.strftime("%H:%M:%S"))
+
                 # Update corresponding prediction
                 database.execute("""
                     UPDATE predictions SET outcome=?, actual_move=?, resolved_at=?
@@ -1734,7 +1788,7 @@ def monitor_open_positions():
                 # Add ending value to trade queue for compounding
                 add_to_queue(current_value, position["id"])
 
-                log.info(f"CLOSED {ticker} {position['direction']} | {reason} | {pnl_percent:+.1f}% | ${pnl_dollars:+.2f}")
+                log.info(f"CLOSED {ticker} {position['direction']} | {reason} | {pnl_percent:+.1f}% | ${pnl_dollars:+.2f} | {'DAY TRADE' if is_day_trade else 'OVERNIGHT'}")
         else:
             # Not sell day — just log for chart data
             database.execute("""
@@ -1873,6 +1927,18 @@ def run_self_audit():
               json.dumps(result.get("reasoning", [])), result.get("summary", ""),
               total_predictions, len(resolved_predictions), len(hit_predictions),
               len(miss_predictions), win_rate])
+        # Also write to weights_history for chart visualization
+        database.execute("""
+            INSERT INTO weights_history (timestamp, rsi_momentum, volume_surge,
+            overnight_gap_probability, earnings_catalyst, sector_rotation, win_rate, total_resolved)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, [current_time_cst().isoformat(),
+              new_weights.get("rsi_momentum", 0),
+              new_weights.get("volume_surge", 0),
+              new_weights.get("overnight_gap_probability", 0),
+              new_weights.get("earnings_catalyst", 0),
+              new_weights.get("sector_rotation", 0),
+              win_rate, len(resolved_predictions)])
         database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_audit',?)",
                          [current_time_cst().isoformat()])
         database.commit()
@@ -2285,6 +2351,8 @@ def api_stats():
         "last_scan": last_scan["value"] if last_scan else None,
         "weights": get_signal_weights(),
         "queue": get_queue_status(),
+        "pdt_used": get_pdt_count(),
+        "pdt_remaining": max(0, 3 - get_pdt_count()),
     })
 
 @app.route("/api/method-stats")
@@ -2507,16 +2575,37 @@ def api_open_positions_dynamic():
                 enriched["current_rsi"] = round(rsi, 1)
                 enriched["current_volume_ratio"] = round(stock_data.get("volume_ratio", 1), 2)
                 enriched["news"] = current_price_data.get(ticker, {}).get("news", [])
-                enriched["broke_52w_high_days_ago"] = current_price_data.get(ticker, {}).get("broke_52w_high_days_ago")
 
+                # 52W and confluence — calculate regardless of market hours
+                # using stored price data or last known values
                 if market_is_live:
+                    enriched["broke_52w_high_days_ago"] = current_price_data.get(ticker, {}).get("broke_52w_high_days_ago")
                     confluence = calculate_method_confluence(ticker, current_price_data)
                     enriched["confluence_count"] = confluence["count"]
                     enriched["confluence_methods"] = confluence["methods"]
                 else:
-                    # Outside market hours — use last stored values if available
-                    enriched["confluence_count"] = position.get("confluence_count") or 0
-                    enriched["confluence_methods"] = json.loads(position.get("confluence_methods") or "[]") if isinstance(position.get("confluence_methods"), str) else (position.get("confluence_methods") or [])
+                    # Use stored confluence from DB (written by monitoring loop)
+                    stored_count = position.get("confluence_count") or 0
+                    stored_methods = position.get("confluence_methods") or "[]"
+                    enriched["confluence_count"] = stored_count
+                    enriched["confluence_methods"] = json.loads(stored_methods) if isinstance(stored_methods, str) else (stored_methods or [])
+                    # For 52W, use stored week_high from darvas_picks if available
+                    try:
+                        db2 = get_database()
+                        darvas_row = db2.execute(
+                            "SELECT * FROM darvas_picks WHERE ticker=? ORDER BY date DESC LIMIT 1", [ticker]
+                        ).fetchone()
+                        db2.close()
+                        if darvas_row and darvas_row["week_high"]:
+                            buy_p = position["buy_price"] or 0
+                            if buy_p >= darvas_row["week_high"] * 0.95:
+                                enriched["broke_52w_high_days_ago"] = 1
+                            else:
+                                enriched["broke_52w_high_days_ago"] = None
+                        else:
+                            enriched["broke_52w_high_days_ago"] = None
+                    except:
+                        enriched["broke_52w_high_days_ago"] = None
 
                 # Sentiment with time-aware CUT thresholds
                 frozen_target = position["expected_move"] or 10
@@ -2753,7 +2842,7 @@ def api_banner_prices():
         ).fetchall()]
         database.close()
 
-        base = ["VIX", "SPY", "QQQ"]
+        base = ["VIX", "SPY", "QQQ", "IWM", "NVDA", "TLT", "BTC-USD", "GLD"]
         all_tickers = list(dict.fromkeys(base + open_tickers))
 
         raw = yf.download(all_tickers, period="5d", interval="1d",
@@ -2939,6 +3028,46 @@ def api_fix_buy_prices():
 
     except Exception as e:
         log.error(f"Fix buy prices error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+# ── BACKFILL WEIGHTS HISTORY ──────────────────────────────────────────────────
+@app.route("/api/backfill-weights-history", methods=["POST"])
+def api_backfill_weights_history():
+    """Backfill weights_history from audit_log for past audits."""
+    try:
+        database = get_database()
+        audit_rows = [dict(r) for r in database.execute(
+            "SELECT * FROM audit_log ORDER BY timestamp ASC"
+        ).fetchall()]
+        inserted = 0
+        for row in audit_rows:
+            try:
+                weights = json.loads(row.get("weights_after") or "{}")
+                if not weights:
+                    continue
+                existing = database.execute(
+                    "SELECT id FROM weights_history WHERE timestamp=?", [row["timestamp"]]
+                ).fetchone()
+                if not existing:
+                    database.execute("""
+                        INSERT INTO weights_history (timestamp, rsi_momentum, volume_surge,
+                        overnight_gap_probability, earnings_catalyst, sector_rotation, win_rate, total_resolved)
+                        VALUES (?,?,?,?,?,?,?,?)
+                    """, [row["timestamp"],
+                          weights.get("rsi_momentum", 0),
+                          weights.get("volume_surge", 0),
+                          weights.get("overnight_gap_probability", 0),
+                          weights.get("earnings_catalyst", 0),
+                          weights.get("sector_rotation", 0),
+                          row.get("win_rate", 0),
+                          row.get("resolved_count", 0)])
+                    inserted += 1
+            except Exception as e:
+                log.warning(f"Backfill row error: {e}")
+        database.commit()
+        database.close()
+        return jsonify({"success": True, "inserted": inserted})
+    except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 # ── KEEP ALIVE ────────────────────────────────────────────────────────────────
