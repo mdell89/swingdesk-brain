@@ -1,9 +1,9 @@
 """
-brain.py — Overnight Swing Desk Backend v7 (Push 32)
+brain.py — Overnight Swing Desk Backend v8 (Push 34)
 ══════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 32:
+Changes in Push 34:
   - Support & Resistance: ATR-14 adaptive swing pivot detection + zone clustering
   - S&R added as 6th scoring indicator, replacing sector_rotation ghost weight
   - sector_rotation weight migrated → support_resistance on DB startup
@@ -1340,66 +1340,128 @@ def run_method_signal_logging(price_data, scored_stocks):
         log.warning(f"Method signal logging error: {err}")
 
 
+def _normalize_news_article(title, summary, url, pub_ts, source):
+    """
+    Normalize a news article into the standard internal schema.
+    All news sources must produce this shape so the provider can be
+    swapped without touching any other code.
+
+    Fields:
+      title        — headline text
+      summary      — article summary or excerpt (may be empty string)
+      url          — full article URL
+      pub_ts       — unix timestamp of publication (0 if unknown)
+      source       — provider name string e.g. "alpha_vantage", "yahoo_rss"
+    """
+    try:
+        pub_dt = datetime.utcfromtimestamp(pub_ts) if pub_ts else datetime.utcnow()
+        date_str = pub_dt.strftime("%b %d")
+    except:
+        date_str = ""
+        pub_ts = 0
+    return {
+        "title": title or "",
+        "summary": summary or "",
+        "url": url or "",
+        "date": date_str,
+        "ts": pub_ts,
+        "source": source,
+    }
+
+
+def _fetch_news_alpha_vantage(ticker):
+    """
+    Fetch news for a single ticker via Alpha Vantage NEWS_SENTIMENT endpoint.
+    Returns a list of normalized articles (up to 3), or empty list on failure.
+    Alpha Vantage returns real article summaries unlike Yahoo RSS headlines-only.
+    No sentiment scoring is used — display only.
+    """
+    if not ALPHA_VANTAGE_KEY:
+        return []
+    try:
+        import urllib.request
+        url = (f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT"
+               f"&tickers={ticker}&limit=5&apikey={ALPHA_VANTAGE_KEY}")
+        req = urllib.request.Request(url, headers={"User-Agent": "SwingDesk/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as response:
+            data = json.loads(response.read().decode("utf-8", errors="ignore"))
+        feed = data.get("feed", [])
+        articles = []
+        for item in feed[:5]:
+            title = item.get("title", "").strip()
+            summary = item.get("summary", "").strip()
+            url_str = item.get("url", "").strip()
+            # Alpha Vantage time format: "20260525T085000"
+            time_str = item.get("time_published", "")
+            pub_ts = 0
+            if time_str:
+                try:
+                    dt = datetime.strptime(time_str, "%Y%m%dT%H%M%S")
+                    pub_ts = dt.timestamp()
+                except:
+                    pass
+            if title and url_str:
+                articles.append(_normalize_news_article(title, summary, url_str, pub_ts, "alpha_vantage"))
+        articles.sort(key=lambda x: x["ts"], reverse=True)
+        return articles[:3]
+    except Exception as err:
+        log.debug(f"Alpha Vantage news failed for {ticker}: {err}")
+        return []
+
+
+def _fetch_news_yahoo_rss(ticker):
+    """
+    Fetch news for a single ticker via Yahoo Finance RSS.
+    Fallback when Alpha Vantage is unavailable or rate-limited.
+    Returns headlines only (no summaries) — normalized to standard schema.
+    """
+    try:
+        import urllib.request
+        import xml.etree.ElementTree as ET
+        from email.utils import parsedate_to_datetime
+        url = f"https://finance.yahoo.com/rss/headline?s={ticker}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; SwingDesk/1.0)"})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            xml_content = response.read().decode("utf-8", errors="ignore")
+        root = ET.fromstring(xml_content)
+        articles = []
+        for item in root.findall(".//item")[:5]:
+            title_el = item.find("title")
+            link_el = item.find("link")
+            pubdate_el = item.find("pubDate")
+            title = title_el.text.strip() if title_el is not None and title_el.text else ""
+            link = link_el.text.strip() if link_el is not None and link_el.text else ""
+            pub_ts = 0
+            if pubdate_el is not None and pubdate_el.text:
+                try:
+                    dt = parsedate_to_datetime(pubdate_el.text.strip())
+                    pub_ts = dt.timestamp()
+                except:
+                    pub_ts = datetime.utcnow().timestamp()
+            if title and link:
+                articles.append(_normalize_news_article(title, "", link, pub_ts, "yahoo_rss"))
+        articles.sort(key=lambda x: x["ts"], reverse=True)
+        return articles[:3]
+    except Exception as err:
+        log.debug(f"Yahoo RSS news failed for {ticker}: {err}")
+        return []
+
+
 def fetch_ticker_news(tickers, price_data):
     """
-    Fetch up to 5 recent news headlines per ticker using Yahoo Finance RSS.
-    Includes publication date, sorted newest to oldest.
+    Fetch news articles for each ticker.
+    Primary: Alpha Vantage NEWS_SENTIMENT (real summaries, not just headlines).
+    Fallback: Yahoo Finance RSS (headlines only).
+    All articles normalized to internal schema regardless of source.
+    Display only — no sentiment scoring or ML integration.
     """
-    import urllib.request
-    import xml.etree.ElementTree as ET
-    from email.utils import parsedate_to_datetime
-
     for ticker in tickers:
         if ticker not in price_data:
             continue
-        try:
-            url = f"https://finance.yahoo.com/rss/headline?s={ticker}"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; SwingDesk/1.0)"})
-            with urllib.request.urlopen(req, timeout=5) as response:
-                xml_content = response.read().decode("utf-8", errors="ignore")
-            root = ET.fromstring(xml_content)
-            headlines = []
-            for item in root.findall(".//item")[:10]:  # Fetch more, then trim
-                title_el = item.find("title")
-                link_el = item.find("link")
-                pubdate_el = item.find("pubDate")
-                title = title_el.text.strip() if title_el is not None and title_el.text else ""
-                link = link_el.text.strip() if link_el is not None and link_el.text else ""
-                pub_date = ""
-                pub_ts = 0
-                if pubdate_el is not None and pubdate_el.text:
-                    raw_date = pubdate_el.text.strip()
-                    dt = None
-                    # Try 1: standard RFC 2822
-                    try:
-                        dt = parsedate_to_datetime(raw_date)
-                    except:
-                        pass
-                    # Try 2: common strptime formats
-                    if dt is None:
-                        for fmt in ["%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %z"]:
-                            try:
-                                dt = datetime.strptime(raw_date[:len(fmt)+5], fmt)
-                                break
-                            except:
-                                continue
-                    # Try 3: fallback to now so article still shows and sorts as recent
-                    if dt is None:
-                        dt = datetime.utcnow()
-                    pub_date = dt.strftime("%b %d")
-                    try:
-                        pub_ts = dt.timestamp()
-                    except:
-                        pub_ts = datetime.utcnow().timestamp()
-                if title and link:
-                    headlines.append({"title": title, "url": link, "date": pub_date, "ts": pub_ts})
-            # Sort by full timestamp newest first, then cap at 3
-            headlines.sort(key=lambda x: x.get("ts", 0), reverse=True)
-            headlines = headlines[:1]
-            price_data[ticker]["news"] = headlines
-        except Exception as err:
-            price_data[ticker]["news"] = []
-            log.debug(f"News fetch failed for {ticker}: {err}")
+        articles = _fetch_news_alpha_vantage(ticker)
+        if not articles:
+            articles = _fetch_news_yahoo_rss(ticker)
+        price_data[ticker]["news"] = articles[:1]  # Show most recent article on card
 
 # ── SCORING ENGINE ────────────────────────────────────────────────────────────
 def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, direction="long"):
@@ -3398,6 +3460,90 @@ def api_backfill_tags():
         return jsonify({"success": True, "updated": updated, "results": results})
     except Exception as e:
         log.error(f"Backfill tags error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+# ── BACKFILL S&R CONFIDENCE ──────────────────────────────────────────────────
+@app.route("/api/backfill-sr-confidence", methods=["POST"])
+def api_backfill_sr_confidence():
+    """
+    One-time endpoint: retroactively apply 5-signal confidence scores to all
+    open positions using the full scoring engine including Support & Resistance.
+
+    Positions opened before Push 32 were scored with the 4-signal engine
+    (no S&R). This recalculates confidence and dynamic_confidence using the
+    current 5-signal engine so cards show accurate scores going forward.
+
+    Safe to call multiple times — only updates confidence fields, never touches
+    P&L, current_value, buy_price, outcome, or any other trade data.
+    """
+    try:
+        database = get_database()
+        open_positions = [dict(r) for r in database.execute(
+            "SELECT * FROM virtual_trades WHERE outcome='open'"
+        ).fetchall()]
+
+        if not open_positions:
+            database.close()
+            return jsonify({"success": True, "updated": 0, "message": "No open positions"})
+
+        tickers = list(set(p["ticker"] for p in open_positions))
+        weights = get_signal_weights()
+
+        # Fetch all data needed for 5-signal scoring
+        price_data = fetch_price_data(tickers)
+        rsi_values = calculate_rsi_batch(tickers)
+        earnings_soon = check_upcoming_earnings(tickers)
+        enrich_price_data_with_history(tickers, price_data)
+
+        # Pre-compute S&R for all tickers
+        for ticker in tickers:
+            if ticker in price_data:
+                try:
+                    price_data[ticker]["expected_move_pct"] = 5.0
+                    calculate_support_resistance(ticker, price_data)
+                except:
+                    pass
+
+        updated = 0
+        results = []
+        for position in open_positions:
+            ticker = position["ticker"]
+            if ticker not in price_data:
+                results.append({"ticker": ticker, "status": "no_price_data"})
+                continue
+            try:
+                rsi = rsi_values.get(ticker, 50.0)
+                new_confidence = calculate_confidence_score(
+                    ticker, price_data[ticker], rsi, earnings_soon, weights, "long"
+                )
+                new_estimate = estimate_overnight_move(
+                    price_data[ticker], new_confidence, ticker in earnings_soon
+                )
+                old_confidence = position.get("confidence", 0)
+
+                database.execute("""
+                    UPDATE virtual_trades
+                    SET confidence=?, dynamic_confidence=?, dynamic_estimate=?
+                    WHERE id=?
+                """, [new_confidence, new_confidence, new_estimate, position["id"]])
+                updated += 1
+                results.append({
+                    "ticker": ticker,
+                    "old_confidence": old_confidence,
+                    "new_confidence": new_confidence,
+                    "new_estimate": new_estimate,
+                    "status": "updated",
+                })
+            except Exception as e:
+                results.append({"ticker": ticker, "status": "error", "error": str(e)})
+
+        database.commit()
+        database.close()
+        log.info(f"Backfill S&R confidence: updated {updated} positions")
+        return jsonify({"success": True, "updated": updated, "results": results})
+
+    except Exception as e:
+        log.error(f"Backfill SR confidence error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 # ── BACKFILL WEIGHTS HISTORY ──────────────────────────────────────────────────
