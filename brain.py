@@ -1,6 +1,11 @@
 """
-brain.py — Overnight Swing Desk Backend v4 (Push 2)
+brain.py — Overnight Swing Desk Backend v5 (Push 28)
 ══════════════════════════════════════════════════════
+Changes in Push 28:
+    - Removed SELL/NEAR sentiment signals — brain holds all winners until 2:45 PM force-close
+    - Sentiment labels: CUT (time-aware loss) | HOLD | WEAK only
+    - sort_priority updated: post-close(-1) > CUT(0) > HOLD(1) > WEAK(2)
+    - Same-day closed positions appended to open-positions-dynamic as is_post_close cards
 Trading Engine with Self-Regulating Queue System
 
 Architecture:
@@ -2628,7 +2633,8 @@ def api_open_positions_dynamic():
                         except:
                             enriched["broke_52w_high_days_ago"] = None
 
-                # Sentiment with time-aware CUT thresholds
+                # Sentiment — brain HOLDS winners until 2:45 PM force-close
+                # Only CUT when loss exceeds time-based threshold or backend explicitly flags it
                 frozen_target = position["expected_move"] or 10
                 cut_threshold = None
                 if is_weekday and MARKET_OPEN <= minute_of_day < MARKET_CLOSE:
@@ -2643,23 +2649,17 @@ def api_open_positions_dynamic():
 
                 is_cut = cut_threshold is not None and pnl_pct < -(cut_threshold)
 
-                if pnl_pct >= frozen_target:
-                    enriched["sentiment"] = f"Exceeded. +{pnl_pct:.1f}% vs {frozen_target:.1f}% target."
-                    enriched["sentiment_icon"] = "flash"
-                elif pnl_pct >= frozen_target * 0.7:
-                    enriched["sentiment"] = f"Close. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
-                    enriched["sentiment_icon"] = "flash"
-                elif is_cut:
+                if is_cut:
                     enriched["sentiment"] = f"Reversing. {pnl_pct:.1f}% exceeds cut threshold."
                     enriched["sentiment_icon"] = "x"
                 elif pnl_pct >= 2:
-                    enriched["sentiment"] = f"Steady. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
+                    enriched["sentiment"] = f"Holding. +{pnl_pct:.1f}% — riding to close."
                     enriched["sentiment_icon"] = "check"
                 elif pnl_pct < 0:
                     enriched["sentiment"] = f"Behind. {pnl_pct:+.1f}%."
                     enriched["sentiment_icon"] = "warning"
                 else:
-                    enriched["sentiment"] = f"Holding. Flat. {pnl_pct:+.1f}%."
+                    enriched["sentiment"] = f"Flat. {pnl_pct:+.1f}%."
                     enriched["sentiment_icon"] = "check"
             else:
                 enriched["dynamic_confidence"] = position.get("confidence", 0)
@@ -2711,16 +2711,27 @@ def api_open_positions_dynamic():
 
             enriched_positions.append(enriched)
 
-        # Sort server-side: SELL first, then NEAR, HOLD, WEAK, CUT last
+        # Add same-day closed positions as post-close awareness cards
+        today_str = now_cst.strftime("%Y-%m-%d")
+        database2 = get_database()
+        closed_today = [dict(t) for t in database2.execute(
+            "SELECT * FROM virtual_trades WHERE outcome != 'open' AND sell_date = ? ORDER BY id DESC LIMIT 25",
+            [today_str]
+        ).fetchall()]
+        database2.close()
+        for ct in closed_today:
+            ct["is_post_close"] = True
+            ct["current_pnl_percent"] = ct.get("actual_move", 0)
+        enriched_positions = closed_today + enriched_positions
+
+        # Sort server-side: post-close first, then CUT, HOLD, WEAK
         def sort_priority(pos):
+            if pos.get("is_post_close"): return (-1, 0)
             pnl = pos.get("current_pnl_percent") or 0
-            target = pos.get("expected_move") or 10
             icon = pos.get("sentiment_icon", "")
-            if pnl >= target: return (1, -pnl)           # SELL
-            if pnl >= target * 0.7: return (2, -pnl)     # NEAR
-            if pnl >= 0: return (3, -pnl)                # HOLD
-            if icon == "x": return (0, -pnl)             # CUT — only when backend flagged it
-            return (4, -pnl)                              # WEAK
+            if icon == "x": return (0, -pnl)    # CUT
+            if pnl >= 0: return (1, -pnl)        # HOLD
+            return (2, -pnl)                      # WEAK
 
         enriched_positions.sort(key=sort_priority)
         return jsonify(enriched_positions)
