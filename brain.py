@@ -2584,11 +2584,27 @@ def api_open_positions_dynamic():
                     enriched["confluence_count"] = confluence["count"]
                     enriched["confluence_methods"] = confluence["methods"]
                 else:
-                    # Use stored confluence from DB (written by monitoring loop)
-                    stored_count = position.get("confluence_count") or 0
-                    stored_methods = position.get("confluence_methods") or "[]"
-                    enriched["confluence_count"] = stored_count
-                    enriched["confluence_methods"] = json.loads(stored_methods) if isinstance(stored_methods, str) else (stored_methods or [])
+                    # Outside market hours — use stored confluence from DB if available
+                    # If NULL (never written), calculate fresh using basic price data
+                    stored_count = position.get("confluence_count")
+                    stored_methods_raw = position.get("confluence_methods")
+                    if stored_count is not None and stored_count > 0:
+                        enriched["confluence_count"] = stored_count
+                        enriched["confluence_methods"] = json.loads(stored_methods_raw) if isinstance(stored_methods_raw, str) else (stored_methods_raw or [])
+                    else:
+                        # Never been written — calculate now using basic available data
+                        confluence = calculate_method_confluence(ticker, current_price_data)
+                        enriched["confluence_count"] = confluence["count"]
+                        enriched["confluence_methods"] = confluence["methods"]
+                        # Persist so future requests don't need to recalculate
+                        try:
+                            _db = get_database()
+                            _db.execute("UPDATE virtual_trades SET confluence_count=?, confluence_methods=? WHERE id=?",
+                                [confluence["count"], json.dumps(confluence["methods"]), position["id"]])
+                            _db.commit()
+                            _db.close()
+                        except:
+                            pass
                     # For 52W, use stored week_high from darvas_picks if available
                     try:
                         db2 = get_database()
