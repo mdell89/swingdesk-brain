@@ -3030,6 +3030,60 @@ def api_fix_buy_prices():
         log.error(f"Fix buy prices error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
+# ── BACKFILL TAGS ─────────────────────────────────────────────────────────────
+@app.route("/api/backfill-tags", methods=["POST"])
+def api_backfill_tags():
+    """
+    Backfill confluence_count, confluence_methods, and broke_52w_high_days_ago
+    for all open positions using fresh yfinance data.
+    """
+    try:
+        import yfinance as yf
+        database = get_database()
+        open_positions = [dict(r) for r in database.execute(
+            "SELECT * FROM virtual_trades WHERE outcome='open'"
+        ).fetchall()]
+
+        if not open_positions:
+            database.close()
+            return jsonify({"success": True, "updated": 0})
+
+        tickers = list(set(p["ticker"] for p in open_positions))
+        price_data = fetch_price_data(tickers)
+        check_52w_breakouts(tickers, price_data)
+        enrich_price_data_with_history(tickers, price_data)
+
+        updated = 0
+        results = []
+        for position in open_positions:
+            ticker = position["ticker"]
+            confluence = calculate_method_confluence(ticker, price_data)
+            conf_count = confluence["count"]
+            conf_methods = json.dumps(confluence["methods"])
+            broke_52w = price_data.get(ticker, {}).get("broke_52w_high_days_ago")
+
+            try:
+                database.execute("""
+                    UPDATE virtual_trades SET confluence_count=?, confluence_methods=?
+                    WHERE id=?
+                """, [conf_count, conf_methods, position["id"]])
+                updated += 1
+                results.append({
+                    "ticker": ticker,
+                    "confluence_count": conf_count,
+                    "confluence_methods": confluence["methods"],
+                    "broke_52w_high_days_ago": broke_52w,
+                })
+            except Exception as e:
+                results.append({"ticker": ticker, "error": str(e)})
+
+        database.commit()
+        database.close()
+        return jsonify({"success": True, "updated": updated, "results": results})
+    except Exception as e:
+        log.error(f"Backfill tags error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 # ── BACKFILL WEIGHTS HISTORY ──────────────────────────────────────────────────
 @app.route("/api/backfill-weights-history", methods=["POST"])
 def api_backfill_weights_history():
