@@ -1,11 +1,6 @@
 """
-brain.py — Overnight Swing Desk Backend v5 (Push 28)
+brain.py — Overnight Swing Desk Backend v6 (Push 30)
 ══════════════════════════════════════════════════════
-Changes in Push 28:
-    - Removed SELL/NEAR sentiment signals — brain holds all winners until 2:45 PM force-close
-    - Sentiment labels: CUT (time-aware loss) | HOLD | WEAK only
-    - sort_priority updated: post-close(-1) > CUT(0) > HOLD(1) > WEAK(2)
-    - Same-day closed positions appended to open-positions-dynamic as is_post_close cards
 Trading Engine with Self-Regulating Queue System
 
 Architecture:
@@ -1166,12 +1161,29 @@ def fetch_ticker_news(tickers, price_data):
                 pub_date = ""
                 pub_ts = 0
                 if pubdate_el is not None and pubdate_el.text:
+                    raw_date = pubdate_el.text.strip()
+                    dt = None
+                    # Try 1: standard RFC 2822
                     try:
-                        dt = parsedate_to_datetime(pubdate_el.text.strip())
-                        pub_date = dt.strftime("%b %d")
+                        dt = parsedate_to_datetime(raw_date)
+                    except:
+                        pass
+                    # Try 2: common strptime formats
+                    if dt is None:
+                        for fmt in ["%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %z"]:
+                            try:
+                                dt = datetime.strptime(raw_date[:len(fmt)+5], fmt)
+                                break
+                            except:
+                                continue
+                    # Try 3: fallback to now so article still shows and sorts as recent
+                    if dt is None:
+                        dt = datetime.utcnow()
+                    pub_date = dt.strftime("%b %d")
+                    try:
                         pub_ts = dt.timestamp()
                     except:
-                        pub_date = pubdate_el.text.strip()[:10]
+                        pub_ts = datetime.utcnow().timestamp()
                 if title and link:
                     headlines.append({"title": title, "url": link, "date": pub_date, "ts": pub_ts})
             # Sort by full timestamp newest first, then cap at 3
@@ -2633,8 +2645,7 @@ def api_open_positions_dynamic():
                         except:
                             enriched["broke_52w_high_days_ago"] = None
 
-                # Sentiment — brain HOLDS winners until 2:45 PM force-close
-                # Only CUT when loss exceeds time-based threshold or backend explicitly flags it
+                # Sentiment with time-aware CUT thresholds
                 frozen_target = position["expected_move"] or 10
                 cut_threshold = None
                 if is_weekday and MARKET_OPEN <= minute_of_day < MARKET_CLOSE:
@@ -2649,17 +2660,23 @@ def api_open_positions_dynamic():
 
                 is_cut = cut_threshold is not None and pnl_pct < -(cut_threshold)
 
-                if is_cut:
+                if pnl_pct >= frozen_target:
+                    enriched["sentiment"] = f"Exceeded. +{pnl_pct:.1f}% vs {frozen_target:.1f}% target."
+                    enriched["sentiment_icon"] = "flash"
+                elif pnl_pct >= frozen_target * 0.7:
+                    enriched["sentiment"] = f"Close. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
+                    enriched["sentiment_icon"] = "flash"
+                elif is_cut:
                     enriched["sentiment"] = f"Reversing. {pnl_pct:.1f}% exceeds cut threshold."
                     enriched["sentiment_icon"] = "x"
                 elif pnl_pct >= 2:
-                    enriched["sentiment"] = f"Holding. +{pnl_pct:.1f}% — riding to close."
+                    enriched["sentiment"] = f"Steady. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
                     enriched["sentiment_icon"] = "check"
                 elif pnl_pct < 0:
                     enriched["sentiment"] = f"Behind. {pnl_pct:+.1f}%."
                     enriched["sentiment_icon"] = "warning"
                 else:
-                    enriched["sentiment"] = f"Flat. {pnl_pct:+.1f}%."
+                    enriched["sentiment"] = f"Holding. Flat. {pnl_pct:+.1f}%."
                     enriched["sentiment_icon"] = "check"
             else:
                 enriched["dynamic_confidence"] = position.get("confidence", 0)
@@ -2711,27 +2728,16 @@ def api_open_positions_dynamic():
 
             enriched_positions.append(enriched)
 
-        # Add same-day closed positions as post-close awareness cards
-        today_str = now_cst.strftime("%Y-%m-%d")
-        database2 = get_database()
-        closed_today = [dict(t) for t in database2.execute(
-            "SELECT * FROM virtual_trades WHERE outcome != 'open' AND sell_date = ? ORDER BY id DESC LIMIT 25",
-            [today_str]
-        ).fetchall()]
-        database2.close()
-        for ct in closed_today:
-            ct["is_post_close"] = True
-            ct["current_pnl_percent"] = ct.get("actual_move", 0)
-        enriched_positions = closed_today + enriched_positions
-
-        # Sort server-side: post-close first, then CUT, HOLD, WEAK
+        # Sort server-side: SELL first, then NEAR, HOLD, WEAK, CUT last
         def sort_priority(pos):
-            if pos.get("is_post_close"): return (-1, 0)
             pnl = pos.get("current_pnl_percent") or 0
+            target = pos.get("expected_move") or 10
             icon = pos.get("sentiment_icon", "")
-            if icon == "x": return (0, -pnl)    # CUT
-            if pnl >= 0: return (1, -pnl)        # HOLD
-            return (2, -pnl)                      # WEAK
+            if pnl >= target: return (1, -pnl)           # SELL
+            if pnl >= target * 0.7: return (2, -pnl)     # NEAR
+            if pnl >= 0: return (3, -pnl)                # HOLD
+            if icon == "x": return (0, -pnl)             # CUT — only when backend flagged it
+            return (4, -pnl)                              # WEAK
 
         enriched_positions.sort(key=sort_priority)
         return jsonify(enriched_positions)
