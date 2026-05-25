@@ -428,6 +428,8 @@ def initialize_database():
         "dynamic_confidence INTEGER",
         "dynamic_estimate REAL",
         "weekend_hold INTEGER DEFAULT 0",
+        "confluence_count INTEGER DEFAULT 0",
+        "confluence_methods TEXT DEFAULT '[]'",
     ]:
         try:
             column_name = column_definition.split()[0]
@@ -1108,7 +1110,7 @@ def fetch_ticker_news(tickers, price_data):
                 xml_content = response.read().decode("utf-8", errors="ignore")
             root = ET.fromstring(xml_content)
             headlines = []
-            for item in root.findall(".//item")[:5]:
+            for item in root.findall(".//item")[:10]:  # Fetch more, then trim
                 title_el = item.find("title")
                 link_el = item.find("link")
                 pubdate_el = item.find("pubDate")
@@ -1125,8 +1127,9 @@ def fetch_ticker_news(tickers, price_data):
                         pub_date = pubdate_el.text.strip()[:10]
                 if title and link:
                     headlines.append({"title": title, "url": link, "date": pub_date, "ts": pub_ts})
-            # Sort newest first
+            # Sort by full timestamp newest first, then cap at 3
             headlines.sort(key=lambda x: x.get("ts", 0), reverse=True)
+            headlines = headlines[:3]
             price_data[ticker]["news"] = headlines
         except Exception as err:
             price_data[ticker]["news"] = []
@@ -1675,12 +1678,20 @@ def monitor_open_positions():
             dyn_est = position.get("dynamic_estimate") or position.get("expected_move", 0)
 
         try:
+            conf_data = calculate_method_confluence(ticker, {ticker: {"price": current_price, "volume_ratio": position.get("current_volume_ratio", 1), "gap_percent": 0, "day_change_percent": pnl_percent}})
+            conf_count = conf_data["count"]
+            conf_methods = json.dumps(conf_data["methods"])
+        except:
+            conf_count = position.get("confluence_count") or 0
+            conf_methods = position.get("confluence_methods") or "[]"
+
+        try:
             database.execute("""
                 UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?,
-                dynamic_confidence=?, dynamic_estimate=?
+                dynamic_confidence=?, dynamic_estimate=?, confluence_count=?, confluence_methods=?
                 WHERE id=?
             """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2),
-                  dyn_conf, round(dyn_est, 1), position["id"]])
+                  dyn_conf, round(dyn_est, 1), conf_count, conf_methods, position["id"]])
         except:
             database.execute("""
                 UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?
@@ -2497,9 +2508,15 @@ def api_open_positions_dynamic():
                 enriched["current_volume_ratio"] = round(stock_data.get("volume_ratio", 1), 2)
                 enriched["news"] = current_price_data.get(ticker, {}).get("news", [])
                 enriched["broke_52w_high_days_ago"] = current_price_data.get(ticker, {}).get("broke_52w_high_days_ago")
-                confluence = calculate_method_confluence(ticker, current_price_data)
-                enriched["confluence_count"] = confluence["count"]
-                enriched["confluence_methods"] = confluence["methods"]
+
+                if market_is_live:
+                    confluence = calculate_method_confluence(ticker, current_price_data)
+                    enriched["confluence_count"] = confluence["count"]
+                    enriched["confluence_methods"] = confluence["methods"]
+                else:
+                    # Outside market hours — use last stored values if available
+                    enriched["confluence_count"] = position.get("confluence_count") or 0
+                    enriched["confluence_methods"] = json.loads(position.get("confluence_methods") or "[]") if isinstance(position.get("confluence_methods"), str) else (position.get("confluence_methods") or [])
 
                 # Sentiment with time-aware CUT thresholds
                 frozen_target = position["expected_move"] or 10
@@ -2517,19 +2534,19 @@ def api_open_positions_dynamic():
                 is_cut = cut_threshold is not None and pnl_pct < -(cut_threshold)
 
                 if pnl_pct >= frozen_target:
-                    enriched["sentiment"] = f"Target exceeded. +{pnl_pct:.1f}% vs {frozen_target:.1f}% target."
+                    enriched["sentiment"] = f"Exceeded. +{pnl_pct:.1f}% vs {frozen_target:.1f}% target."
                     enriched["sentiment_icon"] = "flash"
                 elif pnl_pct >= frozen_target * 0.7:
-                    enriched["sentiment"] = f"Approaching target. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
+                    enriched["sentiment"] = f"Close. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
                     enriched["sentiment_icon"] = "flash"
                 elif is_cut:
                     enriched["sentiment"] = f"Reversing. {pnl_pct:.1f}% exceeds cut threshold."
                     enriched["sentiment_icon"] = "x"
                 elif pnl_pct >= 2:
-                    enriched["sentiment"] = f"Holding. On track. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
+                    enriched["sentiment"] = f"Steady. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
                     enriched["sentiment_icon"] = "check"
                 elif pnl_pct < 0:
-                    enriched["sentiment"] = f"Watching. Behind pace. {pnl_pct:+.1f}%."
+                    enriched["sentiment"] = f"Behind. {pnl_pct:+.1f}%."
                     enriched["sentiment_icon"] = "warning"
                 else:
                     enriched["sentiment"] = f"Holding. Flat. {pnl_pct:+.1f}%."
