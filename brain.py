@@ -2927,22 +2927,27 @@ def api_open_positions_dynamic():
                     enriched["current_value"] = round(stored_value, 4)
 
             # ── Tags: confluence + 52W — always calculated regardless of market hours ──
+            # 52W check always runs unconditionally — must not be gated behind the
+            # confluence cache branch or positions with stored confluence never get the tag.
+            try:
+                tag_data = {ticker: {"price": position.get("buy_price", 0)}}
+                enrich_price_data_with_history([ticker], tag_data)
+                check_52w_breakouts([ticker], tag_data)
+                enriched["broke_52w_high_days_ago"] = tag_data.get(ticker, {}).get("broke_52w_high_days_ago")
+            except:
+                enriched["broke_52w_high_days_ago"] = None
+
             stored_count = position.get("confluence_count")
             stored_methods_raw = position.get("confluence_methods")
             if stored_count is not None and stored_count > 0:
                 enriched["confluence_count"] = stored_count
                 enriched["confluence_methods"] = json.loads(stored_methods_raw) if isinstance(stored_methods_raw, str) else (stored_methods_raw or [])
             else:
-                # Fetch history and calculate fresh
+                # Fetch history and calculate fresh — tag_data already populated above
                 try:
-                    tag_data = {ticker: {"price": position.get("buy_price", 0)}}
-                    enrich_price_data_with_history([ticker], tag_data)
-                    check_52w_breakouts([ticker], tag_data)
                     confluence = calculate_method_confluence(ticker, tag_data)
                     enriched["confluence_count"] = confluence["count"]
                     enriched["confluence_methods"] = confluence["methods"]
-                    enriched["broke_52w_high_days_ago"] = tag_data.get(ticker, {}).get("broke_52w_high_days_ago")
-                    # Persist to DB so next call is instant
                     try:
                         _db = get_database()
                         _db.execute("UPDATE virtual_trades SET confluence_count=?, confluence_methods=? WHERE id=?",
@@ -2954,8 +2959,6 @@ def api_open_positions_dynamic():
                 except:
                     enriched["confluence_count"] = 0
                     enriched["confluence_methods"] = []
-            if "broke_52w_high_days_ago" not in enriched:
-                enriched["broke_52w_high_days_ago"] = None
             if "news" not in enriched:
                 enriched["news"] = []
 
