@@ -403,6 +403,17 @@ def initialize_database():
             actual_move REAL,
             logged_at TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS method_signals (
+            id TEXT PRIMARY KEY,
+            method TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            date TEXT NOT NULL,
+            entry_price REAL,
+            outcome TEXT DEFAULT 'open',
+            actual_move REAL,
+            logged_at TEXT
+        );
     """)
 
     # Add new columns to virtual_trades if upgrading from earlier schema
@@ -1025,14 +1036,67 @@ def run_darvas_silent_collection(price_data, scored_stocks):
     except Exception as err:
         log.warning(f"Darvas silent collection error: {err}")
 
+def run_method_signal_logging(price_data, scored_stocks):
+    """
+    Log signals for all 7 trading methods silently during each scan.
+    Uses the same method_signals table for all non-Darvas methods.
+    Resolves open signals older than 2 days.
+    """
+    try:
+        database = get_database()
+        today = current_time_cst().strftime("%Y-%m-%d")
+
+        for stock in scored_stocks:
+            ticker = stock["ticker"]
+            if ticker not in price_data:
+                continue
+            confluence = calculate_method_confluence(ticker, price_data)
+            for method in confluence["methods"]:
+                if method == "Darvas":
+                    continue  # Already tracked separately
+                signal_id = f"{ticker}_{today}_{method.replace(' ', '_').replace('&', 'and')}"
+                existing = database.execute(
+                    "SELECT id FROM method_signals WHERE id=?", [signal_id]
+                ).fetchone()
+                if not existing:
+                    database.execute("""
+                        INSERT INTO method_signals (id, method, ticker, date, entry_price, outcome, logged_at)
+                        VALUES (?,?,?,?,?,?,?)
+                    """, [signal_id, method, ticker, today,
+                          price_data[ticker].get("price", 0),
+                          "open", current_time_cst().isoformat()])
+
+        # Resolve open signals older than 2 days
+        open_signals = database.execute(
+            "SELECT * FROM method_signals WHERE outcome='open' AND date < ?",
+            [(current_time_cst() - timedelta(days=2)).strftime("%Y-%m-%d")]
+        ).fetchall()
+
+        for signal in open_signals:
+            if signal["ticker"] in price_data:
+                entry = signal["entry_price"] or 1
+                current = price_data[signal["ticker"]]["price"]
+                actual_move = (current - entry) / max(entry, 0.01) * 100
+                outcome = "hit" if actual_move >= 5 else "miss"
+                database.execute(
+                    "UPDATE method_signals SET outcome=?, actual_move=? WHERE id=?",
+                    [outcome, round(actual_move, 2), signal["id"]]
+                )
+
+        database.commit()
+        database.close()
+    except Exception as err:
+        log.warning(f"Method signal logging error: {err}")
+
+
 def fetch_ticker_news(tickers, price_data):
     """
-    Fetch up to 3 recent news headlines per ticker using Yahoo Finance RSS.
-    More reliable than yfinance .news which breaks when Yahoo changes their API.
-    RSS format: https://finance.yahoo.com/rss/headline?s=TICKER
+    Fetch up to 5 recent news headlines per ticker using Yahoo Finance RSS.
+    Includes publication date, sorted newest to oldest.
     """
     import urllib.request
     import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
 
     for ticker in tickers:
         if ticker not in price_data:
@@ -1044,13 +1108,25 @@ def fetch_ticker_news(tickers, price_data):
                 xml_content = response.read().decode("utf-8", errors="ignore")
             root = ET.fromstring(xml_content)
             headlines = []
-            for item in root.findall(".//item")[:3]:
+            for item in root.findall(".//item")[:5]:
                 title_el = item.find("title")
                 link_el = item.find("link")
+                pubdate_el = item.find("pubDate")
                 title = title_el.text.strip() if title_el is not None and title_el.text else ""
                 link = link_el.text.strip() if link_el is not None and link_el.text else ""
+                pub_date = ""
+                pub_ts = 0
+                if pubdate_el is not None and pubdate_el.text:
+                    try:
+                        dt = parsedate_to_datetime(pubdate_el.text.strip())
+                        pub_date = dt.strftime("%b %d")
+                        pub_ts = dt.timestamp()
+                    except:
+                        pub_date = pubdate_el.text.strip()[:10]
                 if title and link:
-                    headlines.append({"title": title, "url": link})
+                    headlines.append({"title": title, "url": link, "date": pub_date, "ts": pub_ts})
+            # Sort newest first
+            headlines.sort(key=lambda x: x.get("ts", 0), reverse=True)
             price_data[ticker]["news"] = headlines
         except Exception as err:
             price_data[ticker]["news"] = []
@@ -1320,6 +1396,7 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
 
     # Run Darvas silent collection on all scored stocks
     run_darvas_silent_collection(price_data, scored_stocks)
+    run_method_signal_logging(price_data, scored_stocks)
 
     # Fetch news for top recommended longs only (not full universe)
     top_tickers = [s["ticker"] for s in recommended_longs[:MAX_LONG_PICKS]]
@@ -2199,6 +2276,54 @@ def api_stats():
         "queue": get_queue_status(),
     })
 
+@app.route("/api/method-stats")
+def api_method_stats():
+    """Return win rate and signal history for all 7 trading methods."""
+    try:
+        database = get_database()
+        methods = ["Darvas", "Gap & Go", "Donchian", "Inside Day", "NR7", "Bull Flag", "Pocket Pivot"]
+        result = {}
+
+        for method in methods:
+            if method == "Darvas":
+                rows = [dict(r) for r in database.execute(
+                    "SELECT * FROM darvas_picks ORDER BY date DESC LIMIT 100"
+                ).fetchall()]
+            else:
+                rows = [dict(r) for r in database.execute(
+                    "SELECT * FROM method_signals WHERE method=? ORDER BY date DESC LIMIT 100",
+                    [method]
+                ).fetchall()]
+
+            resolved = [r for r in rows if r.get("outcome") in ("hit", "miss")]
+            hits = [r for r in resolved if r.get("outcome") == "hit"]
+            moves = [r.get("actual_move", 0) for r in resolved if r.get("actual_move") is not None]
+            win_rate = round(len(hits) / len(resolved) * 100, 1) if resolved else None
+            avg_move = round(sum(moves) / len(moves), 2) if moves else None
+            best_trade = max(moves) if moves else None
+
+            result[method] = {
+                "total_signals": len(rows),
+                "resolved": len(resolved),
+                "hits": len(hits),
+                "misses": len(resolved) - len(hits),
+                "win_rate": win_rate,
+                "avg_move": avg_move,
+                "best_trade": best_trade,
+                "recent": rows[:5],
+            }
+
+        # Also get weights history for SwingDesk Algo section
+        weights_history = [dict(r) for r in database.execute(
+            "SELECT * FROM weights_history ORDER BY timestamp DESC LIMIT 50"
+        ).fetchall()]
+
+        database.close()
+        return jsonify({"methods": result, "weights_history": weights_history})
+    except Exception as e:
+        log.error(f"method-stats error: {e}")
+        return jsonify({"methods": {}, "weights_history": []}), 500
+
 @app.route("/api/position-checks/<position_id>")
 def api_position_checks(position_id):
     database = get_database()
@@ -2287,19 +2412,30 @@ def api_open_positions_dynamic():
 
         tickers = list(set(p["ticker"] for p in open_positions))
         weights = get_signal_weights()
-        current_price_data = fetch_price_data(tickers)
-        current_rsi = calculate_rsi_batch(tickers)
-        earnings_soon = check_upcoming_earnings(tickers)
-        fetch_ticker_news(tickers, current_price_data)
-
-        # Enrich with 52W breakout and confluence data
-        check_52w_breakouts(tickers, current_price_data)
-        enrich_price_data_with_history(tickers, current_price_data)
 
         now_cst = current_time_cst()
         market_is_live = (now_cst.weekday() < 5 and
                           now_cst.hour >= 8 and
                           (now_cst.hour < 15 or (now_cst.hour == 15 and now_cst.minute == 0)))
+
+        if market_is_live:
+            # Live market hours — fetch fresh data
+            current_price_data = fetch_price_data(tickers)
+            current_rsi = calculate_rsi_batch(tickers)
+            earnings_soon = check_upcoming_earnings(tickers)
+            fetch_ticker_news(tickers, current_price_data)
+            check_52w_breakouts(tickers, current_price_data)
+            enrich_price_data_with_history(tickers, current_price_data)
+        else:
+            # Outside market hours — skip yfinance entirely, use stored values
+            current_price_data = {}
+            current_rsi = {}
+            earnings_soon = {}
+            # Still fetch news since it doesn't need market data
+            dummy = {t: {"price": 0} for t in tickers}
+            fetch_ticker_news(tickers, dummy)
+            for t in tickers:
+                current_price_data[t] = dummy[t]
 
         minute_of_day = now_cst.hour * 60 + now_cst.minute
         is_weekday = now_cst.weekday() < 5
