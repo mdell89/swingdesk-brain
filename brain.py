@@ -1,9 +1,20 @@
 """
-brain.py — Overnight Swing Desk Backend v8 (Push 34)
+brain.py — Overnight Swing Desk Backend v9 (Push 35)
 ══════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 34:
+Changes in Push 35:
+  - Relative Strength vs Market: 5-day stock return vs SPY scoring indicator
+  - Sector Relative Strength: 5-day sector ETF vs SPY scoring indicator
+  - VWAP Distance/Reclaim: institutional conviction signal + 9th confluence method
+  - Historical Volatility Ratio/Squeeze: compression detection + 10th confluence method
+  - Scoring engine expanded 5 → 9 indicators, weights rebalanced
+  - Confluence methods expanded 8 → 10, X/8 → X/10
+  - weights_history schema: 4 new indicator columns added
+  - Audit prompt updated for all 9 indicators
+  - DB migration for new weight columns
+
+Previous (Push 34):
   - Support & Resistance: ATR-14 adaptive swing pivot detection + zone clustering
   - S&R added as 6th scoring indicator, replacing sector_rotation ghost weight
   - sector_rotation weight migrated → support_resistance on DB startup
@@ -309,6 +320,10 @@ def initialize_database():
             earnings_catalyst REAL,
             sector_rotation REAL,
             support_resistance REAL,
+            relative_strength REAL,
+            sector_relative_strength REAL,
+            vwap_reclaim REAL,
+            volatility_squeeze REAL,
             win_rate REAL,
             total_resolved INTEGER,
             audit_reasoning TEXT
@@ -439,11 +454,18 @@ def initialize_database():
         );
     """)
 
-    # Add support_resistance column to weights_history if upgrading from earlier schema
-    try:
-        database.execute("ALTER TABLE weights_history ADD COLUMN support_resistance REAL")
-    except:
-        pass  # Column already exists
+    # Add new columns to weights_history if upgrading from earlier schema
+    for wh_col in [
+        "support_resistance REAL",
+        "relative_strength REAL",
+        "sector_relative_strength REAL",
+        "vwap_reclaim REAL",
+        "volatility_squeeze REAL",
+    ]:
+        try:
+            database.execute(f"ALTER TABLE weights_history ADD COLUMN {wh_col}")
+        except:
+            pass  # Column already exists
 
     # Add new columns to virtual_trades if upgrading from earlier schema
     for column_definition in [
@@ -470,11 +492,15 @@ def initialize_database():
     existing_weights = database.execute("SELECT value FROM app_state WHERE key='weights'").fetchone()
     if not existing_weights:
         default_weights = {
-            "rsi_momentum": 0.20,
-            "volume_surge": 0.22,
-            "overnight_gap_probability": 0.25,
-            "earnings_catalyst": 0.18,
-            "support_resistance": 0.15,
+            "rsi_momentum": 0.15,
+            "volume_surge": 0.15,
+            "overnight_gap_probability": 0.18,
+            "earnings_catalyst": 0.14,
+            "support_resistance": 0.13,
+            "relative_strength": 0.12,
+            "sector_relative_strength": 0.10,
+            "vwap_reclaim": 0.08,
+            "volatility_squeeze": 0.05,
         }
         database.execute("INSERT INTO app_state VALUES ('weights',?)", [json.dumps(default_weights)])
     else:
@@ -503,9 +529,11 @@ def get_signal_weights():
     except:
         pass
     return {
-        "rsi_momentum": 0.20, "volume_surge": 0.22,
-        "overnight_gap_probability": 0.25, "earnings_catalyst": 0.18,
-        "support_resistance": 0.15,
+        "rsi_momentum": 0.15, "volume_surge": 0.15,
+        "overnight_gap_probability": 0.18, "earnings_catalyst": 0.14,
+        "support_resistance": 0.13, "relative_strength": 0.12,
+        "sector_relative_strength": 0.10, "vwap_reclaim": 0.08,
+        "volatility_squeeze": 0.05,
     }
 
 def save_signal_weights(weights):
@@ -1055,14 +1083,16 @@ def calculate_method_confluence(ticker, price_data, scored_stocks=None):
     Each method returns True/False based on its rules applied to daily OHLCV data.
 
     Methods:
-    1. Darvas Box      — near 52W high + volume + positive gap
-    2. Gap and Go      — gap up >2% + volume surge
-    3. Donchian Channel — price above 20-day high
-    4. Inside Day      — today's range inside yesterday's + breaking up
-    5. NR7             — narrowest range of last 7 days
-    6. Bull Flag       — strong prior move + tight consolidation
-    7. Pocket Pivot    — up day with volume > any down-day vol of last 10 days
-    8. Support & Resistance — ATR-adaptive zone analysis (open air or near support)
+    1.  Darvas Box          — near 52W high + volume + positive gap
+    2.  Gap and Go          — gap up >2% + volume surge
+    3.  Donchian Channel    — price above 20-day high
+    4.  Inside Day          — today's range inside yesterday's + breaking up
+    5.  NR7                 — narrowest range of last 7 days
+    6.  Bull Flag           — strong prior move + tight consolidation
+    7.  Pocket Pivot        — up day with volume > any down-day vol of last 10 days
+    8.  Support & Resistance — ATR-adaptive zone analysis (open air or near support)
+    9.  VWAP Reclaim        — closing above VWAP, institutional buy-side conviction
+    10. Volatility Squeeze  — HV compression ratio, coiled spring setup
 
     Returns: {"count": int, "methods": [list of method names that agree]}
     """
@@ -1134,12 +1164,19 @@ def calculate_method_confluence(ticker, price_data, scored_stocks=None):
             methods_agree.append("Pocket Pivot")
 
     # 8. Support & Resistance — ATR-adaptive zone analysis
-    # Qualifies if open air above (no resistance in expected move range)
-    # or price is near a support floor with room to run
     sr = data.get("sr_analysis") or calculate_support_resistance(ticker, price_data)
-    if sr["signal"] in ("open_air", "open_air+support_floor") or \
-       ("support_floor" in sr["signal"] and sr["score"] >= 0.65):
+    if sr["signal"] in ("open_air", "open_air+support_floor") or        ("support_floor" in sr["signal"] and sr["score"] >= 0.65):
         methods_agree.append("S&R")
+
+    # 9. VWAP Reclaim — price closing above VWAP shows institutional buy-side
+    vwap_score = calculate_vwap_signal(ticker, price_data)
+    if vwap_score >= 0.75:
+        methods_agree.append("VWAP Reclaim")
+
+    # 10. Volatility Squeeze — compression precedes explosive directional move
+    squeeze_score = calculate_volatility_squeeze(ticker, price_data)
+    if squeeze_score >= 0.75:
+        methods_agree.append("Vol Squeeze")
 
     return {"count": len(methods_agree), "methods": methods_agree}
 
@@ -1463,43 +1500,209 @@ def fetch_ticker_news(tickers, price_data):
             articles = _fetch_news_yahoo_rss(ticker)
         price_data[ticker]["news"] = articles[:1]  # Show most recent article on card
 
+
+def calculate_relative_strength(ticker, price_data):
+    """
+    Relative Strength vs Market: compare ticker's 5-day return to SPY's 5-day return.
+    A stock outperforming SPY is showing genuine institutional accumulation —
+    money is flowing into this name specifically, not just riding the market.
+
+    Score:
+      Outperforming SPY by >3%  → 1.0 (strong RS)
+      Outperforming SPY by >1%  → 0.75
+      In line with SPY (±1%)    → 0.5 (neutral)
+      Underperforming by >1%    → 0.3
+      Underperforming by >3%    → 0.1 (weak RS)
+    """
+    if ticker not in price_data or "SPY" not in price_data:
+        return 0.5
+    try:
+        ticker_history = price_data[ticker].get("daily_history", [])
+        spy_history = price_data.get("SPY", {}).get("daily_history", [])
+        if len(ticker_history) < 5 or len(spy_history) < 5:
+            return 0.5
+        ticker_5d = (ticker_history[-1]["close"] - ticker_history[-5]["close"]) / max(ticker_history[-5]["close"], 0.01) * 100
+        spy_5d = (spy_history[-1]["close"] - spy_history[-5]["close"]) / max(spy_history[-5]["close"], 0.01) * 100
+        rs_diff = ticker_5d - spy_5d
+        if rs_diff > 3:   return 1.0
+        if rs_diff > 1:   return 0.75
+        if rs_diff > -1:  return 0.5
+        if rs_diff > -3:  return 0.3
+        return 0.1
+    except:
+        return 0.5
+
+
+def calculate_sector_relative_strength(ticker, price_data):
+    """
+    Sector Relative Strength: compare ticker's sector ETF 5-day return to SPY.
+    Institutional money rotates by sector. A stock in a sector with tailwind
+    has a higher base rate of continuation than one swimming against sector flow.
+
+    Uses SECTOR_MAP to find the right ETF. ETFs already in the universe so
+    their price data is fetched for free during every scan.
+    """
+    SECTOR_ETF_MAP = {
+        "Tech": "XLK", "Finance": "XLF", "Energy": "XLE",
+        "Healthcare": "XLV", "Industrial": "XLI", "Consumer": "XLY",
+        "Defense": "XLI", "Auto": "XLY", "Crypto": "XLK",
+        "ETF": None, "Other": None,
+    }
+    sector = get_sector(ticker)
+    etf = SECTOR_ETF_MAP.get(sector)
+    if not etf or etf not in price_data or "SPY" not in price_data:
+        return 0.5
+    try:
+        etf_history = price_data[etf].get("daily_history", [])
+        spy_history = price_data.get("SPY", {}).get("daily_history", [])
+        if len(etf_history) < 5 or len(spy_history) < 5:
+            return 0.5
+        etf_5d = (etf_history[-1]["close"] - etf_history[-5]["close"]) / max(etf_history[-5]["close"], 0.01) * 100
+        spy_5d = (spy_history[-1]["close"] - spy_history[-5]["close"]) / max(spy_history[-5]["close"], 0.01) * 100
+        diff = etf_5d - spy_5d
+        if diff > 2:   return 0.85
+        if diff > 0.5: return 0.7
+        if diff > -0.5: return 0.5
+        if diff > -2:  return 0.35
+        return 0.2
+    except:
+        return 0.5
+
+
+def calculate_vwap_signal(ticker, price_data):
+    """
+    VWAP Distance / VWAP Reclaim signal.
+    VWAP (Volume Weighted Average Price) is the institutional benchmark.
+    Stocks closing above VWAP show institutions are net buyers on the day.
+    The reclaim setup — stock dips below VWAP intraday then closes above —
+    is one of the most reliable institutional accumulation signals.
+
+    Uses intraday_history if available (populated separately for candidates),
+    falls back to close vs open as a VWAP proxy for universe-wide scanning.
+
+    Score:
+      Price well above VWAP (>1%)    → 0.85 (strong institutional buy)
+      Price just above VWAP (0-1%)   → 0.65
+      Price at VWAP (±0.3%)          → 0.5
+      Price below VWAP               → 0.25
+    """
+    if ticker not in price_data:
+        return 0.5
+    try:
+        data = price_data[ticker]
+        # Use pre-computed VWAP if available from intraday fetch
+        vwap = data.get("vwap")
+        price = data.get("price", 0)
+        if vwap and price and vwap > 0:
+            dist_pct = (price - vwap) / vwap * 100
+            if dist_pct > 1.0:  return 0.85
+            if dist_pct > 0.0:  return 0.65
+            if dist_pct > -0.3: return 0.5
+            return 0.25
+        # Proxy: closing above open with volume surge suggests above-VWAP close
+        close = data.get("price", 0)
+        open_p = data.get("open", close)
+        volume_ratio = data.get("volume_ratio", 1.0)
+        if open_p <= 0:
+            return 0.5
+        day_move = (close - open_p) / open_p * 100
+        if day_move > 1.5 and volume_ratio > 1.3:  return 0.80
+        if day_move > 0.5:                          return 0.65
+        if day_move > -0.5:                         return 0.5
+        return 0.3
+    except:
+        return 0.5
+
+
+def calculate_volatility_squeeze(ticker, price_data):
+    """
+    Historical Volatility Ratio (Volatility Squeeze signal).
+    Compares recent 5-day HV to 20-day HV. A low ratio means volatility
+    is compressing — the stock is coiling. Compression historically precedes
+    expansion: the tighter the squeeze, the more explosive the breakout.
+
+    HV = annualized standard deviation of daily log returns.
+    Ratio = HV_5 / HV_20
+
+    Score:
+      Ratio < 0.5  → 1.0 (extreme compression — coiled spring)
+      Ratio < 0.7  → 0.85
+      Ratio < 0.9  → 0.65
+      Ratio < 1.1  → 0.5 (neutral)
+      Ratio >= 1.1 → 0.3 (already expanding — may be late)
+    """
+    if ticker not in price_data:
+        return 0.5
+    try:
+        import math
+        history = price_data[ticker].get("daily_history", [])
+        if len(history) < 21:
+            return 0.5
+        closes = [d["close"] for d in history]
+        log_returns = [math.log(closes[i] / closes[i-1]) for i in range(1, len(closes)) if closes[i-1] > 0]
+        if len(log_returns) < 20:
+            return 0.5
+        def hv(returns):
+            n = len(returns)
+            mean = sum(returns) / n
+            variance = sum((r - mean) ** 2 for r in returns) / (n - 1)
+            return math.sqrt(variance * 252)  # Annualized
+        hv5  = hv(log_returns[-5:])
+        hv20 = hv(log_returns[-20:])
+        if hv20 <= 0:
+            return 0.5
+        ratio = hv5 / hv20
+        if ratio < 0.5:  return 1.0
+        if ratio < 0.7:  return 0.85
+        if ratio < 0.9:  return 0.65
+        if ratio < 1.1:  return 0.5
+        return 0.3
+    except:
+        return 0.5
+
+
 # ── SCORING ENGINE ────────────────────────────────────────────────────────────
 def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, direction="long"):
     """
-    Calculate a confidence score (0-96) for a potential trade.
-    Combines RSI, volume, overnight gap, earnings, and S&R signals
-    weighted by the brain's current learned weights.
+    Calculate a confidence score (0-99) for a potential trade.
+    9-signal scoring engine weighted by the brain's current learned weights.
 
-    S&R replaces the former sector_rotation placeholder. Unlike sector_rotation
-    which had no actual signal and redistributed its weight to other indicators,
-    S&R produces a real 0-1 score based on ATR-adaptive pivot zone analysis.
-    The audit loop can now tune all 5 weights against real signal performance.
+    Signals:
+      1. RSI Momentum              — price momentum quality
+      2. Volume Surge              — participation/institutional conviction
+      3. Overnight Gap             — directional bias at open
+      4. Earnings Catalyst         — event-driven run-up signal
+      5. Support & Resistance      — ATR-adaptive structural levels
+      6. Relative Strength         — stock vs SPY 5-day return
+      7. Sector Relative Strength  — sector ETF vs SPY 5-day return
+      8. VWAP Distance/Reclaim     — institutional buy-side footprint
+      9. Volatility Squeeze        — compression precedes expansion
+
+    All signals return 0.0-1.0. Weighted sum × multiplier → integer score.
+    Hard disqualifier: earnings tonight/tomorrow returns 0 immediately.
+    Multiplier calibrated so average qualified setup scores ~70.
     """
-    # Guard against NaN values
     rsi = rsi if rsi == rsi else 50.0
 
-    # RSI signal: different logic for long vs short
+    # 1. RSI Momentum
     if direction == "long":
         rsi_score = 1.0 if 40 <= rsi <= 65 else (0.9 if rsi < 40 else 0.5)
     else:
         rsi_score = 1.0 if rsi > 65 else (0.7 if rsi > 55 else 0.4)
 
-    # Volume surge signal
+    # 2. Volume Surge
     volume_ratio = price_data.get("volume_ratio", 1.0)
     volume_ratio = volume_ratio if volume_ratio == volume_ratio else 1.0
     volume_score = min(volume_ratio / 3.5, 1.0)
 
-    # Overnight gap signal
+    # 3. Overnight Gap
     gap_percent = price_data.get("gap_percent", 0)
     gap_percent = gap_percent if gap_percent == gap_percent else 0.0
     gap_score = min(abs(gap_percent) / 10.0, 1.0)
     if direction == "short":
         gap_score = gap_score if gap_percent < 0 else gap_score * 0.5
 
-    # Earnings catalyst signal
-    # Hard disqualify if earnings tonight (0 days) or tomorrow (1 day) — never hold through earnings
-    # Mild positive for run-up period (2-7 days out) — graduated by proximity
-    # Neutral if no earnings in sight
+    # 4. Earnings Catalyst — hard disqualify if earnings tonight or tomorrow
     if ticker in earnings_soon:
         days_to_earnings = earnings_soon.get(ticker, 7) if isinstance(earnings_soon, dict) else 3
         if days_to_earnings <= 1:
@@ -1513,26 +1716,44 @@ def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, 
     else:
         earnings_score = 0.5
 
-    # Support & Resistance signal — ATR-adaptive zone analysis
-    # Uses pre-computed sr_analysis if available (set by calculate_support_resistance),
-    # otherwise falls back to neutral 0.5 so missing data never tanks a score.
+    # 5. Support & Resistance
     sr_analysis = price_data.get("sr_analysis")
     sr_score = sr_analysis["score"] if sr_analysis else 0.5
     if direction == "short":
-        # For shorts, invert S&R logic: resistance above is good (price likely to stall)
         sr_score = 1.0 - sr_score
 
-    # Weighted combination — all 5 signals now have real scores
+    # 6. Relative Strength vs Market
+    rs_score = calculate_relative_strength(ticker, price_data)
+    if direction == "short":
+        rs_score = 1.0 - rs_score
+
+    # 7. Sector Relative Strength
+    sector_rs_score = calculate_sector_relative_strength(ticker, price_data)
+    if direction == "short":
+        sector_rs_score = 1.0 - sector_rs_score
+
+    # 8. VWAP Distance/Reclaim
+    vwap_score = calculate_vwap_signal(ticker, price_data)
+    if direction == "short":
+        vwap_score = 1.0 - vwap_score
+
+    # 9. Volatility Squeeze
+    squeeze_score = calculate_volatility_squeeze(ticker, price_data)
+
+    # Weighted combination — all 9 signals
     raw_score = (
-        rsi_score    * weights.get("rsi_momentum", 0.20) +
-        volume_score * weights.get("volume_surge", 0.22) +
-        gap_score    * weights.get("overnight_gap_probability", 0.25) +
-        earnings_score * weights.get("earnings_catalyst", 0.18) +
-        sr_score     * weights.get("support_resistance", weights.get("sector_rotation", 0.15))
+        rsi_score        * weights.get("rsi_momentum", 0.15) +
+        volume_score     * weights.get("volume_surge", 0.15) +
+        gap_score        * weights.get("overnight_gap_probability", 0.18) +
+        earnings_score   * weights.get("earnings_catalyst", 0.14) +
+        sr_score         * weights.get("support_resistance", 0.13) +
+        rs_score         * weights.get("relative_strength", 0.12) +
+        sector_rs_score  * weights.get("sector_relative_strength", 0.10) +
+        vwap_score       * weights.get("vwap_reclaim", 0.08) +
+        squeeze_score    * weights.get("volatility_squeeze", 0.05)
     )
-    # Multiplier calibrated to keep scores in 65-96 range for qualified setups.
-    # 5 real signals at average 0.65 score × sum(weights=1.0) × 110 ≈ 71 — floor clears CONFIDENCE_FLOOR.
-    return min(int(raw_score * 110), 99)
+    # Multiplier: 9 signals averaging 0.65 × weights summing to 1.0 × 108 ≈ 70
+    return min(int(raw_score * 108), 99)
 
 def estimate_overnight_move(price_data, confidence, has_earnings):
     """Estimate the expected overnight price movement percentage."""
@@ -1642,7 +1863,9 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
     universe = build_ticker_universe()
     log.info(f"Comprehensive scan: {len(universe)} tickers ({scan_type})...")
 
-    price_data = fetch_price_data(universe)
+    # Ensure SPY is always fetched — needed for relative strength calculations
+    universe_with_spy = list(dict.fromkeys(universe + ["SPY"]))
+    price_data = fetch_price_data(universe_with_spy)
 
     # Filter out tickers where yfinance returned weekend/holiday stale data.
     # If the latest price date is more than 3 days old, the data is stale.
@@ -2215,9 +2438,14 @@ def run_self_audit():
                 f"CURRENT WEIGHTS: {json.dumps(current_weights)}\n"
                 f"PERFORMANCE: {json.dumps({'total': total_predictions, 'resolved': len(resolved_predictions), 'hits': len(hit_predictions), 'misses': len(miss_predictions), 'win_rate': win_rate})}\n"
                 f"HOLD DURATION BREAKDOWN: {json.dumps(closed_days_summary)}\n"
-                f"Indicators: rsi_momentum, volume_surge, overnight_gap_probability, earnings_catalyst, support_resistance.\n"
-                f"support_resistance scores open-air setups (no overhead resistance) higher and resistance-capped setups lower.\n"
-                f"Rules: weights must sum to 1.0, each between 0.05-0.45.\n"
+                f"Indicators: rsi_momentum, volume_surge, overnight_gap_probability, earnings_catalyst, "
+                f"support_resistance, relative_strength, sector_relative_strength, vwap_reclaim, volatility_squeeze.\n"
+                f"support_resistance: open-air setups score high, resistance-capped setups score low.\n"
+                f"relative_strength: stock outperforming SPY 5-day scores high.\n"
+                f"sector_relative_strength: sector ETF outperforming SPY 5-day scores high.\n"
+                f"vwap_reclaim: closing above VWAP shows institutional buy-side conviction.\n"
+                f"volatility_squeeze: low HV ratio (compression) scores high — coiled spring setup.\n"
+                f"Rules: weights must sum to 1.0, each between 0.03-0.35.\n"
                 f"Respond ONLY with valid JSON: {{\"weights\":{{...}},\"reasoning\":[\"...\"],\"summary\":\"...\",\"confidence\":\"low|medium|high\"}}"
             }]
         )
@@ -2242,14 +2470,20 @@ def run_self_audit():
         # Also write to weights_history for chart visualization
         database.execute("""
             INSERT INTO weights_history (timestamp, rsi_momentum, volume_surge,
-            overnight_gap_probability, earnings_catalyst, support_resistance, win_rate, total_resolved)
-            VALUES (?,?,?,?,?,?,?,?)
+            overnight_gap_probability, earnings_catalyst, support_resistance,
+            relative_strength, sector_relative_strength, vwap_reclaim, volatility_squeeze,
+            win_rate, total_resolved)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """, [current_time_cst().isoformat(),
               new_weights.get("rsi_momentum", 0),
               new_weights.get("volume_surge", 0),
               new_weights.get("overnight_gap_probability", 0),
               new_weights.get("earnings_catalyst", 0),
-              new_weights.get("support_resistance", new_weights.get("sector_rotation", 0)),
+              new_weights.get("support_resistance", 0),
+              new_weights.get("relative_strength", 0),
+              new_weights.get("sector_relative_strength", 0),
+              new_weights.get("vwap_reclaim", 0),
+              new_weights.get("volatility_squeeze", 0),
               win_rate, len(resolved_predictions)])
         database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_audit',?)",
                          [current_time_cst().isoformat()])
@@ -2672,7 +2906,7 @@ def api_method_stats():
     """Return win rate and signal history for all 7 trading methods."""
     try:
         database = get_database()
-        methods = ["Darvas", "Gap & Go", "Donchian", "Inside Day", "NR7", "Bull Flag", "Pocket Pivot", "S&R"]
+        methods = ["Darvas", "Gap & Go", "Donchian", "Inside Day", "NR7", "Bull Flag", "Pocket Pivot", "S&R", "VWAP Reclaim", "Vol Squeeze"]
         result = {}
 
         for method in methods:
@@ -3100,10 +3334,16 @@ def api_seed_friday():
                 rsi_score = 1.0
                 vol_score = min(volume_ratio / 3.5, 1.0)
                 gap_score = min(abs(gap_pct) / 10.0, 1.0)
-                raw = (rsi_score * weights["rsi_momentum"] + vol_score * weights["volume_surge"] +
-                       gap_score * weights["overnight_gap_probability"] + 0.6 * weights["earnings_catalyst"] +
-                       0.6 * weights.get("support_resistance", weights.get("sector_rotation", 0.15)))
-                confidence = min(int(raw * 110), 96)
+                raw = (rsi_score * weights.get("rsi_momentum", 0.15) +
+                       vol_score * weights.get("volume_surge", 0.15) +
+                       gap_score * weights.get("overnight_gap_probability", 0.18) +
+                       0.6 * weights.get("earnings_catalyst", 0.14) +
+                       0.6 * weights.get("support_resistance", 0.13) +
+                       0.5 * weights.get("relative_strength", 0.12) +
+                       0.5 * weights.get("sector_relative_strength", 0.10) +
+                       0.5 * weights.get("vwap_reclaim", 0.08) +
+                       0.5 * weights.get("volatility_squeeze", 0.05))
+                confidence = min(int(raw * 108), 96)
                 expected_move = round(min(4 + (confidence-60)*0.25 + (volume_ratio-1)*1.5 + min(abs(gap_pct)*0.3,3), 25), 1)
                 
                 if confidence >= CONFIDENCE_FLOOR and expected_move >= MIN_EXPECTED_MOVE:
@@ -3462,6 +3702,107 @@ def api_backfill_tags():
         log.error(f"Backfill tags error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
+# ── COMPREHENSIVE BACKFILL ───────────────────────────────────────────────────
+@app.route("/api/backfill-all", methods=["POST"])
+def api_backfill_all():
+    """
+    Comprehensive one-time backfill for all open positions.
+    Applies all current scoring logic retroactively:
+      - All 10 confluence methods (including VWAP Reclaim, Vol Squeeze)
+      - All 9 scoring indicators (including RS, Sector RS, VWAP, HVR)
+      - Updated confidence and dynamic_confidence
+      - Updated confluence_count and confluence_methods
+      - 52W breakout tags
+
+    Safe to call multiple times. Never touches P&L, current_value,
+    buy_price, outcome, or any trade outcome data.
+    Supersedes /api/backfill-tags and /api/backfill-sr-confidence.
+    """
+    try:
+        database = get_database()
+        open_positions = [dict(r) for r in database.execute(
+            "SELECT * FROM virtual_trades WHERE outcome='open'"
+        ).fetchall()]
+
+        if not open_positions:
+            database.close()
+            return jsonify({"success": True, "updated": 0, "message": "No open positions"})
+
+        tickers = list(set(p["ticker"] for p in open_positions))
+        weights = get_signal_weights()
+
+        # Fetch all data needed — include SPY for relative strength
+        tickers_with_spy = list(dict.fromkeys(tickers + ["SPY"]))
+        price_data = fetch_price_data(tickers_with_spy)
+        rsi_values = calculate_rsi_batch(tickers)
+        earnings_soon = check_upcoming_earnings(tickers)
+        enrich_price_data_with_history(tickers_with_spy, price_data)
+        check_52w_breakouts(tickers, price_data)
+
+        # Pre-compute S&R for all tickers
+        for ticker in tickers:
+            if ticker in price_data:
+                try:
+                    price_data[ticker]["expected_move_pct"] = 5.0
+                    calculate_support_resistance(ticker, price_data)
+                except:
+                    pass
+
+        updated = 0
+        results = []
+        for position in open_positions:
+            ticker = position["ticker"]
+            if ticker not in price_data:
+                results.append({"ticker": ticker, "status": "no_price_data"})
+                continue
+            try:
+                rsi = rsi_values.get(ticker, 50.0)
+
+                # Recalculate all 10 confluence methods
+                confluence = calculate_method_confluence(ticker, price_data)
+
+                # Recalculate confidence with all 9 signals
+                new_confidence = calculate_confidence_score(
+                    ticker, price_data[ticker], rsi, earnings_soon, weights, "long"
+                )
+                new_estimate = estimate_overnight_move(
+                    price_data[ticker], new_confidence, ticker in earnings_soon
+                )
+
+                broke_52w = price_data.get(ticker, {}).get("broke_52w_high_days_ago")
+
+                database.execute("""
+                    UPDATE virtual_trades SET
+                        confidence=?, dynamic_confidence=?, dynamic_estimate=?,
+                        confluence_count=?, confluence_methods=?
+                    WHERE id=?
+                """, [
+                    new_confidence, new_confidence, new_estimate,
+                    confluence["count"], json.dumps(confluence["methods"]),
+                    position["id"]
+                ])
+                updated += 1
+                results.append({
+                    "ticker": ticker,
+                    "old_confidence": position.get("confidence", 0),
+                    "new_confidence": new_confidence,
+                    "confluence_count": confluence["count"],
+                    "confluence_methods": confluence["methods"],
+                    "broke_52w_high_days_ago": broke_52w,
+                    "status": "updated",
+                })
+            except Exception as e:
+                results.append({"ticker": ticker, "status": "error", "error": str(e)})
+
+        database.commit()
+        database.close()
+        log.info(f"Backfill all: updated {updated} positions")
+        return jsonify({"success": True, "updated": updated, "results": results})
+
+    except Exception as e:
+        log.error(f"Backfill all error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 # ── BACKFILL S&R CONFIDENCE ──────────────────────────────────────────────────
 @app.route("/api/backfill-sr-confidence", methods=["POST"])
 def api_backfill_sr_confidence():
@@ -3567,14 +3908,20 @@ def api_backfill_weights_history():
                 if not existing:
                     database.execute("""
                         INSERT INTO weights_history (timestamp, rsi_momentum, volume_surge,
-                        overnight_gap_probability, earnings_catalyst, support_resistance, win_rate, total_resolved)
-                        VALUES (?,?,?,?,?,?,?,?)
+                        overnight_gap_probability, earnings_catalyst, support_resistance,
+                        relative_strength, sector_relative_strength, vwap_reclaim, volatility_squeeze,
+                        win_rate, total_resolved)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                     """, [row["timestamp"],
                           weights.get("rsi_momentum", 0),
                           weights.get("volume_surge", 0),
                           weights.get("overnight_gap_probability", 0),
                           weights.get("earnings_catalyst", 0),
                           weights.get("support_resistance", weights.get("sector_rotation", 0)),
+                          weights.get("relative_strength", 0),
+                          weights.get("sector_relative_strength", 0),
+                          weights.get("vwap_reclaim", 0),
+                          weights.get("volatility_squeeze", 0),
                           row.get("win_rate", 0),
                           row.get("resolved_count", 0)])
                     inserted += 1
