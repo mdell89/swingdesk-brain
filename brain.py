@@ -1,17 +1,15 @@
 """
-brain.py — Overnight Swing Desk Backend v14 (Push 42)
+brain.py — Overnight Swing Desk Backend v15 (Push 43)
 ══════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 42:
-  - perf-history: always appends live "now" point from open virtual_trades
-    at query time — chart reflects reality even when no position_checks ran
-  - /api/backfill-lock-in-confidence: POST endpoint backfills lock_in_confidence
-    = confidence for all trades where column is NULL (fixes existing trades)
-  - /api/today-closed: GET endpoint returns today's closed trades with
-    human-readable outcome_label and outcome_type for closed card UI
+Changes in Push 43:
+  - open-positions-dynamic: DB-only, zero yfinance calls on demand
+    all values served from what the 2.5-min monitor last wrote to virtual_trades
+    eliminates 5-6 sequential yfinance calls per request, fixes scheduler violation
+  - /api/ping: lightweight wake-up endpoint for Railway cold start mitigation
 
-Previous (Push 41):
+Previous (Push 42):
   - 8:15 AM CST pre-market scan added to scheduler
   - 8:25 AM CST queue lock-in — freezes pick queue before open
   - Twilio SMS notifications on position close (any reason)
@@ -3333,6 +3331,11 @@ def api_performance_history():
 
     return jsonify(history)
 
+@app.route("/api/ping")
+def api_ping():
+    """Lightweight wake-up endpoint. Frontend hits this first to warm Railway before real requests."""
+    return jsonify({"ok": True, "ts": current_time_cst().isoformat()})
+
 @app.route("/api/stats")
 def api_stats():
     database = get_database()
@@ -3485,7 +3488,11 @@ def api_scan_history():
 
 @app.route("/api/open-positions-dynamic")
 def api_open_positions_dynamic():
-    """Return open positions with dynamic scoring, sorted by sentiment priority."""
+    """
+    Return open positions using only DB-stored values.
+    All live enrichment (prices, RSI, confidence, news, confluence) is written
+    by the 2.5-min monitor on its schedule — this endpoint never calls yfinance.
+    """
     try:
         database = get_database()
         open_positions = [dict(t) for t in database.execute(
@@ -3496,33 +3503,7 @@ def api_open_positions_dynamic():
         if not open_positions:
             return jsonify([])
 
-        tickers = list(set(p["ticker"] for p in open_positions))
-        weights = get_signal_weights()
-
         now_cst = current_time_cst()
-        market_is_live = (now_cst.weekday() < 5 and
-                          now_cst.hour >= 8 and
-                          (now_cst.hour < 15 or (now_cst.hour == 15 and now_cst.minute == 0)))
-
-        if market_is_live:
-            # Live market hours — fetch fresh data
-            current_price_data = fetch_price_data(tickers)
-            current_rsi = calculate_rsi_batch(tickers)
-            earnings_soon = check_upcoming_earnings(tickers)
-            fetch_ticker_news(tickers, current_price_data)
-            check_52w_breakouts(tickers, current_price_data)
-            enrich_price_data_with_history(tickers, current_price_data)
-        else:
-            # Outside market hours — skip yfinance entirely, use stored values
-            current_price_data = {}
-            current_rsi = {}
-            earnings_soon = {}
-            # Still fetch news since it doesn't need market data
-            dummy = {t: {"price": 0} for t in tickers}
-            fetch_ticker_news(tickers, dummy)
-            for t in tickers:
-                current_price_data[t] = dummy[t]
-
         minute_of_day = now_cst.hour * 60 + now_cst.minute
         is_weekday = now_cst.weekday() < 5
         WINDOW1 = 9 * 60 + 30
@@ -3536,190 +3517,41 @@ def api_open_positions_dynamic():
             ticker = position["ticker"]
             enriched = dict(position)
 
-            if ticker in current_price_data:
-                stock_data = current_price_data[ticker]
-                rsi = current_rsi.get(ticker, 50.0)
-                has_earnings = ticker in earnings_soon
-
-                # Dynamic confidence/estimate: live during market hours, frozen otherwise
-                if market_is_live:
-                    dynamic_confidence = calculate_confidence_score(
-                        ticker, stock_data, rsi, earnings_soon, weights, position["direction"]
-                    )
-                    dynamic_estimate = estimate_overnight_move(stock_data, dynamic_confidence, has_earnings)
-                else:
-                    dynamic_confidence = position.get("dynamic_confidence") or position.get("confidence", 0)
-                    dynamic_estimate = position.get("dynamic_estimate") or position.get("expected_move", 0)
-
-                # P&L: live during market hours, frozen otherwise
-                buy_price = position["buy_price"] or 0
-                if market_is_live:
-                    current_price = stock_data["price"]
-                else:
-                    stored_value = position.get("current_value")
-                    invested = position.get("invested_amount") or 10.0
-                    if stored_value and abs(stored_value - invested) > 0.001:
-                        current_price = buy_price * (stored_value / max(invested, 0.01))
-                    else:
-                        current_price = buy_price
-
-                pnl_pct = (current_price - buy_price) / max(buy_price, 0.01) * 100
-                if position["direction"] == "short":
-                    pnl_pct = -pnl_pct
-                if abs(pnl_pct) < 0.005:
-                    pnl_pct = 0.0
-
-                invested_amount = position["invested_amount"] or 10.0
-                current_value = invested_amount * (1 + pnl_pct / 100)
-                if abs(current_value - invested_amount) < 0.005:
-                    current_value = invested_amount
-
-                enriched["dynamic_confidence"] = dynamic_confidence
-                enriched["dynamic_estimate"] = dynamic_estimate
-                enriched["current_price"] = round(current_price, 4)
-                enriched["current_pnl_percent"] = round(pnl_pct, 2)
-                enriched["current_value"] = round(current_value, 4)
-                enriched["current_rsi"] = round(rsi, 1)
-                enriched["current_volume_ratio"] = round(stock_data.get("volume_ratio", 1), 2)
-                enriched["news"] = current_price_data.get(ticker, {}).get("news", [])
-
-                # 52W and confluence — calculate regardless of market hours
-                # using stored price data or last known values
-                if market_is_live:
-                    enriched["broke_52w_high_days_ago"] = current_price_data.get(ticker, {}).get("broke_52w_high_days_ago")
-                    confluence = calculate_method_confluence(ticker, current_price_data)
-                    enriched["confluence_count"] = confluence["count"]
-                    enriched["confluence_methods"] = confluence["methods"]
-                else:
-                    # Outside market hours — use stored confluence from DB if available
-                    stored_count = position.get("confluence_count")
-                    stored_methods_raw = position.get("confluence_methods")
-                    if stored_count is not None and stored_count > 0:
-                        enriched["confluence_count"] = stored_count
-                        enriched["confluence_methods"] = json.loads(stored_methods_raw) if isinstance(stored_methods_raw, str) else (stored_methods_raw or [])
-                    else:
-                        # Never been written — fetch history and calculate properly
-                        try:
-                            enriched_data = {ticker: dict(current_price_data.get(ticker, {"price": position.get("buy_price", 0)}))}
-                            enrich_price_data_with_history([ticker], enriched_data)
-                            check_52w_breakouts([ticker], enriched_data)
-                            confluence = calculate_method_confluence(ticker, enriched_data)
-                            # Also grab 52W from the enriched data
-                            enriched["broke_52w_high_days_ago"] = enriched_data.get(ticker, {}).get("broke_52w_high_days_ago")
-                        except:
-                            confluence = {"count": 0, "methods": []}
-                            enriched["broke_52w_high_days_ago"] = None
-                        enriched["confluence_count"] = confluence["count"]
-                        enriched["confluence_methods"] = confluence["methods"]
-                        try:
-                            _db = get_database()
-                            _db.execute("UPDATE virtual_trades SET confluence_count=?, confluence_methods=? WHERE id=?",
-                                [confluence["count"], json.dumps(confluence["methods"]), position["id"]])
-                            _db.commit()
-                            _db.close()
-                        except:
-                            pass
-                    if "broke_52w_high_days_ago" not in enriched:
-                        # For 52W use darvas_picks as fallback
-                        try:
-                            db2 = get_database()
-                            darvas_row = db2.execute(
-                                "SELECT * FROM darvas_picks WHERE ticker=? ORDER BY date DESC LIMIT 1", [ticker]
-                            ).fetchone()
-                            db2.close()
-                            if darvas_row and darvas_row["week_high"]:
-                                buy_p = position["buy_price"] or 0
-                                enriched["broke_52w_high_days_ago"] = 1 if buy_p >= darvas_row["week_high"] * 0.95 else None
-                            else:
-                                enriched["broke_52w_high_days_ago"] = None
-                        except:
-                            enriched["broke_52w_high_days_ago"] = None
-
-                # Sentiment with time-aware CUT thresholds
-                frozen_target = position["expected_move"] or 10
-                cut_threshold = None
-                if is_weekday and MARKET_OPEN <= minute_of_day < MARKET_CLOSE:
-                    if minute_of_day < WINDOW1:
-                        cut_threshold = None
-                    elif minute_of_day < WINDOW2:
-                        cut_threshold = frozen_target * 0.75
-                    elif minute_of_day < WINDOW3:
-                        cut_threshold = frozen_target * 0.50
-                    else:
-                        cut_threshold = frozen_target * 0.25
-
-                is_cut = cut_threshold is not None and pnl_pct < -(cut_threshold)
-
-                if pnl_pct >= frozen_target:
-                    enriched["sentiment"] = f"Exceeded. +{pnl_pct:.1f}% vs {frozen_target:.1f}% target."
-                    enriched["sentiment_icon"] = "flash"
-                elif pnl_pct >= frozen_target * 0.7:
-                    enriched["sentiment"] = f"Close. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
-                    enriched["sentiment_icon"] = "flash"
-                elif is_cut:
-                    enriched["sentiment"] = f"Reversing. {pnl_pct:.1f}% exceeds cut threshold."
-                    enriched["sentiment_icon"] = "x"
-                elif pnl_pct >= 2:
-                    enriched["sentiment"] = f"Steady. +{pnl_pct:.1f}% of {frozen_target:.1f}% target."
-                    enriched["sentiment_icon"] = "check"
-                elif pnl_pct < 0:
-                    enriched["sentiment"] = f"Behind. {pnl_pct:+.1f}%."
-                    enriched["sentiment_icon"] = "warning"
-                else:
-                    enriched["sentiment"] = f"Holding. Flat. {pnl_pct:+.1f}%."
-                    enriched["sentiment_icon"] = "check"
+            # ── P&L from stored current_value (written by 2.5-min monitor) ──
+            invested = position.get("invested_amount") or 10.0
+            stored_value = position.get("current_value") or invested
+            buy_price = position.get("buy_price") or 0
+            if buy_price > 0:
+                pnl_pct = (stored_value - invested) / max(invested, 0.01) * 100
             else:
-                enriched["dynamic_confidence"] = position.get("confidence", 0)
-                enriched["dynamic_estimate"] = position.get("expected_move", 0)
-                enriched["sentiment"] = "Monitoring. Waiting for data."
-                enriched["sentiment_icon"] = "warning"
-                # Set P&L from stored values so cards show correctly
-                stored_value = position.get("current_value")
-                invested = position.get("invested_amount") or 10.0
-                buy_price = position.get("buy_price") or 0
-                if stored_value and buy_price > 0:
-                    pnl_pct = (stored_value - invested) / max(invested, 0.01) * 100
-                    if abs(pnl_pct) < 0.005: pnl_pct = 0.0
-                    enriched["current_pnl_percent"] = round(pnl_pct, 2)
-                    enriched["current_value"] = round(stored_value, 4)
+                pnl_pct = 0.0
+            if abs(pnl_pct) < 0.005:
+                pnl_pct = 0.0
+            enriched["current_pnl_percent"] = round(pnl_pct, 2)
+            enriched["current_value"] = round(stored_value, 4)
 
-            # ── Tags: confluence + 52W — always calculated regardless of market hours ──
-            # 52W check always runs unconditionally — must not be gated behind the
-            # confluence cache branch or positions with stored confluence never get the tag.
-            try:
-                tag_data = {ticker: {"price": position.get("buy_price", 0)}}
-                enrich_price_data_with_history([ticker], tag_data)
-                check_52w_breakouts([ticker], tag_data)
-                enriched["broke_52w_high_days_ago"] = tag_data.get(ticker, {}).get("broke_52w_high_days_ago")
-            except:
-                enriched["broke_52w_high_days_ago"] = None
+            # ── Dynamic confidence/estimate from stored values ──
+            enriched["dynamic_confidence"] = position.get("dynamic_confidence") or position.get("confidence", 0)
+            enriched["dynamic_estimate"] = position.get("dynamic_estimate") or position.get("expected_move", 0)
+            enriched["lock_in_confidence"] = position.get("lock_in_confidence") or position.get("confidence", 0)
 
-            stored_count = position.get("confluence_count")
+            # ── Sentiment icon — use stored, fallback to warning ──
+            enriched["sentiment_icon"] = position.get("sentiment_icon") or "warning"
+            enriched["sentiment"] = position.get("sentiment") or "Monitoring."
+
+            # ── Confluence — always parse from DB, never recalculate ──
+            stored_count = position.get("confluence_count") or 0
             stored_methods_raw = position.get("confluence_methods")
-            if stored_count is not None and stored_count > 0:
-                enriched["confluence_count"] = stored_count
+            enriched["confluence_count"] = stored_count
+            try:
                 enriched["confluence_methods"] = json.loads(stored_methods_raw) if isinstance(stored_methods_raw, str) else (stored_methods_raw or [])
-            else:
-                # Fetch history and calculate fresh — tag_data already populated above
-                try:
-                    confluence = calculate_method_confluence(ticker, tag_data)
-                    enriched["confluence_count"] = confluence["count"]
-                    enriched["confluence_methods"] = confluence["methods"]
-                    try:
-                        _db = get_database()
-                        _db.execute("UPDATE virtual_trades SET confluence_count=?, confluence_methods=? WHERE id=?",
-                            [confluence["count"], json.dumps(confluence["methods"]), position["id"]])
-                        _db.commit()
-                        _db.close()
-                    except:
-                        pass
-                except:
-                    enriched["confluence_count"] = 0
-                    enriched["confluence_methods"] = []
-            if "news" not in enriched:
-                enriched["news"] = []
+            except:
+                enriched["confluence_methods"] = []
 
-            # Signal scores — use stored value, fallback to empty
+            # ── 52W — use stored value from DB ──
+            enriched["broke_52w_high_days_ago"] = position.get("broke_52w_high_days_ago")
+
+            # ── Signal scores — parse from stored JSON ──
             raw_scores = position.get("signal_scores")
             try:
                 parsed = json.loads(raw_scores) if isinstance(raw_scores, str) else (raw_scores or {})
@@ -3731,21 +3563,20 @@ def api_open_positions_dynamic():
                 enriched["signal_fired"] = []
                 enriched["signal_values"] = {}
 
-            # Lock-in confidence — stamped at 8:15 AM scan, never changes
-            enriched["lock_in_confidence"] = position.get("lock_in_confidence") or position.get("confidence", 0)
+            # ── News — use stored value ──
+            enriched["news"] = position.get("news") or []
 
             enriched_positions.append(enriched)
 
-        # Sort server-side: SELL first, then NEAR, HOLD, WEAK, CUT last
+        # Sort: target hit first, then HOLD, then WEAK, then worst P&L
         def sort_priority(pos):
             pnl = pos.get("current_pnl_percent") or 0
             target = pos.get("expected_move") or 10
             icon = pos.get("sentiment_icon", "")
-            if pnl >= target: return (1, -pnl)           # SELL
-            if pnl >= target * 0.7: return (2, -pnl)     # NEAR
-            if pnl >= 0: return (3, -pnl)                # HOLD
-            if icon == "x": return (0, -pnl)             # CUT — only when backend flagged it
-            return (4, -pnl)                              # WEAK
+            if pnl >= target: return (1, -pnl)
+            if pnl >= 0: return (2, -pnl)
+            if icon == "x": return (0, -pnl)
+            return (3, -pnl)
 
         enriched_positions.sort(key=sort_priority)
         return jsonify(enriched_positions)
