@@ -1,16 +1,18 @@
 """
-brain.py — Overnight Swing Desk Backend v16b (Push 44b hotfix)
-══════════════════════════════════════════════════════════════
+brain.py — Overnight Swing Desk Backend v17 (Push 45)
+══════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 44b (hotfix):
-  - fetch_current_prices: switched to fast_info.last_price for standard monitoring
-    history() per-ticker was too slow causing monitor to never complete writes
-    fast_info is a single property lookup — ~10x faster per ticker
-    fallback to history() if fast_info unavailable
-    pin_to_845 path unchanged (still uses 1-min download for accuracy)
+Changes in Push 45:
+  - get_database: timeout=30 + PRAGMA busy_timeout=30000 — fixes database locked errors
+    monitor and scans were competing causing monitor to never write prices
+  - fetch_current_prices: returns {ticker: {price, day_change_pct}} dicts
+    Alpha Vantage fallback when fast_info returns nothing
+  - monitor: reads price dict, writes day_change_percent to virtual_trades
+  - banner-prices: ^VIX fix, switched to fast_info per ticker (no batch download)
+  - day_change_percent: new column on virtual_trades, returned from open-positions-dynamic
 
-Previous (Push 44):
+Previous (Push 44b):
   - 8:15 AM CST pre-market scan added to scheduler
   - 8:25 AM CST queue lock-in — freezes pick queue before open
   - Twilio SMS notifications on position close (any reason)
@@ -258,9 +260,11 @@ def build_ticker_universe():
 
 # ── DATABASE ──────────────────────────────────────────────────────────────────
 def get_database():
-    """Open a connection to the SQLite database with WAL mode enabled."""
-    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False, timeout=10)
+    """Open a connection to the SQLite database with WAL mode enabled.
+    timeout=30 prevents 'database is locked' errors when monitor and scans compete."""
+    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False, timeout=30)
     connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA busy_timeout=30000")
     connection.row_factory = sqlite3.Row
     return connection
 
@@ -512,6 +516,7 @@ def initialize_database():
         "signal_scores TEXT DEFAULT '{}'",
         "lock_in_confidence INTEGER",
         "last_price_updated TEXT",
+        "day_change_percent REAL",
     ]:
         try:
             column_name = column_definition.split()[0]
@@ -774,11 +779,11 @@ def fetch_price_data(tickers):
 
 def fetch_current_prices(tickers, pin_to_845=False):
     """
-    Fetch current prices for monitoring — returns {ticker: price}.
+    Fetch current prices for monitoring — returns {ticker: {"price": float, "day_change_pct": float}}.
 
-    Uses fast_info.last_price for standard monitoring (fast, single property lookup).
-    Falls back to history() if fast_info unavailable.
-    pin_to_845 still uses 1-min history to find the exact 8:45 AM candle.
+    Uses fast_info.last_price + previous_close for price and daily change.
+    Falls back to Alpha Vantage if fast_info returns nothing.
+    pin_to_845 still uses 1-min history for exact 8:45 AM candle.
 
     Each ticker fetched independently — one bad ticker never poisons the batch.
     Retries with backoff on rate limit errors.
@@ -801,20 +806,27 @@ def fetch_current_prices(tickers, pin_to_845=False):
                     candle = data[data.index.strftime("%H:%M") == "08:46"]
                 if not candle.empty:
                     price = float(candle["Open"].iloc[0])
-                    return price if price == price else None
+                    return {"price": price, "day_change_pct": 0} if price == price else None
                 price = float(data["Open"].iloc[0])
-                return price if price == price else None
+                return {"price": price, "day_change_pct": 0} if price == price else None
             else:
-                # fast_info.last_price is a single property — much faster than history()
                 fi = yf.Ticker(ticker).fast_info
                 price = fi.last_price
-                if price and price == price:  # not None, not NaN
-                    return float(price)
-                # fallback to history if fast_info unavailable
-                hist = yf.Ticker(ticker).history(period="1d", interval="5m")
-                if hist is not None and not hist.empty:
-                    price = float(hist["Close"].iloc[-1])
-                    return price if price == price else None
+                prev = fi.previous_close
+                if price and price == price:
+                    day_chg = ((float(price) - float(prev)) / float(prev) * 100) if prev and prev == prev else 0
+                    return {"price": float(price), "day_change_pct": round(day_chg, 2)}
+                # Alpha Vantage fallback
+                if ALPHA_VANTAGE_KEY:
+                    import urllib.request
+                    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}"
+                    with urllib.request.urlopen(url, timeout=5) as resp:
+                        quote = json.loads(resp.read()).get("Global Quote", {})
+                    if quote.get("05. price"):
+                        price = float(quote["05. price"])
+                        prev = float(quote["08. previous close"])
+                        day_chg = (price - prev) / prev * 100 if prev else 0
+                        return {"price": price, "day_change_pct": round(day_chg, 2)}
                 return None
         except Exception as e:
             err_str = str(e).lower()
@@ -827,10 +839,10 @@ def fetch_current_prices(tickers, pin_to_845=False):
             return None
 
     for ticker in tickers:
-        price = fetch_one(ticker)
-        if price is not None:
-            results[ticker] = price
-        time.sleep(0.1)  # polite delay between tickers
+        result = fetch_one(ticker)
+        if result is not None:
+            results[ticker] = result
+        time.sleep(0.1)
 
     return results
 
@@ -2577,11 +2589,12 @@ def monitor_open_positions():
         if ticker not in current_prices:
             continue
 
-        price = current_prices[ticker]
+        price_data = current_prices[ticker]
+        price = price_data["price"] if isinstance(price_data, dict) else float(price_data)
+        day_change_pct = price_data.get("day_change_pct", 0) if isinstance(price_data, dict) else 0
 
         # Stale price detection — if price is identical to last 3 consecutive checks
         # during market hours, skip sell decisions (possible halt or bad data)
-        stale_key = f"stale_count_{ticker}"
         last_known = last_price_cache.get(ticker, {})
         last_price = last_known.get("price")
         stale_count = last_known.get("stale_count", 0)
@@ -2657,18 +2670,18 @@ def monitor_open_positions():
             database.execute("""
                 UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?,
                 dynamic_confidence=?, dynamic_estimate=?, confluence_count=?, confluence_methods=?,
-                signal_scores=?, last_price_updated=?
+                signal_scores=?, last_price_updated=?, day_change_percent=?
                 WHERE id=?
             """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2),
                   dyn_conf, round(dyn_est, 1), conf_count, conf_methods,
-                  _signal_scores_json, now.isoformat(), position["id"]])
+                  _signal_scores_json, now.isoformat(), day_change_pct, position["id"]])
         except:
             database.execute("""
                 UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?,
-                last_price_updated=?
+                last_price_updated=?, day_change_percent=?
                 WHERE id=?
             """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2),
-                  now.isoformat(), position["id"]])
+                  now.isoformat(), day_change_pct, position["id"]])
 
         # Determine if this is the sell day (position was opened before today)
         is_sell_day = position["buy_date"] < today
@@ -3526,6 +3539,7 @@ def api_open_positions_dynamic():
             enriched["dynamic_estimate"] = position.get("dynamic_estimate") or position.get("expected_move", 0)
             enriched["lock_in_confidence"] = position.get("lock_in_confidence") or position.get("confidence", 0)
             enriched["last_price_updated"] = position.get("last_price_updated")
+            enriched["day_change_percent"] = position.get("day_change_percent") or 0
 
             # ── Sentiment icon — use stored, fallback to warning ──
             enriched["sentiment_icon"] = position.get("sentiment_icon") or "warning"
@@ -3750,7 +3764,8 @@ def api_seed_friday():
 # ── BANNER PRICES ─────────────────────────────────────────────────────────────
 @app.route("/api/banner-prices")
 def api_banner_prices():
-    """Return latest prices for VIX, SPY, QQQ + any open position tickers."""
+    """Return latest prices for VIX, SPY, QQQ + any open position tickers.
+    Uses fast_info per ticker for reliability — avoids batch download 400s."""
     try:
         import yfinance as yf
         database = get_database()
@@ -3759,38 +3774,30 @@ def api_banner_prices():
         ).fetchall()]
         database.close()
 
-        base = ["VIX", "SPY", "QQQ", "IWM", "NVDA", "TLT", "BTC-USD", "GLD"]
+        # ^VIX is the correct yfinance symbol for VIX index
+        base = ["^VIX", "SPY", "QQQ", "IWM", "NVDA", "TLT", "BTC-USD", "GLD"]
         all_tickers = list(dict.fromkeys(base + open_tickers))
-
-        raw = yf.download(all_tickers, period="5d", interval="1d",
-                          auto_adjust=True, progress=False)
 
         results = {}
         for ticker in all_tickers:
             try:
-                if len(all_tickers) == 1:
-                    close = raw["Close"].dropna()
-                    prev = raw["Close"].dropna()
-                else:
-                    close = raw["Close"][ticker].dropna()
-                    prev = raw["Close"][ticker].dropna()
-
-                if len(close) < 2:
-                    continue
-
-                price = float(close.iloc[-1])
-                prev_close = float(close.iloc[-2])
-                change = price - prev_close
-                change_pct = (change / prev_close) * 100
-
-                results[ticker] = {
-                    "price": round(price, 2),
-                    "prev_close": round(prev_close, 2),
-                    "change": round(change, 2),
-                    "change_pct": round(change_pct, 2),
-                }
+                fi = yf.Ticker(ticker).fast_info
+                price = fi.last_price
+                prev = fi.previous_close
+                if price and prev and price == price and prev == prev:
+                    change = price - prev
+                    change_pct = (change / prev) * 100
+                    # Store under display name (VIX not ^VIX)
+                    display = ticker.lstrip("^")
+                    results[display] = {
+                        "price": round(float(price), 2),
+                        "prev_close": round(float(prev), 2),
+                        "change": round(float(change), 2),
+                        "change_pct": round(float(change_pct), 2),
+                    }
+                time.sleep(0.1)
             except Exception as e:
-                log.warning(f"Banner price error for {ticker}: {e}")
+                log.debug(f"Banner price skip {ticker}: {e}")
 
         return jsonify(results)
     except Exception as e:
