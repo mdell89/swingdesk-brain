@@ -1,9 +1,15 @@
 """
-brain.py — Overnight Swing Desk Backend v9 (Push 35)
+brain.py — Overnight Swing Desk Backend v10 (Push 36)
 ══════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 35:
+Changes in Push 36:
+  - /api/reset-weights: POST endpoint to write 9-signal default weights to DB
+  - initialize_database: detects + fills missing weight keys in existing weights JSON
+  - perf-history: seed point uses last trading weekday date, fixes 1D chart weekend bug
+  - get_queue_status: returns dynamic fallback amount instead of hardcoded DEFAULT_INVESTMENT
+
+Previous (Push 35):
   - Relative Strength vs Market: 5-day stock return vs SPY scoring indicator
   - Sector Relative Strength: 5-day sector ETF vs SPY scoring indicator
   - VWAP Distance/Reclaim: institutional conviction signal + 9th confluence method
@@ -481,6 +487,7 @@ def initialize_database():
         "weekend_hold INTEGER DEFAULT 0",
         "confluence_count INTEGER DEFAULT 0",
         "confluence_methods TEXT DEFAULT '[]'",
+        "signal_scores TEXT DEFAULT '{}'",
     ]:
         try:
             column_name = column_definition.split()[0]
@@ -504,13 +511,34 @@ def initialize_database():
         }
         database.execute("INSERT INTO app_state VALUES ('weights',?)", [json.dumps(default_weights)])
     else:
-        # Migrate existing weights: rename sector_rotation → support_resistance if needed
+        # Migrate existing weights: fill in any missing keys with defaults
         try:
             w = json.loads(existing_weights["value"])
+            changed = False
+            # Rename sector_rotation → support_resistance
             if "sector_rotation" in w and "support_resistance" not in w:
                 w["support_resistance"] = w.pop("sector_rotation")
+                changed = True
+            # Fill in any missing new indicator keys
+            default_new_keys = {
+                "support_resistance": 0.13,
+                "relative_strength": 0.12,
+                "sector_relative_strength": 0.10,
+                "vwap_reclaim": 0.08,
+                "volatility_squeeze": 0.05,
+            }
+            for key, default_val in default_new_keys.items():
+                if key not in w:
+                    # Redistribute weight from existing keys proportionally
+                    w[key] = default_val
+                    changed = True
+            # Renormalize so weights sum to 1.0
+            if changed:
+                total = sum(w.values())
+                if total > 0:
+                    w = {k: round(v / total, 4) for k, v in w.items()}
                 database.execute("INSERT OR REPLACE INTO app_state VALUES ('weights',?)", [json.dumps(w)])
-                log.info("Migrated weights: sector_rotation → support_resistance")
+                log.info(f"Migrated weights to 9-signal schema: {w}")
         except:
             pass
 
@@ -629,7 +657,7 @@ def get_queue_status():
         "available_count": available["count"],
         "available_total": round(available["total"], 2),
         "total_ever_queued": total_ever["count"],
-        "default_fallback": DEFAULT_INVESTMENT,
+        "default_fallback": get_dynamic_fallback_amount(),
         "recent_entries": recent,
     }
 
@@ -1661,6 +1689,84 @@ def calculate_volatility_squeeze(ticker, price_data):
         return 0.5
 
 
+def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direction="long"):
+    """
+    Compute individual scores for all 9 indicators.
+    Returns:
+      scores: dict of {indicator_name: float 0-1}
+      fired:  list of indicator names that scored >= 0.65 (above neutral threshold)
+
+    Used to populate signal_scores on virtual_trades for display on position cards.
+    Does not recalculate confidence — that uses calculate_confidence_score separately.
+    """
+    rsi = rsi if rsi == rsi else 50.0
+
+    # RSI
+    if direction == "long":
+        rsi_score = 1.0 if 40 <= rsi <= 65 else (0.9 if rsi < 40 else 0.5)
+    else:
+        rsi_score = 1.0 if rsi > 65 else (0.7 if rsi > 55 else 0.4)
+
+    # Volume
+    volume_ratio = price_data.get("volume_ratio", 1.0)
+    volume_ratio = volume_ratio if volume_ratio == volume_ratio else 1.0
+    volume_score = min(volume_ratio / 3.5, 1.0)
+
+    # Gap
+    gap_percent = price_data.get("gap_percent", 0)
+    gap_percent = gap_percent if gap_percent == gap_percent else 0.0
+    gap_score = min(abs(gap_percent) / 10.0, 1.0)
+    if direction == "short":
+        gap_score = gap_score if gap_percent < 0 else gap_score * 0.5
+
+    # Earnings
+    if ticker in earnings_soon:
+        days = earnings_soon.get(ticker, 7) if isinstance(earnings_soon, dict) else 3
+        if days <= 1:   earnings_score = 0.0
+        elif days <= 3: earnings_score = 0.75
+        elif days <= 7: earnings_score = 0.65
+        else:           earnings_score = 0.5
+    else:
+        earnings_score = 0.5
+
+    # S&R
+    sr_analysis = price_data.get("sr_analysis")
+    sr_score = sr_analysis["score"] if sr_analysis else 0.5
+    if direction == "short": sr_score = 1.0 - sr_score
+
+    # RS vs Market
+    rs_score = calculate_relative_strength(ticker, price_data)
+    if direction == "short": rs_score = 1.0 - rs_score
+
+    # Sector RS
+    sector_rs_score = calculate_sector_relative_strength(ticker, price_data)
+    if direction == "short": sector_rs_score = 1.0 - sector_rs_score
+
+    # VWAP
+    vwap_score = calculate_vwap_signal(ticker, price_data)
+    if direction == "short": vwap_score = 1.0 - vwap_score
+
+    # Volatility Squeeze
+    squeeze_score = calculate_volatility_squeeze(ticker, price_data)
+
+    scores = {
+        "rsi_momentum":             round(rsi_score, 3),
+        "volume_surge":             round(volume_score, 3),
+        "overnight_gap":            round(gap_score, 3),
+        "earnings_catalyst":        round(earnings_score, 3),
+        "support_resistance":       round(sr_score, 3),
+        "relative_strength":        round(rs_score, 3),
+        "sector_rs":                round(sector_rs_score, 3),
+        "vwap_reclaim":             round(vwap_score, 3),
+        "volatility_squeeze":       round(squeeze_score, 3),
+    }
+
+    FIRED_THRESHOLD = 0.65
+    fired = [k for k, v in scores.items() if v >= FIRED_THRESHOLD]
+
+    return scores, fired
+
+
 # ── SCORING ENGINE ────────────────────────────────────────────────────────────
 def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, direction="long"):
     """
@@ -2120,16 +2226,34 @@ def execute_opening_positions():
         else:
             closed_days = 1  # Just overnight
 
+        # Compute signal scores at open time for display on position cards
+        try:
+            _weights = get_signal_weights()
+            _earnings = check_upcoming_earnings([ticker])
+            _open_price_data = {ticker: {
+                "price": buy_price,
+                "volume_ratio": pick.get("vol_ratio", 1.0),
+                "gap_percent": pick.get("overnight_gap_pct", 0),
+                "day_change_percent": pick.get("day_change_pct", 0),
+                "daily_history": [],
+            }}
+            _sig_scores, _fired = compute_signal_scores(ticker, _open_price_data, pick.get("rsi", 50.0), _earnings, _weights, direction)
+            _signal_scores_json = json.dumps({"scores": _sig_scores, "fired": _fired})
+        except:
+            _signal_scores_json = json.dumps({"scores": {}, "fired": []})
+
         existing.execute("""
             INSERT INTO virtual_trades
             (id, ticker, direction, buy_date, buy_time, buy_price, invested_amount,
              confidence, expected_move, outcome, sector, reasoning, closed_days,
-             status, current_value, intraday_high_pct, intraday_low_pct, queue_position)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             status, current_value, intraday_high_pct, intraday_low_pct, queue_position,
+             signal_scores)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, [trade_id, ticker, direction, today, "08:45:00", buy_price,
               round(invested_amount, 4), confidence, expected_move, "open",
               get_sector(ticker), reasoning, closed_days,
-              "open", round(invested_amount, 4), 0.0, 0.0, queue_id])
+              "open", round(invested_amount, 4), 0.0, 0.0, queue_id,
+              _signal_scores_json])
         existing.commit()
         existing.close()
 
@@ -2260,13 +2384,28 @@ def monitor_open_positions():
             conf_count = position.get("confluence_count") or 0
             conf_methods = position.get("confluence_methods") or "[]"
 
+        # Refresh signal_scores during monitoring
+        try:
+            _weights = get_signal_weights()
+            _earnings_m = check_upcoming_earnings([ticker])
+            _sig_scores, _fired = compute_signal_scores(
+                ticker, price_data_for_dynamic.get(ticker, {"price": price, "volume_ratio": 1.0, "gap_percent": 0}),
+                rsi_val if "rsi_val" in dir() else 50.0,
+                _earnings_m, _weights, position["direction"]
+            )
+            _signal_scores_json = json.dumps({"scores": _sig_scores, "fired": _fired})
+        except:
+            _signal_scores_json = position.get("signal_scores") or json.dumps({"scores": {}, "fired": []})
+
         try:
             database.execute("""
                 UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?,
-                dynamic_confidence=?, dynamic_estimate=?, confluence_count=?, confluence_methods=?
+                dynamic_confidence=?, dynamic_estimate=?, confluence_count=?, confluence_methods=?,
+                signal_scores=?
                 WHERE id=?
             """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2),
-                  dyn_conf, round(dyn_est, 1), conf_count, conf_methods, position["id"]])
+                  dyn_conf, round(dyn_est, 1), conf_count, conf_methods,
+                  _signal_scores_json, position["id"]])
         except:
             database.execute("""
                 UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?
@@ -2829,10 +2968,19 @@ def api_performance_history():
     running_balance = 1000.0
     history = []
 
-    # Seed point so chart always has something to draw from day one
-    seed_ts = int((datetime.utcnow() - timedelta(days=1)).timestamp() * 1000)
+    # Seed point — always use last trading weekday date so the frontend
+    # baseline lookup (which filters for weekdays only) can always find it.
+    # Using utcnow()-1 breaks on weekends when "yesterday" is Saturday.
+    def last_trading_weekday():
+        d = datetime.utcnow() - timedelta(days=1)
+        # Walk back until we hit a weekday (Mon=0 ... Fri=4)
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d
+    seed_day = last_trading_weekday()
+    seed_ts = int(seed_day.replace(hour=9, minute=0, second=0).timestamp() * 1000)
     history.append({
-        "date": (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d"),
+        "date": seed_day.strftime("%Y-%m-%d"),
         "virtual": 1000.0,
         "daily_pnl": 0,
         "trades": 0,
@@ -3257,6 +3405,16 @@ def api_open_positions_dynamic():
                     enriched["confluence_methods"] = []
             if "news" not in enriched:
                 enriched["news"] = []
+
+            # Signal scores — use stored value, fallback to empty
+            raw_scores = position.get("signal_scores")
+            try:
+                parsed = json.loads(raw_scores) if isinstance(raw_scores, str) else (raw_scores or {})
+                enriched["signal_scores"] = parsed.get("scores", {})
+                enriched["signal_fired"] = parsed.get("fired", [])
+            except:
+                enriched["signal_scores"] = {}
+                enriched["signal_fired"] = []
 
             enriched_positions.append(enriched)
 
@@ -3771,15 +3929,24 @@ def api_backfill_all():
 
                 broke_52w = price_data.get(ticker, {}).get("broke_52w_high_days_ago")
 
+                # Compute signal scores for display
+                try:
+                    _sig_scores, _fired = compute_signal_scores(
+                        ticker, price_data[ticker], rsi, earnings_soon, weights, "long"
+                    )
+                    _signal_scores_json = json.dumps({"scores": _sig_scores, "fired": _fired})
+                except:
+                    _signal_scores_json = json.dumps({"scores": {}, "fired": []})
+
                 database.execute("""
                     UPDATE virtual_trades SET
                         confidence=?, dynamic_confidence=?, dynamic_estimate=?,
-                        confluence_count=?, confluence_methods=?
+                        confluence_count=?, confluence_methods=?, signal_scores=?
                     WHERE id=?
                 """, [
                     new_confidence, new_confidence, new_estimate,
                     confluence["count"], json.dumps(confluence["methods"]),
-                    position["id"]
+                    _signal_scores_json, position["id"]
                 ])
                 updated += 1
                 results.append({
@@ -3931,6 +4098,34 @@ def api_backfill_weights_history():
         database.close()
         return jsonify({"success": True, "inserted": inserted})
     except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+# ── RESET WEIGHTS ────────────────────────────────────────────────────────────
+@app.route("/api/reset-weights", methods=["POST"])
+def api_reset_weights():
+    """
+    Write the current 9-signal default weights to the DB.
+    Use when new indicators have been added and the stored weights
+    JSON is missing the new keys, causing them to show 0% in Analytics.
+    Safe to call at any time — does not affect audit history.
+    """
+    try:
+        default_weights = {
+            "rsi_momentum": 0.15,
+            "volume_surge": 0.15,
+            "overnight_gap_probability": 0.18,
+            "earnings_catalyst": 0.14,
+            "support_resistance": 0.13,
+            "relative_strength": 0.12,
+            "sector_relative_strength": 0.10,
+            "vwap_reclaim": 0.08,
+            "volatility_squeeze": 0.05,
+        }
+        save_signal_weights(default_weights)
+        log.info(f"Weights reset to 9-signal defaults: {default_weights}")
+        return jsonify({"success": True, "weights": default_weights})
+    except Exception as e:
+        log.error(f"Reset weights error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 # ── KEEP ALIVE ────────────────────────────────────────────────────────────────
