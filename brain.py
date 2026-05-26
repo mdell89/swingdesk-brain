@@ -4436,13 +4436,7 @@ def api_test_notification():
         if not all([account_sid, auth_token, from_number, to_number]):
             return jsonify({"success": False, "error": "Twilio env vars not configured in Railway"}), 400
         client = Client(account_sid, auth_token)
-        body = (
-            "SwingDesk: Test notification working ✓\n\n"
-            "You'll be notified when a position closes:\n"
-            "• Cut at a loss — threshold triggered, day trade used\n"
-            "• Force closed in profit — overnight hold closed at 2:45 PM\n"
-            "• Closed on reversal — overnight hold, brain cut on day 2+ as confidence dropped"
-        )
+        body = "SwingDesk: Test notification working. You'll be notified on cut, force close, and overnight reversal."
         message = client.messages.create(body=body, from_=from_number, to=to_number)
         log.info(f"Test notification sent: {message.sid}")
         return jsonify({"success": True, "sid": message.sid})
