@@ -1,9 +1,18 @@
 """
-brain.py — Overnight Swing Desk Backend v12 (Push 40)
+brain.py — Overnight Swing Desk Backend v13 (Push 41)
 ══════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 40:
+Changes in Push 41:
+  - lock_in_confidence: new column on virtual_trades, stamped at execute_opening_positions
+    captures the 8:15 AM scan confidence as the immutable lock-in baseline
+    returned from /api/open-positions-dynamic as lock_in_confidence
+  - 8:30 AM CST market open scan added to scheduler (scan_type="market_open")
+    fires after queue lock-in, captures open-market scores for recs + ML data
+  - Verified pre/post market scan schedule: 4:00-8:15 AM CST every 30 min (pre),
+    3:30-6:00 PM CST every 30 min (post), confirmed firing correctly
+
+Previous (Push 40):
   - 8:15 AM CST pre-market scan added to scheduler
   - 8:25 AM CST queue lock-in — freezes pick queue before open
   - Twilio SMS notifications on position close (any reason)
@@ -503,6 +512,7 @@ def initialize_database():
         "confluence_count INTEGER DEFAULT 0",
         "confluence_methods TEXT DEFAULT '[]'",
         "signal_scores TEXT DEFAULT '{}'",
+        "lock_in_confidence INTEGER",
     ]:
         try:
             column_name = column_definition.split()[0]
@@ -2491,12 +2501,12 @@ def execute_opening_positions():
         existing.execute("""
             INSERT INTO virtual_trades
             (id, ticker, direction, buy_date, buy_time, buy_price, invested_amount,
-             confidence, expected_move, outcome, sector, reasoning, closed_days,
+             confidence, lock_in_confidence, expected_move, outcome, sector, reasoning, closed_days,
              status, current_value, intraday_high_pct, intraday_low_pct, queue_position,
              signal_scores)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, [trade_id, ticker, direction, today, "08:45:00", buy_price,
-              round(invested_amount, 4), confidence, expected_move, "open",
+              round(invested_amount, 4), confidence, confidence, expected_move, "open",
               get_sector(ticker), reasoning, closed_days,
               "open", round(invested_amount, 4), 0.0, 0.0, queue_id,
               _signal_scores_json])
@@ -2905,6 +2915,7 @@ def run_scheduler():
     All times are specified in UTC (CST + 5 hours).
     
     Comprehensive scans run every 30 minutes during pre-market and post-market.
+    8:30 AM CST market open scan fires after queue lock-in for fresh open-market scores.
     5-minute monitoring runs continuously during active hours (4 AM - 7 PM CST).
     """
     import schedule
@@ -2925,6 +2936,9 @@ def run_scheduler():
 
     # 8:25 AM CST = 13:25 UTC — Queue lock-in: no new picks after this
     schedule.every().day.at("13:25").do(lock_pick_queue)
+
+    # 8:30 AM CST = 13:30 UTC — Market open scan: fresh scores at open for recs + ML data
+    schedule.every().day.at("13:30").do(lambda: run_comprehensive_scan(scan_type="market_open"))
 
     # 8:45 AM CST = 13:45 UTC — Execute positions at market open + 15 min
     schedule.every().day.at("13:45").do(execute_opening_positions)
@@ -3684,6 +3698,9 @@ def api_open_positions_dynamic():
                 enriched["signal_scores"] = {}
                 enriched["signal_fired"] = []
                 enriched["signal_values"] = {}
+
+            # Lock-in confidence — stamped at 8:15 AM scan, never changes
+            enriched["lock_in_confidence"] = position.get("lock_in_confidence") or position.get("confidence", 0)
 
             enriched_positions.append(enriched)
 
