@@ -1,9 +1,14 @@
 """
-brain.py — Overnight Swing Desk Backend v17 (Push 45)
-══════════════════════════════════════════════════════
+brain.py — Overnight Swing Desk Backend v17c (Push 45c)
+════════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 45:
+Changes in Push 45c:
+  - fetch_current_prices: Alpha Vantage PRIMARY, yfinance fallback
+    Yahoo Finance is blocking Railway's IP — AV works reliably from cloud
+  - Removed busy_timeout PRAGMA (was causing startup crash)
+
+Previous (Push 45):
   - get_database: timeout=30 + PRAGMA busy_timeout=30000 — fixes database locked errors
     monitor and scans were competing causing monitor to never write prices
   - fetch_current_prices: returns {ticker: {price, day_change_pct}} dicts
@@ -780,68 +785,83 @@ def fetch_current_prices(tickers, pin_to_845=False):
     """
     Fetch current prices for monitoring — returns {ticker: {"price": float, "day_change_pct": float}}.
 
-    Uses fast_info.last_price + previous_close for price and daily change.
-    Falls back to Alpha Vantage if fast_info returns nothing.
-    pin_to_845 still uses 1-min history for exact 8:45 AM candle.
+    Primary: Alpha Vantage GLOBAL_QUOTE (reliable from cloud servers).
+    Fallback: yfinance fast_info (used when AV key unavailable or rate limited).
+    pin_to_845: uses yfinance 1-min download for exact 8:45 AM candle.
 
     Each ticker fetched independently — one bad ticker never poisons the batch.
-    Retries with backoff on rate limit errors.
     """
     import yfinance as yf
+    import urllib.request
     results = {}
 
-    def fetch_one(ticker, attempt=0):
+    def fetch_one_av(ticker):
+        """Fetch via Alpha Vantage GLOBAL_QUOTE."""
         try:
-            if pin_to_845:
-                import pytz
-                cst = pytz.timezone("America/Chicago")
-                data = yf.download(ticker, period="1d", interval="1m",
-                                   auto_adjust=True, progress=False, threads=False)
-                if data is None or data.empty:
-                    return None
-                data.index = data.index.tz_convert(cst)
-                candle = data[data.index.strftime("%H:%M") == "08:45"]
-                if candle.empty:
-                    candle = data[data.index.strftime("%H:%M") == "08:46"]
-                if not candle.empty:
-                    price = float(candle["Open"].iloc[0])
-                    return {"price": price, "day_change_pct": 0} if price == price else None
-                price = float(data["Open"].iloc[0])
-                return {"price": price, "day_change_pct": 0} if price == price else None
-            else:
-                fi = yf.Ticker(ticker).fast_info
-                price = fi.last_price
-                prev = fi.previous_close
-                if price and price == price:
-                    day_chg = ((float(price) - float(prev)) / float(prev) * 100) if prev and prev == prev else 0
-                    return {"price": float(price), "day_change_pct": round(day_chg, 2)}
-                # Alpha Vantage fallback
-                if ALPHA_VANTAGE_KEY:
-                    import urllib.request
-                    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}"
-                    with urllib.request.urlopen(url, timeout=5) as resp:
-                        quote = json.loads(resp.read()).get("Global Quote", {})
-                    if quote.get("05. price"):
-                        price = float(quote["05. price"])
-                        prev = float(quote["08. previous close"])
-                        day_chg = (price - prev) / prev * 100 if prev else 0
-                        return {"price": price, "day_change_pct": round(day_chg, 2)}
-                return None
+            url = (f"https://www.alphavantage.co/query"
+                   f"?function=GLOBAL_QUOTE&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}")
+            with urllib.request.urlopen(url, timeout=8) as resp:
+                data = json.loads(resp.read())
+            quote = data.get("Global Quote", {})
+            price_str = quote.get("05. price")
+            prev_str = quote.get("08. previous close")
+            if price_str and float(price_str) > 0:
+                price = float(price_str)
+                prev = float(prev_str) if prev_str else price
+                day_chg = (price - prev) / prev * 100 if prev else 0
+                return {"price": price, "day_change_pct": round(day_chg, 2)}
         except Exception as e:
-            err_str = str(e).lower()
-            if attempt < 2 and ("429" in err_str or "too many" in err_str or "rate" in err_str):
-                wait = (attempt + 1) * 2
-                log.warning(f"Rate limit on {ticker}, retrying in {wait}s...")
-                time.sleep(wait)
-                return fetch_one(ticker, attempt + 1)
-            log.debug(f"fetch_current_prices failed for {ticker}: {e}")
-            return None
+            log.debug(f"AV fetch failed for {ticker}: {e}")
+        return None
+
+    def fetch_one_yf(ticker):
+        """Fallback: yfinance fast_info."""
+        try:
+            fi = yf.Ticker(ticker).fast_info
+            price = fi.last_price
+            prev = fi.previous_close
+            if price and price == price:
+                day_chg = ((float(price) - float(prev)) / float(prev) * 100) if prev and prev == prev else 0
+                return {"price": float(price), "day_change_pct": round(day_chg, 2)}
+        except Exception as e:
+            log.debug(f"yf fast_info failed for {ticker}: {e}")
+        return None
+
+    def fetch_one_845(ticker):
+        """pin_to_845: yfinance 1-min data for exact 8:45 AM CST candle."""
+        try:
+            import pytz
+            cst = pytz.timezone("America/Chicago")
+            data = yf.download(ticker, period="1d", interval="1m",
+                               auto_adjust=True, progress=False, threads=False)
+            if data is None or data.empty:
+                return None
+            data.index = data.index.tz_convert(cst)
+            candle = data[data.index.strftime("%H:%M") == "08:45"]
+            if candle.empty:
+                candle = data[data.index.strftime("%H:%M") == "08:46"]
+            if not candle.empty:
+                price = float(candle["Open"].iloc[0])
+                return {"price": price, "day_change_pct": 0} if price == price else None
+            price = float(data["Open"].iloc[0])
+            return {"price": price, "day_change_pct": 0} if price == price else None
+        except Exception as e:
+            log.debug(f"yf 845 failed for {ticker}: {e}")
+        return None
 
     for ticker in tickers:
-        result = fetch_one(ticker)
+        if pin_to_845:
+            result = fetch_one_845(ticker)
+        elif ALPHA_VANTAGE_KEY:
+            result = fetch_one_av(ticker)
+            if result is None:
+                result = fetch_one_yf(ticker)
+        else:
+            result = fetch_one_yf(ticker)
+
         if result is not None:
             results[ticker] = result
-        time.sleep(0.1)
+        time.sleep(0.15)  # polite delay between tickers
 
     return results
 
