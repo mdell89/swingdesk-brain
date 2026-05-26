@@ -1,19 +1,16 @@
 """
-brain.py — Overnight Swing Desk Backend v16 (Push 44)
-══════════════════════════════════════════════════════
+brain.py — Overnight Swing Desk Backend v16b (Push 44b hotfix)
+══════════════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 44:
-  - fetch_current_prices: individual ticker fetching with error isolation
-    one bad ticker never poisons the whole batch — each fails independently
-    exponential backoff retry on rate limit (429/too many requests)
-    small polite delay between tickers to avoid hammering Yahoo
-  - last_price_updated: new column on virtual_trades, stamped by monitor
-    returned from open-positions-dynamic for stale data detection
-  - extended-runners: DB-only, no yfinance calls on demand
-    eliminates load-time API calls that contributed to rate limit 400s
+Changes in Push 44b (hotfix):
+  - fetch_current_prices: switched to fast_info.last_price for standard monitoring
+    history() per-ticker was too slow causing monitor to never complete writes
+    fast_info is a single property lookup — ~10x faster per ticker
+    fallback to history() if fast_info unavailable
+    pin_to_845 path unchanged (still uses 1-min download for accuracy)
 
-Previous (Push 43):
+Previous (Push 44):
   - 8:15 AM CST pre-market scan added to scheduler
   - 8:25 AM CST queue lock-in — freezes pick queue before open
   - Twilio SMS notifications on position close (any reason)
@@ -778,18 +775,18 @@ def fetch_price_data(tickers):
 def fetch_current_prices(tickers, pin_to_845=False):
     """
     Fetch current prices for monitoring — returns {ticker: price}.
-    
-    Fetches each ticker individually so one bad ticker never poisons the batch.
-    Retries with exponential backoff on rate limit (429) or bad request (400).
-    
-    If pin_to_845=True (used at trade open time), fetches 1-minute data and
-    returns the 8:45 AM CST candle open price for accuracy.
+
+    Uses fast_info.last_price for standard monitoring (fast, single property lookup).
+    Falls back to history() if fast_info unavailable.
+    pin_to_845 still uses 1-min history to find the exact 8:45 AM candle.
+
+    Each ticker fetched independently — one bad ticker never poisons the batch.
+    Retries with backoff on rate limit errors.
     """
     import yfinance as yf
     results = {}
 
     def fetch_one(ticker, attempt=0):
-        """Fetch a single ticker with retry on transient errors."""
         try:
             if pin_to_845:
                 import pytz
@@ -808,12 +805,17 @@ def fetch_current_prices(tickers, pin_to_845=False):
                 price = float(data["Open"].iloc[0])
                 return price if price == price else None
             else:
-                ticker_obj = yf.Ticker(ticker)
-                hist = ticker_obj.history(period="1d", interval="5m")
-                if hist is None or hist.empty:
-                    return None
-                price = float(hist["Close"].iloc[-1])
-                return price if price == price else None
+                # fast_info.last_price is a single property — much faster than history()
+                fi = yf.Ticker(ticker).fast_info
+                price = fi.last_price
+                if price and price == price:  # not None, not NaN
+                    return float(price)
+                # fallback to history if fast_info unavailable
+                hist = yf.Ticker(ticker).history(period="1d", interval="5m")
+                if hist is not None and not hist.empty:
+                    price = float(hist["Close"].iloc[-1])
+                    return price if price == price else None
+                return None
         except Exception as e:
             err_str = str(e).lower()
             if attempt < 2 and ("429" in err_str or "too many" in err_str or "rate" in err_str):
@@ -828,7 +830,7 @@ def fetch_current_prices(tickers, pin_to_845=False):
         price = fetch_one(ticker)
         if price is not None:
             results[ticker] = price
-        time.sleep(0.15)  # Small polite delay between tickers
+        time.sleep(0.1)  # polite delay between tickers
 
     return results
 
