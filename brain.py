@@ -1,14 +1,13 @@
 """
-brain.py — Overnight Swing Desk Backend v17c (Push 45c)
+brain.py — Overnight Swing Desk Backend v17d (Push 45d)
 ════════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 45c:
-  - fetch_current_prices: Alpha Vantage PRIMARY, yfinance fallback
-    Yahoo Finance is blocking Railway's IP — AV works reliably from cloud
-  - Removed busy_timeout PRAGMA (was causing startup crash)
+Changes in Push 45d:
+  - Fix TypeError: current_prices now returns dicts not floats
+    fixed two callsites that were treating dict as float for price math
 
-Previous (Push 45):
+Previous (Push 45c):
   - get_database: timeout=30 + PRAGMA busy_timeout=30000 — fixes database locked errors
     monitor and scans were competing causing monitor to never write prices
   - fetch_current_prices: returns {ticker: {price, day_change_pct}} dicts
@@ -2489,7 +2488,8 @@ def execute_opening_positions():
     for original_index, pick in indexed_picks:
         direction = "long" if original_index < MAX_LONG_PICKS else "short"
         ticker = pick["ticker"]
-        buy_price = current_prices.get(ticker, pick.get("open_price", pick["price"]))
+        raw_price = current_prices.get(ticker)
+        buy_price = (raw_price["price"] if isinstance(raw_price, dict) else raw_price) or pick.get("open_price", pick["price"])
         confidence = pick["long_conf"] if direction == "long" else pick["short_conf"]
         expected_move = pick["long_move"] if direction == "long" else pick["short_move"]
         reasoning = pick.get("long_reasoning", "") if direction == "long" else pick.get("short_reasoning", "")
@@ -2803,7 +2803,8 @@ def force_close_previous_session():
 
     for position in previous_session_positions:
         ticker = position["ticker"]
-        price = current_prices.get(ticker, position.get("buy_price", 0))
+        raw = current_prices.get(ticker)
+        price = raw["price"] if isinstance(raw, dict) else (raw or position.get("buy_price", 0))
         buy_price = position["buy_price"]
         invested = position["invested_amount"] or DEFAULT_INVESTMENT
         pnl_percent = (price - buy_price) / buy_price * 100
