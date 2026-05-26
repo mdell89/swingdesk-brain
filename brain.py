@@ -1,9 +1,14 @@
 """
-brain.py — Overnight Swing Desk Backend v10 (Push 36)
+brain.py — Overnight Swing Desk Backend v11 (Push 38)
 ══════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 36:
+Changes in Push 38:
+  - compute_signal_scores: adds "values" dict with raw measurements per indicator
+    (RSI value, volume ratio, gap %, days to earnings, S&R signal, RS diff,
+     sector ETF name + diff, VWAP mode + distance, HV ratio)
+
+Previous (Push 36):
   - /api/reset-weights: POST endpoint to write 9-signal default weights to DB
   - initialize_database: detects + fills missing weight keys in existing weights JSON
   - perf-history: seed point uses last trading weekday date, fixes 1D chart weekend bug
@@ -1693,11 +1698,12 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
     """
     Compute individual scores for all 9 indicators.
     Returns:
-      scores: dict of {indicator_name: float 0-1}
-      fired:  list of indicator names that scored >= 0.65 (above neutral threshold)
+      scores:  dict of {indicator_name: float 0-1}
+      fired:   list of indicator names that scored >= 0.65
+      values:  dict of raw measurements per indicator for human-readable display
 
-    Used to populate signal_scores on virtual_trades for display on position cards.
-    Does not recalculate confidence — that uses calculate_confidence_score separately.
+    The values dict is what powers the sub-tray on position cards — showing
+    the actual RSI number, volume ratio, gap %, etc. rather than abstract scores.
     """
     rsi = rsi if rsi == rsi else 50.0
 
@@ -1720,51 +1726,119 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
         gap_score = gap_score if gap_percent < 0 else gap_score * 0.5
 
     # Earnings
+    days_to_earnings = None
     if ticker in earnings_soon:
-        days = earnings_soon.get(ticker, 7) if isinstance(earnings_soon, dict) else 3
-        if days <= 1:   earnings_score = 0.0
-        elif days <= 3: earnings_score = 0.75
-        elif days <= 7: earnings_score = 0.65
-        else:           earnings_score = 0.5
+        days_to_earnings = earnings_soon.get(ticker, 7) if isinstance(earnings_soon, dict) else 3
+        if days_to_earnings <= 1:   earnings_score = 0.0
+        elif days_to_earnings <= 3: earnings_score = 0.75
+        elif days_to_earnings <= 7: earnings_score = 0.65
+        else:                       earnings_score = 0.5
     else:
         earnings_score = 0.5
 
     # S&R
     sr_analysis = price_data.get("sr_analysis")
     sr_score = sr_analysis["score"] if sr_analysis else 0.5
+    sr_signal = sr_analysis["signal"] if sr_analysis else "unknown"
+    sr_nearest_resistance = sr_analysis.get("nearest_resistance") if sr_analysis else None
+    sr_nearest_support = sr_analysis.get("nearest_support") if sr_analysis else None
     if direction == "short": sr_score = 1.0 - sr_score
 
-    # RS vs Market
+    # RS vs Market — compute diff for display
     rs_score = calculate_relative_strength(ticker, price_data)
+    rs_stock_5d, rs_spy_5d = None, None
+    try:
+        ticker_history = price_data[ticker].get("daily_history", [])
+        spy_history = price_data.get("SPY", {}).get("daily_history", [])
+        if len(ticker_history) >= 5 and len(spy_history) >= 5:
+            rs_stock_5d = round((ticker_history[-1]["close"] - ticker_history[-5]["close"]) / max(ticker_history[-5]["close"], 0.01) * 100, 2)
+            rs_spy_5d = round((spy_history[-1]["close"] - spy_history[-5]["close"]) / max(spy_history[-5]["close"], 0.01) * 100, 2)
+    except: pass
     if direction == "short": rs_score = 1.0 - rs_score
 
-    # Sector RS
+    # Sector RS — compute diff + ETF name for display
     sector_rs_score = calculate_sector_relative_strength(ticker, price_data)
+    sector_etf_name, sector_etf_5d, sector_spy_5d = None, None, None
+    try:
+        SECTOR_ETF_MAP = {
+            "Tech": "XLK", "Finance": "XLF", "Energy": "XLE",
+            "Healthcare": "XLV", "Industrial": "XLI", "Consumer": "XLY",
+            "Defense": "XLI", "Auto": "XLY", "Crypto": "XLK",
+        }
+        sector_etf_name = SECTOR_ETF_MAP.get(get_sector(ticker))
+        if sector_etf_name and sector_etf_name in price_data and "SPY" in price_data:
+            etf_hist = price_data[sector_etf_name].get("daily_history", [])
+            spy_hist = price_data.get("SPY", {}).get("daily_history", [])
+            if len(etf_hist) >= 5 and len(spy_hist) >= 5:
+                sector_etf_5d = round((etf_hist[-1]["close"] - etf_hist[-5]["close"]) / max(etf_hist[-5]["close"], 0.01) * 100, 2)
+                sector_spy_5d = round((spy_hist[-1]["close"] - spy_hist[-5]["close"]) / max(spy_hist[-5]["close"], 0.01) * 100, 2)
+    except: pass
     if direction == "short": sector_rs_score = 1.0 - sector_rs_score
 
-    # VWAP
+    # VWAP — capture mode + distance
     vwap_score = calculate_vwap_signal(ticker, price_data)
+    vwap_mode, vwap_dist = "unknown", None
+    try:
+        vwap = price_data.get(ticker, {}).get("vwap")
+        price = price_data.get(ticker, {}).get("price", 0)
+        if vwap and price and vwap > 0:
+            vwap_mode = "real"
+            vwap_dist = round((price - vwap) / vwap * 100, 2)
+        else:
+            vwap_mode = "proxy"
+            close = price_data.get(ticker, {}).get("price", 0)
+            open_p = price_data.get(ticker, {}).get("open", close)
+            if open_p > 0:
+                vwap_dist = round((close - open_p) / open_p * 100, 2)
+    except: pass
     if direction == "short": vwap_score = 1.0 - vwap_score
 
-    # Volatility Squeeze
+    # Volatility Squeeze — compute HV ratio for display
     squeeze_score = calculate_volatility_squeeze(ticker, price_data)
+    hv_ratio = None
+    try:
+        import math
+        history = price_data.get(ticker, {}).get("daily_history", [])
+        if len(history) >= 21:
+            closes = [d["close"] for d in history]
+            log_returns = [math.log(closes[i] / closes[i-1]) for i in range(1, len(closes)) if closes[i-1] > 0]
+            if len(log_returns) >= 20:
+                def hv(r): 
+                    n = len(r); mean = sum(r)/n
+                    return math.sqrt(sum((x-mean)**2 for x in r)/(n-1) * 252)
+                hv5 = hv(log_returns[-5:])
+                hv20 = hv(log_returns[-20:])
+                if hv20 > 0: hv_ratio = round(hv5 / hv20, 3)
+    except: pass
 
     scores = {
-        "rsi_momentum":             round(rsi_score, 3),
-        "volume_surge":             round(volume_score, 3),
-        "overnight_gap":            round(gap_score, 3),
-        "earnings_catalyst":        round(earnings_score, 3),
-        "support_resistance":       round(sr_score, 3),
-        "relative_strength":        round(rs_score, 3),
-        "sector_rs":                round(sector_rs_score, 3),
-        "vwap_reclaim":             round(vwap_score, 3),
-        "volatility_squeeze":       round(squeeze_score, 3),
+        "rsi_momentum":       round(rsi_score, 3),
+        "volume_surge":       round(volume_score, 3),
+        "overnight_gap":      round(gap_score, 3),
+        "earnings_catalyst":  round(earnings_score, 3),
+        "support_resistance": round(sr_score, 3),
+        "relative_strength":  round(rs_score, 3),
+        "sector_rs":          round(sector_rs_score, 3),
+        "vwap_reclaim":       round(vwap_score, 3),
+        "volatility_squeeze": round(squeeze_score, 3),
+    }
+
+    values = {
+        "rsi_momentum":       round(rsi, 1),
+        "volume_surge":       round(volume_ratio, 2),
+        "overnight_gap":      round(gap_percent, 2),
+        "earnings_catalyst":  days_to_earnings,
+        "support_resistance": {"signal": sr_signal, "resistance": sr_nearest_resistance, "support": sr_nearest_support},
+        "relative_strength":  {"stock_5d": rs_stock_5d, "spy_5d": rs_spy_5d},
+        "sector_rs":          {"etf": sector_etf_name, "etf_5d": sector_etf_5d, "spy_5d": sector_spy_5d},
+        "vwap_reclaim":       {"mode": vwap_mode, "dist": vwap_dist},
+        "volatility_squeeze": hv_ratio,
     }
 
     FIRED_THRESHOLD = 0.65
     fired = [k for k, v in scores.items() if v >= FIRED_THRESHOLD]
 
-    return scores, fired
+    return scores, fired, values
 
 
 # ── SCORING ENGINE ────────────────────────────────────────────────────────────
@@ -2237,8 +2311,8 @@ def execute_opening_positions():
                 "day_change_percent": pick.get("day_change_pct", 0),
                 "daily_history": [],
             }}
-            _sig_scores, _fired = compute_signal_scores(ticker, _open_price_data, pick.get("rsi", 50.0), _earnings, _weights, direction)
-            _signal_scores_json = json.dumps({"scores": _sig_scores, "fired": _fired})
+            _sig_scores, _fired, _values = compute_signal_scores(ticker, _open_price_data, pick.get("rsi", 50.0), _earnings, _weights, direction)
+            _signal_scores_json = json.dumps({"scores": _sig_scores, "fired": _fired, "values": _values})
         except:
             _signal_scores_json = json.dumps({"scores": {}, "fired": []})
 
@@ -2388,12 +2462,12 @@ def monitor_open_positions():
         try:
             _weights = get_signal_weights()
             _earnings_m = check_upcoming_earnings([ticker])
-            _sig_scores, _fired = compute_signal_scores(
+            _sig_scores, _fired, _values = compute_signal_scores(
                 ticker, price_data_for_dynamic.get(ticker, {"price": price, "volume_ratio": 1.0, "gap_percent": 0}),
                 rsi_val if "rsi_val" in dir() else 50.0,
                 _earnings_m, _weights, position["direction"]
             )
-            _signal_scores_json = json.dumps({"scores": _sig_scores, "fired": _fired})
+            _signal_scores_json = json.dumps({"scores": _sig_scores, "fired": _fired, "values": _values})
         except:
             _signal_scores_json = position.get("signal_scores") or json.dumps({"scores": {}, "fired": []})
 
@@ -3412,9 +3486,11 @@ def api_open_positions_dynamic():
                 parsed = json.loads(raw_scores) if isinstance(raw_scores, str) else (raw_scores or {})
                 enriched["signal_scores"] = parsed.get("scores", {})
                 enriched["signal_fired"] = parsed.get("fired", [])
+                enriched["signal_values"] = parsed.get("values", {})
             except:
                 enriched["signal_scores"] = {}
                 enriched["signal_fired"] = []
+                enriched["signal_values"] = {}
 
             enriched_positions.append(enriched)
 
@@ -3931,10 +4007,10 @@ def api_backfill_all():
 
                 # Compute signal scores for display
                 try:
-                    _sig_scores, _fired = compute_signal_scores(
+                    _sig_scores, _fired, _values = compute_signal_scores(
                         ticker, price_data[ticker], rsi, earnings_soon, weights, "long"
                     )
-                    _signal_scores_json = json.dumps({"scores": _sig_scores, "fired": _fired})
+                    _signal_scores_json = json.dumps({"scores": _sig_scores, "fired": _fired, "values": _values})
                 except:
                     _signal_scores_json = json.dumps({"scores": {}, "fired": []})
 
