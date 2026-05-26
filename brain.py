@@ -1,15 +1,19 @@
 """
-brain.py — Overnight Swing Desk Backend v15 (Push 43)
+brain.py — Overnight Swing Desk Backend v16 (Push 44)
 ══════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 43:
-  - open-positions-dynamic: DB-only, zero yfinance calls on demand
-    all values served from what the 2.5-min monitor last wrote to virtual_trades
-    eliminates 5-6 sequential yfinance calls per request, fixes scheduler violation
-  - /api/ping: lightweight wake-up endpoint for Railway cold start mitigation
+Changes in Push 44:
+  - fetch_current_prices: individual ticker fetching with error isolation
+    one bad ticker never poisons the whole batch — each fails independently
+    exponential backoff retry on rate limit (429/too many requests)
+    small polite delay between tickers to avoid hammering Yahoo
+  - last_price_updated: new column on virtual_trades, stamped by monitor
+    returned from open-positions-dynamic for stale data detection
+  - extended-runners: DB-only, no yfinance calls on demand
+    eliminates load-time API calls that contributed to rate limit 400s
 
-Previous (Push 42):
+Previous (Push 43):
   - 8:15 AM CST pre-market scan added to scheduler
   - 8:25 AM CST queue lock-in — freezes pick queue before open
   - Twilio SMS notifications on position close (any reason)
@@ -510,6 +514,7 @@ def initialize_database():
         "confluence_methods TEXT DEFAULT '[]'",
         "signal_scores TEXT DEFAULT '{}'",
         "lock_in_confidence INTEGER",
+        "last_price_updated TEXT",
     ]:
         try:
             column_name = column_definition.split()[0]
@@ -771,64 +776,60 @@ def fetch_price_data(tickers):
     return results
 
 def fetch_current_prices(tickers, pin_to_845=False):
-    """Quick price fetch for 5-minute monitoring — returns {ticker: price}.
+    """
+    Fetch current prices for monitoring — returns {ticker: price}.
+    
+    Fetches each ticker individually so one bad ticker never poisons the batch.
+    Retries with exponential backoff on rate limit (429) or bad request (400).
     
     If pin_to_845=True (used at trade open time), fetches 1-minute data and
-    returns the 8:45 AM CST candle open price for accuracy. This ensures buy
-    prices are always anchored to the correct entry time, not a random 5m close.
+    returns the 8:45 AM CST candle open price for accuracy.
     """
+    import yfinance as yf
     results = {}
-    try:
-        import yfinance as yf
-        import pytz
 
-        if pin_to_845:
-            # Use 1-minute data and find the exact 8:45 AM CST candle
-            cst = pytz.timezone("America/Chicago")
-            today_str = current_time_cst().strftime("%Y-%m-%d")
-            batch_data = yf.download(
-                tickers, period="1d", interval="1m",
-                auto_adjust=True, progress=False, threads=True
-            )
-            for ticker in tickers:
-                try:
-                    ticker_data = (batch_data if len(tickers) == 1
-                                   else (batch_data[ticker] if ticker in batch_data.columns.get_level_values(0) else None))
-                    if ticker_data is None or ticker_data.empty:
-                        continue
-                    # Convert to CST and find 8:45 candle
-                    ticker_data.index = ticker_data.index.tz_convert(cst)
-                    candle = ticker_data[ticker_data.index.strftime("%H:%M") == "08:45"]
-                    if candle.empty:
-                        candle = ticker_data[ticker_data.index.strftime("%H:%M") == "08:46"]
-                    if not candle.empty:
-                        price = float(candle["Open"].iloc[0])
-                        if price == price:  # Not NaN
-                            results[ticker] = price
-                    else:
-                        # Fallback to first candle of the day if 8:45 not found
-                        price = float(ticker_data["Open"].iloc[0])
-                        if price == price:
-                            results[ticker] = price
-                except:
-                    pass
-        else:
-            batch_data = yf.download(
-                tickers, period="1d", interval="5m",
-                group_by="ticker", auto_adjust=True, progress=False, threads=True
-            )
-            for ticker in tickers:
-                try:
-                    ticker_data = (batch_data if len(tickers) == 1
-                                   else (batch_data[ticker] if ticker in batch_data.columns.get_level_values(0) else None))
-                    if ticker_data is not None and len(ticker_data) >= 1:
-                        price = float(ticker_data["Close"].iloc[-1])
-                        if price == price:  # Not NaN
-                            results[ticker] = price
-                except:
-                    pass
-    except:
-        pass
+    def fetch_one(ticker, attempt=0):
+        """Fetch a single ticker with retry on transient errors."""
+        try:
+            if pin_to_845:
+                import pytz
+                cst = pytz.timezone("America/Chicago")
+                data = yf.download(ticker, period="1d", interval="1m",
+                                   auto_adjust=True, progress=False, threads=False)
+                if data is None or data.empty:
+                    return None
+                data.index = data.index.tz_convert(cst)
+                candle = data[data.index.strftime("%H:%M") == "08:45"]
+                if candle.empty:
+                    candle = data[data.index.strftime("%H:%M") == "08:46"]
+                if not candle.empty:
+                    price = float(candle["Open"].iloc[0])
+                    return price if price == price else None
+                price = float(data["Open"].iloc[0])
+                return price if price == price else None
+            else:
+                ticker_obj = yf.Ticker(ticker)
+                hist = ticker_obj.history(period="1d", interval="5m")
+                if hist is None or hist.empty:
+                    return None
+                price = float(hist["Close"].iloc[-1])
+                return price if price == price else None
+        except Exception as e:
+            err_str = str(e).lower()
+            if attempt < 2 and ("429" in err_str or "too many" in err_str or "rate" in err_str):
+                wait = (attempt + 1) * 2
+                log.warning(f"Rate limit on {ticker}, retrying in {wait}s...")
+                time.sleep(wait)
+                return fetch_one(ticker, attempt + 1)
+            log.debug(f"fetch_current_prices failed for {ticker}: {e}")
+            return None
+
+    for ticker in tickers:
+        price = fetch_one(ticker)
+        if price is not None:
+            results[ticker] = price
+        time.sleep(0.15)  # Small polite delay between tickers
+
     return results
 
 def calculate_rsi_batch(tickers, period=14):
@@ -2654,16 +2655,18 @@ def monitor_open_positions():
             database.execute("""
                 UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?,
                 dynamic_confidence=?, dynamic_estimate=?, confluence_count=?, confluence_methods=?,
-                signal_scores=?
+                signal_scores=?, last_price_updated=?
                 WHERE id=?
             """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2),
                   dyn_conf, round(dyn_est, 1), conf_count, conf_methods,
-                  _signal_scores_json, position["id"]])
+                  _signal_scores_json, now.isoformat(), position["id"]])
         except:
             database.execute("""
-                UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?
+                UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?,
+                last_price_updated=?
                 WHERE id=?
-            """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2), position["id"]])
+            """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2),
+                  now.isoformat(), position["id"]])
 
         # Determine if this is the sell day (position was opened before today)
         is_sell_day = position["buy_date"] < today
@@ -2998,8 +3001,8 @@ def health():
 @app.route("/api/extended-runners")
 def api_extended_runners():
     """
-    Return extended runner positions — trades the user is holding after the brain sold.
-    Fetches current price from yfinance to calculate live user P&L vs brain P&L.
+    Return extended runner positions using stored values only.
+    Live price updates happen via the monitor — never on demand here.
     """
     database = get_database()
     runners = database.execute(
@@ -3010,33 +3013,19 @@ def api_extended_runners():
     if not runners:
         return jsonify([])
 
-    tickers = [r["ticker"] for r in runners]
-    price_data = fetch_price_data(tickers)
     result = []
-
     for runner in runners:
-        ticker = runner["ticker"]
-        current_price = price_data.get(ticker, {}).get("price", runner["current_price"] or runner["buy_price"])
         buy_price = runner["buy_price"] or 1
+        current_price = runner["current_price"] or buy_price
         current_pnl = (current_price - buy_price) / buy_price * 100
         invested = runner["invested_amount"] or 10
         current_value = invested * (1 + current_pnl / 100)
-
         result.append({
             **dict(runner),
             "current_price": round(current_price, 4),
             "current_pnl_percent": round(current_pnl, 2),
             "current_value": round(current_value, 4),
         })
-
-        # Update DB with latest price
-        database = get_database()
-        database.execute(
-            "UPDATE extended_runners SET current_price=?, current_pnl_percent=?, last_updated=? WHERE id=?",
-            [round(current_price, 4), round(current_pnl, 2), current_time_cst().isoformat(), runner["id"]]
-        )
-        database.commit()
-        database.close()
 
     return jsonify(result)
 
@@ -3534,6 +3523,7 @@ def api_open_positions_dynamic():
             enriched["dynamic_confidence"] = position.get("dynamic_confidence") or position.get("confidence", 0)
             enriched["dynamic_estimate"] = position.get("dynamic_estimate") or position.get("expected_move", 0)
             enriched["lock_in_confidence"] = position.get("lock_in_confidence") or position.get("confidence", 0)
+            enriched["last_price_updated"] = position.get("last_price_updated")
 
             # ── Sentiment icon — use stored, fallback to warning ──
             enriched["sentiment_icon"] = position.get("sentiment_icon") or "warning"
