@@ -1,13 +1,24 @@
 """
-brain.py — Overnight Swing Desk Backend v17d (Push 45d)
-════════════════════════════════════════════════════════
+brain.py — Overnight Swing Desk Backend v18 (Push 46)
+══════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 45d:
-  - Fix TypeError: current_prices now returns dicts not floats
-    fixed two callsites that were treating dict as float for price math
+Changes in Push 46:
+  - run_comprehensive_scan: excludes open position tickers — monitor owns those
+    eliminates DB lock conflicts between scan and monitor writes
+  - monitor: allows after-hours price writes (pre/post market + evenings)
+    skips sell decisions outside regular market hours
+    weekends still fully skipped
+  - scheduler: dynamic monitor interval — 2.5 min regular hours, 5 min extended
+  - Day 2 confidence time-decay: confidence tightens as 2:45 PM approaches
+    decay multiplier: 1.0 at open → 0.6 at close (40% reduction over sell day)
+  - Telegram bot infrastructure: send_telegram_notification() added
+    NOTIFY_PROVIDER=telegram env var switches from Twilio to Telegram
+    TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID required in Railway env vars
+    test-notification and notification-settings updated for both providers
+  - notification-settings: returns provider, telegram_configured, twilio_configured
 
-Previous (Push 45c):
+Previous (Push 45d):
   - get_database: timeout=30 + PRAGMA busy_timeout=30000 — fixes database locked errors
     monitor and scans were competing causing monitor to never write prices
   - fetch_current_prices: returns {ticker: {price, day_change_pct}} dicts
@@ -1892,14 +1903,41 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
 
 
 
-def send_close_notification(ticker, pnl_dollar, pnl_pct, close_reason, close_time=None):
+def send_telegram_notification(message):
     """
-    Send Twilio SMS when a position closes.
-    Only fires if notifications are enabled in app_state.
-    Reads credentials from Railway environment variables.
+    Send a Telegram bot message.
+    Requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Railway env vars.
+    Set NOTIFY_PROVIDER=telegram in Railway to use Telegram instead of Twilio.
     """
     try:
-        # Check notification toggle
+        import urllib.request
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+        if not token or not chat_id:
+            log.warning("Telegram env vars not set — TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID required")
+            return False
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = json.dumps({"chat_id": chat_id, "text": message}).encode()
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            result = json.loads(resp.read())
+        if result.get("ok"):
+            log.info(f"Telegram sent: {message}")
+            return True
+        log.warning(f"Telegram failed: {result}")
+        return False
+    except Exception as e:
+        log.error(f"Telegram error: {e}")
+        return False
+
+
+def send_close_notification(ticker, pnl_dollar, pnl_pct, close_reason, close_time=None):
+    """
+    Send notification when a position closes.
+    Provider: NOTIFY_PROVIDER env var — 'telegram' or 'twilio' (default twilio).
+    Only fires if notifications are enabled in app_state.
+    """
+    try:
         db = get_database()
         setting = db.execute("SELECT value FROM app_state WHERE key='notify_on_close'").fetchone()
         db.close()
@@ -1908,8 +1946,17 @@ def send_close_notification(ticker, pnl_dollar, pnl_pct, close_reason, close_tim
     except:
         pass
 
+    sign = "+" if pnl_dollar >= 0 else ""
+    time_str = close_time or current_time_cst().strftime("%I:%M %p")
+    message = f"SwingDesk: {ticker} closed {sign}${pnl_dollar:.2f} ({sign}{pnl_pct:.1f}%) — {close_reason} {time_str}"
+
+    provider = os.environ.get("NOTIFY_PROVIDER", "twilio").lower()
+
+    if provider == "telegram":
+        send_telegram_notification(message)
+        return
+
     try:
-        import os
         from twilio.rest import Client
         account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
         auth_token  = os.environ.get("TWILIO_AUTH_TOKEN")
@@ -1919,11 +1966,8 @@ def send_close_notification(ticker, pnl_dollar, pnl_pct, close_reason, close_tim
             log.warning("Twilio env vars not set — SMS skipped")
             return
         client = Client(account_sid, auth_token)
-        sign = "+" if pnl_dollar >= 0 else ""
-        time_str = close_time or current_time_cst().strftime("%I:%M %p")
-        body = f"SwingDesk: {ticker} closed {sign}${pnl_dollar:.2f} ({sign}{pnl_pct:.1f}%) — {close_reason} {time_str}"
-        client.messages.create(body=body, from_=from_number, to=to_number)
-        log.info(f"SMS sent: {body}")
+        client.messages.create(body=message, from_=from_number, to=to_number)
+        log.info(f"SMS sent: {message}")
     except Exception as e:
         log.error(f"Twilio SMS error: {e}")
 
@@ -2199,11 +2243,25 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
     Run a full scan of the entire ticker universe.
     Scores every stock, filters by confidence floor, caches results.
     Only stocks at or above CONFIDENCE_FLOOR (65%) are recommended.
+    Open position tickers are excluded — they are owned by the monitor.
     """
     if weights is None:
         weights = get_signal_weights()
     universe = build_ticker_universe()
-    log.info(f"Comprehensive scan: {len(universe)} tickers ({scan_type})...")
+
+    # Exclude tickers with open positions — monitor handles those exclusively
+    # This prevents DB lock conflicts between scan writes and monitor writes
+    try:
+        _db = get_database()
+        open_tickers = set(r["ticker"] for r in _db.execute(
+            "SELECT ticker FROM virtual_trades WHERE outcome='open'"
+        ).fetchall())
+        _db.close()
+        universe = [t for t in universe if t not in open_tickers]
+    except Exception as e:
+        log.warning(f"Could not exclude open tickers from scan: {e}")
+
+    log.info(f"Comprehensive scan: {len(universe)} tickers ({scan_type}, {len(open_tickers) if 'open_tickers' in dir() else 0} open positions excluded)...")
 
     # Ensure SPY is always fetched — needed for relative strength calculations
     universe_with_spy = list(dict.fromkeys(universe + ["SPY"]))
@@ -2626,14 +2684,19 @@ def monitor_open_positions():
         database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
             [f"last_monitor_price_{ticker}", json.dumps({"price": price, "stale_count": stale_count})])
 
-        # Stale price guard — if price unchanged 3+ checks OR outside market hours,
-        # skip all DB writes to preserve last known good P&L values.
+        # Stale price guard — if price unchanged 3+ checks during market hours, skip
         if stale_count >= 3 and is_market_open():
             log.warning(f"{ticker} price unchanged for {stale_count} checks — possible halt, freezing P&L")
             continue
 
-        # Outside market hours (weekends, after-hours) — freeze P&L, no writes
-        if not is_market_open():
+        # Determine session context
+        in_extended, in_premarket = is_extended_hours()
+        after_hours = not is_market_open() and not in_extended
+        extended_hours = in_extended and not is_market_open()
+
+        # Always write price updates — during regular hours AND pre/post market
+        # Skip only on weekends when markets are fully closed
+        if now.weekday() >= 5:  # Saturday=5, Sunday=6
             continue
 
         buy_price = position["buy_price"]
@@ -2657,6 +2720,18 @@ def monitor_open_positions():
                 rsi_val = calculate_rsi_batch([ticker]).get(ticker, 50.0)
                 dyn_conf = calculate_confidence_score(ticker, price_data_for_dynamic[ticker], rsi_val, earnings_soon, weights, position["direction"])
                 dyn_est = estimate_overnight_move(price_data_for_dynamic[ticker], dyn_conf, ticker in earnings_soon)
+
+                # Day 2 time-decay — tighten confidence as 2:45 PM deadline approaches
+                # Only applies on sell day (day 2) during market hours
+                is_sell_day_check = position["buy_date"] < today
+                if is_sell_day_check and is_market_open():
+                    minutes_left = minutes_until_forced_close()
+                    total_day_minutes = 375  # 8:30 AM to 2:45 PM CST
+                    time_elapsed_pct = max(0, (total_day_minutes - minutes_left) / total_day_minutes)
+                    # Decay multiplier: starts at 1.0, drops to 0.6 by close
+                    decay = 1.0 - (time_elapsed_pct * 0.4)
+                    dyn_conf = max(1, round(dyn_conf * decay))
+                    log.debug(f"{ticker} Day 2 confidence decay: {decay:.2f}x → {dyn_conf}% ({minutes_left:.0f}min left)")
             else:
                 dyn_conf = position.get("dynamic_confidence") or position.get("confidence", 0)
                 dyn_est = position.get("dynamic_estimate") or position.get("expected_move", 0)
@@ -2701,6 +2776,10 @@ def monitor_open_positions():
                 WHERE id=?
             """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2),
                   now.isoformat(), day_change_pct, position["id"]])
+
+        # Skip sell decisions outside regular market hours
+        if not is_market_open():
+            continue
 
         # Determine if this is the sell day (position was opened before today)
         is_sell_day = position["buy_date"] < today
@@ -3004,20 +3083,25 @@ def run_scheduler():
             run_self_audit()
     schedule.every().day.at("23:55").do(run_audit_if_weekday)
 
-    log.info("Scheduler started — comprehensive scans every 30min, 5-min position monitoring")
+    log.info("Scheduler started — comprehensive scans every 30min, position monitoring 2.5min regular/5min extended")
 
-    # 5-minute monitoring loop runs inline with the scheduler
+    # Dynamic monitoring loop — 2.5 min during regular hours, 5 min during pre/post market
     last_monitor_time = 0
     while True:
         schedule.run_pending()
         current_time = time.time()
 
-        # Run 5-minute monitoring during active hours (4 AM - 7 PM CST)
-        if current_time - last_monitor_time >= MONITOR_INTERVAL:
+        now = current_time_cst()
+        is_regular = is_market_open()
+        in_extended, _ = is_extended_hours()
+        is_active = now.weekday() < 5 and (is_regular or in_extended or 4 <= now.hour < 20)
+
+        # 2.5 min during regular market hours, 5 min during pre/post market
+        dynamic_interval = 150 if is_regular else 300  # 150s = 2.5 min, 300s = 5 min
+
+        if is_active and current_time - last_monitor_time >= dynamic_interval:
             try:
-                now = current_time_cst()
-                if now.weekday() < 5 and 4 <= now.hour < 19:
-                    monitor_open_positions()
+                monitor_open_positions()
                 last_monitor_time = current_time
             except Exception as error:
                 log.error(f"Monitor error: {error}")
@@ -4369,7 +4453,15 @@ def api_get_notification_settings():
         setting = database.execute("SELECT value FROM app_state WHERE key='notify_on_close'").fetchone()
         database.close()
         enabled = setting["value"] != "false" if setting else True
-        return jsonify({"notify_on_close": enabled})
+        provider = os.environ.get("NOTIFY_PROVIDER", "twilio").lower()
+        telegram_configured = bool(os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"))
+        twilio_configured = bool(os.environ.get("TWILIO_ACCOUNT_SID") and os.environ.get("TWILIO_AUTH_TOKEN"))
+        return jsonify({
+            "notify_on_close": enabled,
+            "provider": provider,
+            "telegram_configured": telegram_configured,
+            "twilio_configured": twilio_configured,
+        })
     except Exception as e:
         return jsonify({"notify_on_close": True, "error": str(e)})
 
@@ -4390,7 +4482,15 @@ def api_set_notification_settings():
 @app.route("/api/test-notification", methods=["POST"])
 def api_test_notification():
     try:
-        import os
+        provider = os.environ.get("NOTIFY_PROVIDER", "twilio").lower()
+        test_msg = "SwingDesk: Test notification working. You'll be notified on cut, force close, and overnight reversal."
+
+        if provider == "telegram":
+            success = send_telegram_notification(test_msg)
+            if success:
+                return jsonify({"success": True, "provider": "telegram"})
+            return jsonify({"success": False, "error": "Telegram send failed — check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Railway"}), 400
+
         from twilio.rest import Client
         account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
         auth_token  = os.environ.get("TWILIO_AUTH_TOKEN")
@@ -4399,10 +4499,9 @@ def api_test_notification():
         if not all([account_sid, auth_token, from_number, to_number]):
             return jsonify({"success": False, "error": "Twilio env vars not configured in Railway"}), 400
         client = Client(account_sid, auth_token)
-        body = "SwingDesk: Test notification working. You'll be notified on cut, force close, and overnight reversal."
-        message = client.messages.create(body=body, from_=from_number, to=to_number)
+        message = client.messages.create(body=test_msg, from_=from_number, to=to_number)
         log.info(f"Test notification sent: {message.sid}")
-        return jsonify({"success": True, "sid": message.sid})
+        return jsonify({"success": True, "provider": "twilio", "sid": message.sid})
     except Exception as e:
         log.error(f"Test notification error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
