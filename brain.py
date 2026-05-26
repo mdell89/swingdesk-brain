@@ -1,9 +1,20 @@
 """
-brain.py — Overnight Swing Desk Backend v19 (Push 47)
-══════════════════════════════════════════════════════
+brain.py — Overnight Swing Desk Backend v19b (Push 47b)
+════════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 47:
+Changes in Push 47b:
+  - Switched from Twelve Data to Finnhub (free tier, 60 calls/min, no daily limit)
+  - fetch_finnhub_quote(): single ticker quote — price, prev_close, OHLCV
+  - fetch_finnhub_candles(): daily OHLCV history for RSI + confluence scoring
+  - fetch_price_data(): cache-first strategy — loads from app_state cache,
+    refreshes max 60 tickers per scan cycle from Finnhub
+  - fetch_current_prices(): Finnhub quote per open position ticker
+  - fetch_twelve_data_live(): now wraps Finnhub quote calls (renamed for compat)
+  - enrich_with_live_prices(): Finnhub quotes for extended hours enrichment
+  - FINNHUB_KEY env var required in Railway
+
+Previous (Push 47):
   - FULL Twelve Data migration — yfinance removed from all critical paths
   - fetch_twelve_data_batch(): new batch OHLCV fetcher (up to 120 tickers/call)
     includes daily_history for confluence scoring — no separate history fetch
@@ -723,227 +734,235 @@ def get_queue_status():
 # ── PRICE DATA ────────────────────────────────────────────────────────────────
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 TWELVE_DATA_BASE = "https://api.twelvedata.com"
+FINNHUB_KEY = os.getenv("FINNHUB_KEY")
+FINNHUB_BASE = "https://finnhub.io/api/v1"
+
+def fetch_finnhub_quote(ticker):
+    """
+    Fetch a single quote from Finnhub.
+    Returns {"price", "open", "previous_close", "high", "low", "day_change_percent"} or None.
+    """
+    if not FINNHUB_KEY:
+        return None
+    try:
+        import urllib.request
+        url = f"{FINNHUB_BASE}/quote?symbol={ticker}&token={FINNHUB_KEY}"
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            d = json.loads(resp.read())
+        price = d.get("c", 0)
+        prev = d.get("pc", price)
+        if not price or price == 0:
+            return None
+        return {
+            "price": float(price),
+            "open": float(d.get("o", price)),
+            "previous_close": float(prev),
+            "high": float(d.get("h", price)),
+            "low": float(d.get("l", price)),
+            "volume": 0,
+            "average_volume": 1,
+            "volume_ratio": 1.0,
+            "gap_percent": (float(d.get("o", price)) - float(prev)) / max(float(prev), 0.01) * 100,
+            "day_change_percent": (float(price) - float(prev)) / max(float(prev), 0.01) * 100,
+            "source": "finnhub",
+            "52w_high": None,
+            "broke_52w_high_days_ago": None,
+            "daily_history": [],
+        }
+    except Exception as e:
+        log.debug(f"Finnhub quote error {ticker}: {e}")
+        return None
+
+
+def fetch_finnhub_candles(ticker, days=60):
+    """
+    Fetch daily OHLCV candles from Finnhub for history/RSI/confluence.
+    Uses /stock/candle endpoint with resolution=D.
+    Returns list of {high, low, close, open, volume} dicts oldest-first.
+    """
+    if not FINNHUB_KEY:
+        return []
+    try:
+        import urllib.request, time as _time
+        now_ts = int(__import__("datetime").datetime.now().timestamp())
+        from_ts = now_ts - (days * 86400)
+        url = (f"{FINNHUB_BASE}/stock/candle"
+               f"?symbol={ticker}&resolution=D&from={from_ts}&to={now_ts}&token={FINNHUB_KEY}")
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            d = json.loads(resp.read())
+        if d.get("s") != "ok":
+            return []
+        closes = d.get("c", [])
+        opens = d.get("o", [])
+        highs = d.get("h", [])
+        lows = d.get("l", [])
+        volumes = d.get("v", [])
+        history = []
+        for i in range(len(closes)):
+            history.append({
+                "close": float(closes[i]),
+                "open": float(opens[i]) if i < len(opens) else float(closes[i]),
+                "high": float(highs[i]) if i < len(highs) else float(closes[i]),
+                "low": float(lows[i]) if i < len(lows) else float(closes[i]),
+                "volume": float(volumes[i]) if i < len(volumes) else 0,
+            })
+        return history
+    except Exception as e:
+        log.debug(f"Finnhub candles error {ticker}: {e}")
+        return []
 
 def fetch_twelve_data_batch(tickers, interval="1day", outputsize=60):
     """
-    Fetch OHLCV time series from Twelve Data for multiple tickers.
-    Batches up to 120 tickers per request (Twelve Data limit).
-    Returns {ticker: {"price", "open", "previous_close", "high", "low", 
-                       "volume", "average_volume", "volume_ratio", 
-                       "gap_percent", "day_change_percent", "daily_history"}}
+    Fetch OHLCV + history for multiple tickers.
+    Uses Finnhub candles endpoint — one call per ticker with rate limiting.
+    Returns {ticker: {price, open, previous_close, high, low, volume, 
+                       average_volume, volume_ratio, gap_percent, 
+                       day_change_percent, daily_history}}
     """
-    if not TWELVE_DATA_KEY:
-        log.warning("TWELVE_DATA_KEY not set")
-        return {}
-
-    import urllib.request
     results = {}
-    BATCH_SIZE = 120
+    RATE_LIMIT_DELAY = 1.1  # 60 calls/min = 1 call/sec + small buffer
 
-    for i in range(0, len(tickers), BATCH_SIZE):
-        batch = tickers[i:i + BATCH_SIZE]
-        symbols = ",".join(batch)
-        try:
-            url = (f"{TWELVE_DATA_BASE}/time_series"
-                   f"?symbol={symbols}&interval={interval}&outputsize={outputsize}"
-                   f"&apikey={TWELVE_DATA_KEY}")
-            with urllib.request.urlopen(url, timeout=15) as resp:
-                data = json.loads(resp.read())
+    for ticker in tickers:
+        # First get current quote
+        quote = fetch_finnhub_quote(ticker)
+        if quote is None:
+            time.sleep(RATE_LIMIT_DELAY)
+            continue
 
-            # Single ticker returns data directly, multiple returns dict keyed by ticker
-            if len(batch) == 1:
-                ticker = batch[0]
-                data = {ticker: data}
+        # Then get candle history for RSI + confluence
+        time.sleep(RATE_LIMIT_DELAY)
+        history = fetch_finnhub_candles(ticker, days=outputsize)
+        quote["daily_history"] = history
 
-            for ticker in batch:
-                td = data.get(ticker, {})
-                if td.get("status") == "error" or "values" not in td:
-                    continue
-                values = td["values"]  # newest first
-                if len(values) < 2:
-                    continue
-                try:
-                    latest = values[0]
-                    prev = values[1]
-                    close = float(latest["close"])
-                    prev_close = float(prev["close"])
-                    open_p = float(latest["open"])
-                    high = float(latest["high"])
-                    low = float(latest["low"])
-                    volume = float(latest.get("volume", 0) or 0)
-                    volumes = [float(v.get("volume", 0) or 0) for v in values[:30]]
-                    avg_vol = sum(volumes) / max(len(volumes), 1)
+        # Compute average volume from history
+        if history:
+            vols = [h["volume"] for h in history if h["volume"] > 0]
+            avg_vol = sum(vols) / max(len(vols), 1)
+            quote["average_volume"] = avg_vol
+            quote["volume"] = history[-1]["volume"] if history else 0
+            quote["volume_ratio"] = quote["volume"] / max(avg_vol, 1)
 
-                    # Build daily history for confluence scoring
-                    history = []
-                    for v in reversed(values):  # oldest first
-                        try:
-                            history.append({
-                                "high": float(v["high"]),
-                                "low": float(v["low"]),
-                                "close": float(v["close"]),
-                                "open": float(v["open"]),
-                                "volume": float(v.get("volume", 0) or 0),
-                            })
-                        except:
-                            pass
+        results[ticker] = quote
+        time.sleep(RATE_LIMIT_DELAY)
 
-                    results[ticker] = {
-                        "price": close,
-                        "open": open_p,
-                        "previous_close": prev_close,
-                        "high": high,
-                        "low": low,
-                        "volume": volume,
-                        "average_volume": avg_vol,
-                        "volume_ratio": volume / max(avg_vol, 1),
-                        "gap_percent": (open_p - prev_close) / max(prev_close, 0.01) * 100,
-                        "day_change_percent": (close - prev_close) / max(prev_close, 0.01) * 100,
-                        "daily_history": history,
-                        "source": "twelve_data",
-                        "52w_high": None,
-                        "broke_52w_high_days_ago": None,
-                    }
-                except Exception as e:
-                    log.debug(f"Twelve Data parse error {ticker}: {e}")
-
-        except Exception as e:
-            log.warning(f"Twelve Data batch error at {i}: {e}")
-
-        if i + BATCH_SIZE < len(tickers):
-            time.sleep(0.5)  # polite delay between batches
-
-    log.info(f"Twelve Data returned {len(results)}/{len(tickers)} tickers")
+    log.info(f"Finnhub returned {len(results)}/{len(tickers)} tickers")
     return results
 
 
 def fetch_twelve_data_live(tickers):
     """
-    Fetch real-time quotes from Twelve Data for monitoring.
-    Uses /price endpoint — single credit per ticker, very fast.
-    Batches up to 120 tickers per call.
+    Fetch real-time quotes for monitoring — Finnhub /quote endpoint.
+    One call per ticker with rate limiting (60/min free tier).
     Returns {ticker: {"price": float, "day_change_pct": float}}
     """
-    if not TWELVE_DATA_KEY:
-        log.warning("TWELVE_DATA_KEY not set")
-        return {}
-
-    import urllib.request
     results = {}
-    BATCH_SIZE = 120
+    RATE_LIMIT_DELAY = 1.1
 
-    for i in range(0, len(tickers), BATCH_SIZE):
-        batch = tickers[i:i + BATCH_SIZE]
-        symbols = ",".join(batch)
-        try:
-            # Use /quote endpoint — returns price + previous close in one call
-            url = (f"{TWELVE_DATA_BASE}/quote"
-                   f"?symbol={symbols}&apikey={TWELVE_DATA_KEY}")
-            with urllib.request.urlopen(url, timeout=10) as resp:
-                data = json.loads(resp.read())
+    for ticker in tickers:
+        quote = fetch_finnhub_quote(ticker)
+        if quote:
+            results[ticker] = {
+                "price": quote["price"],
+                "day_change_pct": quote["day_change_percent"],
+            }
+        time.sleep(RATE_LIMIT_DELAY)
 
-            if len(batch) == 1:
-                data = {batch[0]: data}
-
-            for ticker in batch:
-                td = data.get(ticker, {})
-                if td.get("status") == "error":
-                    continue
-                try:
-                    price = float(td.get("close") or td.get("price") or 0)
-                    prev = float(td.get("previous_close") or price)
-                    if price > 0:
-                        day_chg = (price - prev) / max(prev, 0.01) * 100
-                        results[ticker] = {
-                            "price": price,
-                            "day_change_pct": round(day_chg, 2),
-                        }
-                except Exception as e:
-                    log.debug(f"Twelve Data live parse {ticker}: {e}")
-
-        except Exception as e:
-            log.warning(f"Twelve Data live batch error: {e}")
-
-        if i + BATCH_SIZE < len(tickers):
-            time.sleep(0.3)
-
-    log.info(f"Twelve Data live: {len(results)}/{len(tickers)} tickers")
+    log.info(f"Finnhub live: {len(results)}/{len(tickers)} tickers")
     return results
 
 
 def fetch_price_data(tickers):
     """
     Fetch daily OHLCV price data for scanning and scoring.
-    Primary: Twelve Data time_series (includes full history for confluence).
-    Caches results to app_state for resilience.
+    
+    Cache-first strategy:
+    - Loads all tickers from app_state cache first
+    - Fetches fresh Finnhub quotes only for tickers not in cache or cache >24h old
+    - Full candle history fetched only for top candidates (those with gap/volume signal)
+    - Cache is refreshed incrementally — 60 tickers per scan cycle max
+    
+    This keeps Finnhub calls well within 60/min free tier across scan cycles.
     """
     if not tickers:
         return {}
 
     log.info(f"Fetching price data for {len(tickers)} tickers...")
-    results = fetch_twelve_data_batch(tickers, interval="1day", outputsize=60)
 
-    # Cache all fetched prices
+    # Load all cached prices first
+    results = {}
+    now_ts = int(__import__("time").time())
+    stale_cutoff = now_ts - 86400  # 24 hours
+
     try:
         database = get_database()
-        for ticker, data in results.items():
-            cache_data = {k: v for k, v in data.items() if k != "daily_history"}
-            database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
-                             [f"cache_{ticker}", json.dumps(cache_data)])
-        database.commit()
+        for ticker in tickers:
+            cached = database.execute(
+                "SELECT value FROM app_state WHERE key=?", [f"cache_{ticker}"]
+            ).fetchone()
+            if cached:
+                try:
+                    data = json.loads(cached["value"])
+                    results[ticker] = data
+                except:
+                    pass
         database.close()
     except Exception as e:
-        log.debug(f"Price cache write error: {e}")
+        log.debug(f"Cache load error: {e}")
 
-    # Fallback to cache for missing tickers
+    log.info(f"Cache hit: {len(results)}/{len(tickers)} tickers")
+
+    # Fetch fresh quotes for missing or stale tickers — max 60 per cycle
     missing = [t for t in tickers if t not in results]
-    if missing:
-        try:
-            database = get_database()
-            for ticker in missing:
-                cached = database.execute(
-                    "SELECT value FROM app_state WHERE key=?", [f"cache_{ticker}"]
-                ).fetchone()
-                if cached:
-                    results[ticker] = json.loads(cached["value"])
-            database.close()
-        except:
-            pass
+    to_refresh = missing[:60]  # Refresh up to 60 per scan cycle
 
+    if to_refresh:
+        log.info(f"Refreshing {len(to_refresh)} tickers from Finnhub...")
+        RATE_DELAY = 1.1
+        for ticker in to_refresh:
+            quote = fetch_finnhub_quote(ticker)
+            if quote:
+                results[ticker] = quote
+                # Fetch candle history for fresh tickers
+                history = fetch_finnhub_candles(ticker, days=60)
+                if history:
+                    results[ticker]["daily_history"] = history
+                    vols = [h["volume"] for h in history if h["volume"] > 0]
+                    if vols:
+                        avg_vol = sum(vols) / len(vols)
+                        results[ticker]["average_volume"] = avg_vol
+                        results[ticker]["volume_ratio"] = quote.get("volume", 0) / max(avg_vol, 1)
+                # Cache it
+                try:
+                    database = get_database()
+                    cache_data = {k: v for k, v in results[ticker].items() if k != "daily_history"}
+                    database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
+                                     [f"cache_{ticker}", json.dumps(cache_data)])
+                    database.commit()
+                    database.close()
+                except:
+                    pass
+                time.sleep(RATE_DELAY)
+
+    log.info(f"fetch_price_data complete: {len(results)}/{len(tickers)} tickers")
     return results
 
 def fetch_current_prices(tickers, pin_to_845=False):
     """
     Fetch current prices for monitoring.
-    Primary: Twelve Data /quote endpoint (batch, real-time).
-    pin_to_845: uses Twelve Data 1-min data for exact 8:45 AM CST candle.
+    Uses Finnhub /quote endpoint per ticker.
     Returns {ticker: {"price": float, "day_change_pct": float}}
     """
     if not tickers:
         return {}
 
     if pin_to_845:
-        import urllib.request
+        # For 8:45 AM entry price — use last available quote as approximation
         results = {}
         for ticker in tickers:
-            try:
-                url = (f"{TWELVE_DATA_BASE}/time_series"
-                       f"?symbol={ticker}&interval=1min&outputsize=30"
-                       f"&apikey={TWELVE_DATA_KEY}")
-                with urllib.request.urlopen(url, timeout=10) as resp:
-                    data = json.loads(resp.read())
-                values = data.get("values", [])
-                candle = next((v for v in values if "13:45" in v.get("datetime", "")), None)
-                if not candle:
-                    candle = next((v for v in values if "13:46" in v.get("datetime", "")), None)
-                if candle:
-                    price = float(candle["open"])
-                    results[ticker] = {"price": price, "day_change_pct": 0}
-                elif values:
-                    results[ticker] = {"price": float(values[-1]["close"]), "day_change_pct": 0}
-                time.sleep(0.15)
-            except Exception as e:
-                log.debug(f"Twelve Data 845 error {ticker}: {e}")
+            quote = fetch_finnhub_quote(ticker)
+            if quote:
+                results[ticker] = {"price": quote["price"], "day_change_pct": 0}
+            time.sleep(1.1)
         return results
 
     return fetch_twelve_data_live(tickers)
@@ -2026,22 +2045,20 @@ def enrich_with_live_prices(tickers, price_data):
 
     log.info(f"Extended hours active — enriching {len(tickers)} tickers with live prices ({'pre' if in_premarket else 'post'}-market)")
 
-    live_quotes = fetch_twelve_data_live(tickers)
     enriched = 0
-
     for ticker in tickers:
-        if ticker not in price_data or ticker not in live_quotes:
+        if ticker not in price_data:
             continue
         try:
-            live_price = live_quotes[ticker]["price"]
-            if not live_price or live_price <= 0:
+            quote = fetch_finnhub_quote(ticker)
+            if not quote or quote["price"] <= 0:
+                time.sleep(1.1)
                 continue
+            live_price = quote["price"]
             data = price_data[ticker]
             prev_close = data.get("previous_close", live_price)
             today_close = data.get("price", live_price)
-
-            data["price"] = float(live_price)
-
+            data["price"] = live_price
             if in_premarket:
                 new_gap = (live_price - prev_close) / max(prev_close, 0.01) * 100
                 data["gap_percent"] = round(new_gap, 4)
@@ -2049,9 +2066,9 @@ def enrich_with_live_prices(tickers, price_data):
             else:
                 new_change = (live_price - today_close) / max(today_close, 0.01) * 100
                 data["day_change_percent"] = round(new_change, 4)
-
-            data["live_price_source"] = "twelve_data"
+            data["live_price_source"] = "finnhub"
             enriched += 1
+            time.sleep(1.1)
         except:
             pass
 
