@@ -1,18 +1,17 @@
 """
-brain.py — Overnight Swing Desk Backend v13 (Push 41)
+brain.py — Overnight Swing Desk Backend v14 (Push 42)
 ══════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 41:
-  - lock_in_confidence: new column on virtual_trades, stamped at execute_opening_positions
-    captures the 8:15 AM scan confidence as the immutable lock-in baseline
-    returned from /api/open-positions-dynamic as lock_in_confidence
-  - 8:30 AM CST market open scan added to scheduler (scan_type="market_open")
-    fires after queue lock-in, captures open-market scores for recs + ML data
-  - Verified pre/post market scan schedule: 4:00-8:15 AM CST every 30 min (pre),
-    3:30-6:00 PM CST every 30 min (post), confirmed firing correctly
+Changes in Push 42:
+  - perf-history: always appends live "now" point from open virtual_trades
+    at query time — chart reflects reality even when no position_checks ran
+  - /api/backfill-lock-in-confidence: POST endpoint backfills lock_in_confidence
+    = confidence for all trades where column is NULL (fixes existing trades)
+  - /api/today-closed: GET endpoint returns today's closed trades with
+    human-readable outcome_label and outcome_type for closed card UI
 
-Previous (Push 40):
+Previous (Push 41):
   - 8:15 AM CST pre-market scan added to scheduler
   - 8:25 AM CST queue lock-in — freezes pick queue before open
   - Twilio SMS notifications on position close (any reason)
@@ -3299,6 +3298,39 @@ def api_performance_history():
         })
 
     history.sort(key=lambda point: point["ts"])
+
+    # ── Always append a live "now" point from current open positions ──────────
+    # This ensures the chart reflects reality even when no position_checks have
+    # run today (e.g. no positions were open during market hours).
+    try:
+        open_trades = database.execute(
+            "SELECT invested_amount, current_value FROM virtual_trades WHERE outcome='open'"
+        ).fetchall() if not database else None
+        # Re-open db since we closed it above
+        _db2 = get_database()
+        open_trades = _db2.execute(
+            "SELECT invested_amount, current_value FROM virtual_trades WHERE outcome='open'"
+        ).fetchall()
+        _db2.close()
+        live_pnl = sum(
+            float(t["current_value"] or t["invested_amount"] or 10) - float(t["invested_amount"] or 10)
+            for t in open_trades
+        )
+        if live_pnl != 0:
+            now_cst = current_time_cst()
+            history.append({
+                "date": now_cst.strftime("%Y-%m-%d"),
+                "virtual": round(running_balance + live_pnl, 2),
+                "daily_pnl": round(live_pnl, 4),
+                "trades": 0,
+                "ts": int(now_cst.timestamp() * 1000),
+                "intraday": True,
+                "live": True,
+            })
+            history.sort(key=lambda point: point["ts"])
+    except Exception as e:
+        log.debug(f"perf-history live point skipped: {e}")
+
     return jsonify(history)
 
 @app.route("/api/stats")
@@ -4388,6 +4420,70 @@ def api_backfill_weights_history():
         return jsonify({"success": False, "error": str(e)}), 500
 
 # ── RESET WEIGHTS ────────────────────────────────────────────────────────────
+@app.route("/api/backfill-lock-in-confidence", methods=["POST"])
+def api_backfill_lock_in_confidence():
+    """
+    Backfill lock_in_confidence for all trades where it is NULL.
+    Uses the trade's confidence column as the baseline.
+    Safe to call multiple times — only touches NULL rows.
+    """
+    try:
+        database = get_database()
+        result = database.execute(
+            "UPDATE virtual_trades SET lock_in_confidence = confidence WHERE lock_in_confidence IS NULL AND confidence IS NOT NULL"
+        )
+        database.commit()
+        updated = result.rowcount
+        database.close()
+        return jsonify({"success": True, "updated": updated})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/today-closed")
+def api_today_closed():
+    """
+    Return trades closed today with outcome labels for the closed card UI.
+    Called by the frontend to show DONE-able closed position cards.
+    """
+    try:
+        today = current_time_cst().strftime("%Y-%m-%d")
+        database = get_database()
+        closed = [dict(t) for t in database.execute(
+            "SELECT * FROM virtual_trades WHERE sell_date=? AND outcome != 'open' ORDER BY sell_time DESC",
+            [today]
+        ).fetchall()]
+        database.close()
+
+        enriched = []
+        for trade in closed:
+            sell_reason = trade.get("sell_reason") or ""
+            pnl_pct = trade.get("actual_move") or 0
+            gross = trade.get("gross_pnl") or 0
+
+            # Build human-readable outcome label
+            if sell_reason == "forced_close":
+                label = "Force closed 2:45 PM"
+                label_type = "force"
+            elif sell_reason in ("cut_loss", "stop_loss"):
+                label = "Losses cut"
+                label_type = "cut"
+            elif pnl_pct >= 0:
+                label = "Closed in profit"
+                label_type = "profit"
+            else:
+                label = "Closed at a loss"
+                label_type = "loss"
+
+            enriched.append({
+                **trade,
+                "outcome_label": label,
+                "outcome_type": label_type,
+                "lock_in_confidence": trade.get("lock_in_confidence") or trade.get("confidence", 0),
+            })
+        return jsonify(enriched)
+    except Exception as e:
+        return jsonify([])
+
 @app.route("/api/reset-weights", methods=["POST"])
 def api_reset_weights():
     """
