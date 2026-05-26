@@ -1,9 +1,19 @@
 """
-brain.py — Overnight Swing Desk Backend v11 (Push 38)
+brain.py — Overnight Swing Desk Backend v12 (Push 40)
 ══════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 38:
+Changes in Push 40:
+  - 8:15 AM CST pre-market scan added to scheduler
+  - 8:25 AM CST queue lock-in — freezes pick queue before open
+  - Twilio SMS notifications on position close (any reason)
+  - /api/notification-settings GET+POST
+  - /api/test-notification POST
+  - enrich_with_live_prices: pre/post market price override via yf.fast_info
+    gap_percent recalculated in pre-market, day_change in post-market
+    covers both sessions with single is_extended_hours() check
+
+Previous (Push 38):
   - compute_signal_scores: adds "values" dict with raw measurements per indicator
     (RSI value, volume ratio, gap %, days to earnings, S&R signal, RS diff,
      sector ETF name + diff, VWAP mode + distance, HV ratio)
@@ -1841,6 +1851,118 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
     return scores, fired, values
 
 
+
+def send_close_notification(ticker, pnl_dollar, pnl_pct, close_reason, close_time=None):
+    """
+    Send Twilio SMS when a position closes.
+    Only fires if notifications are enabled in app_state.
+    Reads credentials from Railway environment variables.
+    """
+    try:
+        # Check notification toggle
+        db = get_database()
+        setting = db.execute("SELECT value FROM app_state WHERE key='notify_on_close'").fetchone()
+        db.close()
+        if setting and setting["value"] == "false":
+            return
+    except:
+        pass
+
+    try:
+        import os
+        from twilio.rest import Client
+        account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+        auth_token  = os.environ.get("TWILIO_AUTH_TOKEN")
+        from_number = os.environ.get("TWILIO_FROM_NUMBER")
+        to_number   = os.environ.get("TWILIO_TO_NUMBER")
+        if not all([account_sid, auth_token, from_number, to_number]):
+            log.warning("Twilio env vars not set — SMS skipped")
+            return
+        client = Client(account_sid, auth_token)
+        sign = "+" if pnl_dollar >= 0 else ""
+        time_str = close_time or current_time_cst().strftime("%I:%M %p")
+        body = f"SwingDesk: {ticker} closed {sign}${pnl_dollar:.2f} ({sign}{pnl_pct:.1f}%) — {close_reason} {time_str}"
+        client.messages.create(body=body, from_=from_number, to=to_number)
+        log.info(f"SMS sent: {body}")
+    except Exception as e:
+        log.error(f"Twilio SMS error: {e}")
+
+
+def is_extended_hours():
+    """
+    Returns True if current CST time is in pre-market (4:00-9:30 AM) or
+    post-market (4:00-8:00 PM) session. Used to decide whether to fetch
+    live extended-hours prices via fast_info instead of daily OHLCV close.
+    """
+    now = current_time_cst()
+    hour = now.hour + now.minute / 60
+    is_premarket  = 4.0 <= hour < 9.5
+    is_postmarket = 16.0 <= hour < 20.0
+    return is_premarket or is_postmarket, is_premarket
+
+
+def enrich_with_live_prices(tickers, price_data):
+    """
+    Override stale daily-close prices with live extended-hours prices.
+    Called after fetch_price_data during pre-market and post-market windows.
+
+    Pre-market  (4:00-9:30 AM CST):
+      - price      → fast_info.last_price (current pre-market price)
+      - gap_percent → recalculated as (premarket_price - prev_close) / prev_close
+      - day_change_percent → same as gap_percent in pre-market
+
+    Post-market (4:00-8:00 PM CST):
+      - price      → fast_info.last_price (current post-market price)
+      - day_change_percent → recalculated as (postmarket_price - today_close) / today_close
+      - gap_percent unchanged (gap already happened at today's open)
+
+    Batches 10 tickers at a time with a small sleep to avoid rate limiting.
+    Silently skips any ticker where fast_info is unavailable.
+    """
+    try:
+        import yfinance as yf
+        in_extended, in_premarket = is_extended_hours()
+        if not in_extended:
+            return  # Nothing to do during regular market hours
+
+        log.info(f"Extended hours active — enriching {len(tickers)} tickers with live prices ({'pre' if in_premarket else 'post'}-market)")
+
+        for i in range(0, len(tickers), 10):
+            batch = tickers[i:i+10]
+            for ticker in batch:
+                if ticker not in price_data:
+                    continue
+                try:
+                    fi = yf.Ticker(ticker).fast_info
+                    live_price = fi.last_price
+                    if not live_price or live_price != live_price:
+                        continue
+                    data = price_data[ticker]
+                    prev_close = data.get("previous_close", live_price)
+                    today_close = data.get("price", live_price)  # daily close before override
+
+                    data["price"] = float(live_price)
+
+                    if in_premarket:
+                        # Gap is current pre-market price vs yesterday's close
+                        new_gap = (live_price - prev_close) / max(prev_close, 0.01) * 100
+                        data["gap_percent"] = round(new_gap, 4)
+                        data["day_change_percent"] = round(new_gap, 4)
+                    else:
+                        # Post-market: day change vs today's regular-session close
+                        new_change = (live_price - today_close) / max(today_close, 0.01) * 100
+                        data["day_change_percent"] = round(new_change, 4)
+                        # gap_percent unchanged — gap already happened at open
+
+                    data["live_price_source"] = "fast_info"
+                except:
+                    pass
+            time.sleep(0.2)
+
+        log.info("Live price enrichment complete")
+    except Exception as e:
+        log.warning(f"Live price enrichment error: {e}")
+
 # ── SCORING ENGINE ────────────────────────────────────────────────────────────
 def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, direction="long"):
     """
@@ -2047,6 +2169,9 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
     universe_with_spy = list(dict.fromkeys(universe + ["SPY"]))
     price_data = fetch_price_data(universe_with_spy)
 
+    # During pre/post market hours, override stale daily closes with live prices
+    enrich_with_live_prices(universe_with_spy, price_data)
+
     # Filter out tickers where yfinance returned weekend/holiday stale data.
     # If the latest price date is more than 3 days old, the data is stale.
     from datetime import date as date_type
@@ -2136,6 +2261,22 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
             "confluence_count": confluence["count"],
             "confluence_methods": confluence["methods"],
         })
+
+    # Check if queue is locked (post 8:25 AM CST)
+    # If locked, scan still runs for monitoring purposes but no new picks enter the queue
+    try:
+        _db = get_database()
+        _lock = _db.execute("SELECT value FROM app_state WHERE key='queue_locked'").fetchone()
+        queue_is_locked = _lock and _lock["value"] == "true"
+        _db.close()
+    except:
+        queue_is_locked = False
+
+    if queue_is_locked and scan_type not in ("manual", "manual_fresh"):
+        log.info(f"Queue locked — scan completed but no new picks added ({scan_type})")
+        return {"longs": [], "shorts": [], "queue_locked": True,
+                "total_scanned": len(scored_stocks), "scan_type": scan_type,
+                "generated_at": current_time_cst().isoformat()}
 
     # Filter by confidence floor — longs only.
     # Shorts are disabled: current signals (RSI momentum, volume surge, gap probability)
@@ -2238,6 +2379,37 @@ def get_cached_picks():
     return None
 
 # ── POSITION LIFECYCLE ────────────────────────────────────────────────────────
+def lock_pick_queue():
+    """
+    8:25 AM CST queue lock-in. Freezes the pick queue so no new entries are
+    added after this point. The 8:15 AM scan has had 10 minutes to complete.
+    Positions still execute at 8:45 AM as usual — this just closes the window
+    for new candidates, reflecting the pre-market conviction thesis.
+    """
+    try:
+        database = get_database()
+        database.execute("INSERT OR REPLACE INTO app_state VALUES ('queue_locked', 'true')")
+        database.execute("INSERT OR REPLACE INTO app_state VALUES ('queue_locked_at', ?)",
+                        [current_time_cst().isoformat()])
+        database.commit()
+        database.close()
+        log.info("Pick queue locked at 8:25 AM CST — no new picks until next session")
+    except Exception as e:
+        log.error(f"Queue lock error: {e}")
+
+
+def unlock_pick_queue():
+    """Unlock the queue at start of next pre-market session (4:00 AM CST)."""
+    try:
+        database = get_database()
+        database.execute("INSERT OR REPLACE INTO app_state VALUES ('queue_locked', 'false')")
+        database.commit()
+        database.close()
+        log.info("Pick queue unlocked — pre-market scanning resumed")
+    except Exception as e:
+        log.error(f"Queue unlock error: {e}")
+
+
 def execute_opening_positions():
     """
     Execute at 8:45 AM CST: Convert committed picks into open positions.
@@ -2534,6 +2706,15 @@ def monitor_open_positions():
                 # Add ending value to trade queue for compounding
                 add_to_queue(current_value, position["id"])
 
+                # Send SMS notification
+                if reason == "cut_loss" and is_day_trade:
+                    sms_reason = "cut at a loss — day trade used"
+                elif reason == "cut_loss":
+                    sms_reason = "closed on reversal — confidence dropped"
+                else:
+                    sms_reason = reason.replace("_", " ")
+                send_close_notification(ticker, round(pnl_dollars, 2), round(pnl_percent, 1), sms_reason)
+
                 log.info(f"CLOSED {ticker} {position['direction']} | {reason} | {pnl_percent:+.1f}% | ${pnl_dollars:+.2f} | {'DAY TRADE' if is_day_trade else 'OVERNIGHT'}")
         else:
             # Not sell day — just log for chart data
@@ -2607,6 +2788,12 @@ def force_close_previous_session():
         # Add ending value to queue — this is where compounding happens
         add_to_queue(ending_value, position["id"])
         closed_count += 1
+
+        # Send SMS notification
+        send_close_notification(
+            ticker, round(pnl_dollars, 2), round(pnl_percent, 1),
+            "force closed in profit at 2:45 PM"
+        )
 
     database.commit()
     database.close()
@@ -2733,8 +2920,11 @@ def run_scheduler():
         scan_label = f"pre_market_{label}"
         schedule.every().day.at(time_str).do(lambda st=scan_label: run_comprehensive_scan(scan_type=st))
 
-    # 8:15 AM CST = 13:15 UTC — Final scan, picks locked
+    # 8:15 AM CST = 13:15 UTC — Final pre-market scan
     schedule.every().day.at("13:15").do(lambda: run_comprehensive_scan(scan_type="final_scan"))
+
+    # 8:25 AM CST = 13:25 UTC — Queue lock-in: no new picks after this
+    schedule.every().day.at("13:25").do(lock_pick_queue)
 
     # 8:45 AM CST = 13:45 UTC — Execute positions at market open + 15 min
     schedule.every().day.at("13:45").do(execute_opening_positions)
@@ -2753,6 +2943,9 @@ def run_scheduler():
         time_str = f"{hour:02d}:{minute:02d}"
         scan_label = f"post_market_{label}"
         schedule.every().day.at(time_str).do(lambda st=scan_label: run_comprehensive_scan(scan_type=st))
+
+    # 4:00 AM CST = 09:00 UTC — Unlock queue for new pre-market session
+    schedule.every().day.at("09:00").do(unlock_pick_queue)
 
     # Self-audit at 7:00 PM CST = 00:00 UTC (midnight) — end of trading day
     # Runs after post-market closes so brain has full day of data to learn from
@@ -3968,6 +4161,7 @@ def api_backfill_all():
         # Fetch all data needed — include SPY for relative strength
         tickers_with_spy = list(dict.fromkeys(tickers + ["SPY"]))
         price_data = fetch_price_data(tickers_with_spy)
+        enrich_with_live_prices(tickers_with_spy, price_data)
         rsi_values = calculate_rsi_batch(tickers)
         earnings_soon = check_upcoming_earnings(tickers)
         enrich_price_data_with_history(tickers_with_spy, price_data)
@@ -4202,6 +4396,58 @@ def api_reset_weights():
         return jsonify({"success": True, "weights": default_weights})
     except Exception as e:
         log.error(f"Reset weights error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+# ── NOTIFICATION SETTINGS ────────────────────────────────────────────────────
+@app.route("/api/notification-settings", methods=["GET"])
+def api_get_notification_settings():
+    try:
+        database = get_database()
+        setting = database.execute("SELECT value FROM app_state WHERE key='notify_on_close'").fetchone()
+        database.close()
+        enabled = setting["value"] != "false" if setting else True
+        return jsonify({"notify_on_close": enabled})
+    except Exception as e:
+        return jsonify({"notify_on_close": True, "error": str(e)})
+
+@app.route("/api/notification-settings", methods=["POST"])
+def api_set_notification_settings():
+    try:
+        data = request.get_json()
+        notify = data.get("notify_on_close", True)
+        database = get_database()
+        database.execute("INSERT OR REPLACE INTO app_state VALUES ('notify_on_close',?)",
+                        ["true" if notify else "false"])
+        database.commit()
+        database.close()
+        return jsonify({"success": True, "notify_on_close": notify})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/test-notification", methods=["POST"])
+def api_test_notification():
+    try:
+        import os
+        from twilio.rest import Client
+        account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+        auth_token  = os.environ.get("TWILIO_AUTH_TOKEN")
+        from_number = os.environ.get("TWILIO_FROM_NUMBER")
+        to_number   = os.environ.get("TWILIO_TO_NUMBER")
+        if not all([account_sid, auth_token, from_number, to_number]):
+            return jsonify({"success": False, "error": "Twilio env vars not configured in Railway"}), 400
+        client = Client(account_sid, auth_token)
+        body = (
+            "SwingDesk: Test notification working ✓\n\n"
+            "You'll be notified when a position closes:\n"
+            "• Cut at a loss — threshold triggered, day trade used\n"
+            "• Force closed in profit — overnight hold closed at 2:45 PM\n"
+            "• Closed on reversal — overnight hold, brain cut on day 2+ as confidence dropped"
+        )
+        message = client.messages.create(body=body, from_=from_number, to=to_number)
+        log.info(f"Test notification sent: {message.sid}")
+        return jsonify({"success": True, "sid": message.sid})
+    except Exception as e:
+        log.error(f"Test notification error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 # ── KEEP ALIVE ────────────────────────────────────────────────────────────────
