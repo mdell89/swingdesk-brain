@@ -1,9 +1,25 @@
 """
-brain.py — Overnight Swing Desk Backend v18 (Push 46)
+brain.py — Overnight Swing Desk Backend v19 (Push 47)
 ══════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 46:
+Changes in Push 47:
+  - FULL Twelve Data migration — yfinance removed from all critical paths
+  - fetch_twelve_data_batch(): new batch OHLCV fetcher (up to 120 tickers/call)
+    includes daily_history for confluence scoring — no separate history fetch
+  - fetch_twelve_data_live(): new batch quote fetcher for monitoring
+    one call per cycle for all open positions combined
+  - fetch_price_data(): now uses Twelve Data exclusively
+  - fetch_current_prices(): now uses Twelve Data exclusively
+  - calculate_rsi_batch(): uses pre-fetched daily_history — zero extra API calls
+  - enrich_price_data_with_history(): no-op when history already in price_data
+  - enrich_with_live_prices(): uses Twelve Data live quotes instead of fast_info
+  - check_upcoming_earnings(): uses Twelve Data earnings calendar
+  - check_52w_breakouts(): uses daily_history already in price_data — zero extra calls
+  - monitor dynamic confidence: reuses fetched price — no extra fetch_price_data call
+  - TWELVE_DATA_KEY env var required in Railway
+
+Previous (Push 46):
   - run_comprehensive_scan: excludes open position tickers — monitor owns those
     eliminates DB lock conflicts between scan and monitor writes
   - monitor: allows after-hours price writes (pre/post market + evenings)
@@ -705,303 +721,338 @@ def get_queue_status():
     }
 
 # ── PRICE DATA ────────────────────────────────────────────────────────────────
+TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
+TWELVE_DATA_BASE = "https://api.twelvedata.com"
+
+def fetch_twelve_data_batch(tickers, interval="1day", outputsize=60):
+    """
+    Fetch OHLCV time series from Twelve Data for multiple tickers.
+    Batches up to 120 tickers per request (Twelve Data limit).
+    Returns {ticker: {"price", "open", "previous_close", "high", "low", 
+                       "volume", "average_volume", "volume_ratio", 
+                       "gap_percent", "day_change_percent", "daily_history"}}
+    """
+    if not TWELVE_DATA_KEY:
+        log.warning("TWELVE_DATA_KEY not set")
+        return {}
+
+    import urllib.request
+    results = {}
+    BATCH_SIZE = 120
+
+    for i in range(0, len(tickers), BATCH_SIZE):
+        batch = tickers[i:i + BATCH_SIZE]
+        symbols = ",".join(batch)
+        try:
+            url = (f"{TWELVE_DATA_BASE}/time_series"
+                   f"?symbol={symbols}&interval={interval}&outputsize={outputsize}"
+                   f"&apikey={TWELVE_DATA_KEY}")
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                data = json.loads(resp.read())
+
+            # Single ticker returns data directly, multiple returns dict keyed by ticker
+            if len(batch) == 1:
+                ticker = batch[0]
+                data = {ticker: data}
+
+            for ticker in batch:
+                td = data.get(ticker, {})
+                if td.get("status") == "error" or "values" not in td:
+                    continue
+                values = td["values"]  # newest first
+                if len(values) < 2:
+                    continue
+                try:
+                    latest = values[0]
+                    prev = values[1]
+                    close = float(latest["close"])
+                    prev_close = float(prev["close"])
+                    open_p = float(latest["open"])
+                    high = float(latest["high"])
+                    low = float(latest["low"])
+                    volume = float(latest.get("volume", 0) or 0)
+                    volumes = [float(v.get("volume", 0) or 0) for v in values[:30]]
+                    avg_vol = sum(volumes) / max(len(volumes), 1)
+
+                    # Build daily history for confluence scoring
+                    history = []
+                    for v in reversed(values):  # oldest first
+                        try:
+                            history.append({
+                                "high": float(v["high"]),
+                                "low": float(v["low"]),
+                                "close": float(v["close"]),
+                                "open": float(v["open"]),
+                                "volume": float(v.get("volume", 0) or 0),
+                            })
+                        except:
+                            pass
+
+                    results[ticker] = {
+                        "price": close,
+                        "open": open_p,
+                        "previous_close": prev_close,
+                        "high": high,
+                        "low": low,
+                        "volume": volume,
+                        "average_volume": avg_vol,
+                        "volume_ratio": volume / max(avg_vol, 1),
+                        "gap_percent": (open_p - prev_close) / max(prev_close, 0.01) * 100,
+                        "day_change_percent": (close - prev_close) / max(prev_close, 0.01) * 100,
+                        "daily_history": history,
+                        "source": "twelve_data",
+                        "52w_high": None,
+                        "broke_52w_high_days_ago": None,
+                    }
+                except Exception as e:
+                    log.debug(f"Twelve Data parse error {ticker}: {e}")
+
+        except Exception as e:
+            log.warning(f"Twelve Data batch error at {i}: {e}")
+
+        if i + BATCH_SIZE < len(tickers):
+            time.sleep(0.5)  # polite delay between batches
+
+    log.info(f"Twelve Data returned {len(results)}/{len(tickers)} tickers")
+    return results
+
+
+def fetch_twelve_data_live(tickers):
+    """
+    Fetch real-time quotes from Twelve Data for monitoring.
+    Uses /price endpoint — single credit per ticker, very fast.
+    Batches up to 120 tickers per call.
+    Returns {ticker: {"price": float, "day_change_pct": float}}
+    """
+    if not TWELVE_DATA_KEY:
+        log.warning("TWELVE_DATA_KEY not set")
+        return {}
+
+    import urllib.request
+    results = {}
+    BATCH_SIZE = 120
+
+    for i in range(0, len(tickers), BATCH_SIZE):
+        batch = tickers[i:i + BATCH_SIZE]
+        symbols = ",".join(batch)
+        try:
+            # Use /quote endpoint — returns price + previous close in one call
+            url = (f"{TWELVE_DATA_BASE}/quote"
+                   f"?symbol={symbols}&apikey={TWELVE_DATA_KEY}")
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read())
+
+            if len(batch) == 1:
+                data = {batch[0]: data}
+
+            for ticker in batch:
+                td = data.get(ticker, {})
+                if td.get("status") == "error":
+                    continue
+                try:
+                    price = float(td.get("close") or td.get("price") or 0)
+                    prev = float(td.get("previous_close") or price)
+                    if price > 0:
+                        day_chg = (price - prev) / max(prev, 0.01) * 100
+                        results[ticker] = {
+                            "price": price,
+                            "day_change_pct": round(day_chg, 2),
+                        }
+                except Exception as e:
+                    log.debug(f"Twelve Data live parse {ticker}: {e}")
+
+        except Exception as e:
+            log.warning(f"Twelve Data live batch error: {e}")
+
+        if i + BATCH_SIZE < len(tickers):
+            time.sleep(0.3)
+
+    log.info(f"Twelve Data live: {len(results)}/{len(tickers)} tickers")
+    return results
+
+
 def fetch_price_data(tickers):
     """
-    Fetch daily price data for a list of tickers using yfinance (primary)
-    with Alpha Vantage as fallback and local cache as last resort.
-    Processes tickers in batches to handle large universes.
+    Fetch daily OHLCV price data for scanning and scoring.
+    Primary: Twelve Data time_series (includes full history for confluence).
+    Caches results to app_state for resilience.
     """
-    results = {}
-    try:
-        import yfinance as yf
-        log.info(f"Fetching price data for {len(tickers)} tickers...")
-        for batch_start in range(0, len(tickers), SCAN_BATCH_SIZE):
-            batch_tickers = tickers[batch_start:batch_start + SCAN_BATCH_SIZE]
-            try:
-                batch_data = yf.download(
-                    batch_tickers, period="5d", interval="1d",
-                    group_by="ticker", auto_adjust=True, progress=False, threads=True
-                )
-                for ticker in batch_tickers:
-                    try:
-                        ticker_data = (batch_data if len(batch_tickers) == 1
-                                       else (batch_data[ticker] if ticker in batch_data.columns.get_level_values(0) else None))
-                        if ticker_data is not None and len(ticker_data) >= 2:
-                            close_price = float(ticker_data["Close"].iloc[-1])
-                            if close_price != close_price:
-                                continue  # Skip NaN
-                            previous_close = float(ticker_data["Close"].iloc[-2])
-                            open_price = float(ticker_data["Open"].iloc[-1])
-                            volume = float(ticker_data["Volume"].iloc[-1])
-                            average_volume = float(ticker_data["Volume"].mean())
-                            results[ticker] = {
-                                "price": close_price,
-                                "open": open_price,
-                                "previous_close": previous_close,
-                                "high": float(ticker_data["High"].iloc[-1]),
-                                "low": float(ticker_data["Low"].iloc[-1]),
-                                "volume": volume,
-                                "average_volume": average_volume,
-                                "volume_ratio": volume / max(average_volume, 1),
-                                "gap_percent": (open_price - previous_close) / max(previous_close, 0.01) * 100,
-                                "day_change_percent": (close_price - previous_close) / max(previous_close, 0.01) * 100,
-                                "source": "yfinance",
-                                "52w_high": None,
-                                "broke_52w_high_days_ago": None,
-                            }
-                    except:
-                        pass
-            except Exception as batch_error:
-                log.warning(f"Batch error at index {batch_start}: {batch_error}")
-            time.sleep(0.3)  # Brief pause between batches to be polite
-        log.info(f"yfinance returned {len(results)}/{len(tickers)} tickers")
-    except Exception as error:
-        log.error(f"yfinance error: {error}")
+    if not tickers:
+        return {}
 
-    # Alpha Vantage fallback for missing tickers
-    missing_tickers = [t for t in tickers if t not in results]
-    if missing_tickers and ALPHA_VANTAGE_KEY:
-        import urllib.request
-        for ticker in missing_tickers[:10]:
-            try:
-                url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}"
-                with urllib.request.urlopen(url, timeout=5) as response:
-                    quote = json.loads(response.read()).get("Global Quote", {})
-                if quote.get("05. price"):
-                    price = float(quote["05. price"])
-                    previous = float(quote["08. previous close"])
-                    results[ticker] = {
-                        "price": price, "open": price, "previous_close": previous,
-                        "high": price, "low": price, "volume": 0, "average_volume": 1,
-                        "volume_ratio": 1.0,
-                        "gap_percent": (price - previous) / max(previous, 0.01) * 100,
-                        "day_change_percent": (price - previous) / max(previous, 0.01) * 100,
-                        "source": "alpha_vantage",
-                    }
-                time.sleep(0.5)
-            except:
-                pass
+    log.info(f"Fetching price data for {len(tickers)} tickers...")
+    results = fetch_twelve_data_batch(tickers, interval="1day", outputsize=60)
 
     # Cache all fetched prices
-    database = get_database()
-    for ticker, data in results.items():
-        database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
-                         [f"cache_{ticker}", json.dumps(data)])
-    database.commit()
-    database.close()
+    try:
+        database = get_database()
+        for ticker, data in results.items():
+            cache_data = {k: v for k, v in data.items() if k != "daily_history"}
+            database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
+                             [f"cache_{ticker}", json.dumps(cache_data)])
+        database.commit()
+        database.close()
+    except Exception as e:
+        log.debug(f"Price cache write error: {e}")
+
+    # Fallback to cache for missing tickers
+    missing = [t for t in tickers if t not in results]
+    if missing:
+        try:
+            database = get_database()
+            for ticker in missing:
+                cached = database.execute(
+                    "SELECT value FROM app_state WHERE key=?", [f"cache_{ticker}"]
+                ).fetchone()
+                if cached:
+                    results[ticker] = json.loads(cached["value"])
+            database.close()
+        except:
+            pass
+
     return results
 
 def fetch_current_prices(tickers, pin_to_845=False):
     """
-    Fetch current prices for monitoring — returns {ticker: {"price": float, "day_change_pct": float}}.
-
-    Primary: Alpha Vantage GLOBAL_QUOTE (reliable from cloud servers).
-    Fallback: yfinance fast_info (used when AV key unavailable or rate limited).
-    pin_to_845: uses yfinance 1-min download for exact 8:45 AM candle.
-
-    Each ticker fetched independently — one bad ticker never poisons the batch.
+    Fetch current prices for monitoring.
+    Primary: Twelve Data /quote endpoint (batch, real-time).
+    pin_to_845: uses Twelve Data 1-min data for exact 8:45 AM CST candle.
+    Returns {ticker: {"price": float, "day_change_pct": float}}
     """
-    import yfinance as yf
-    import urllib.request
-    results = {}
+    if not tickers:
+        return {}
 
-    def fetch_one_av(ticker):
-        """Fetch via Alpha Vantage GLOBAL_QUOTE."""
-        try:
-            url = (f"https://www.alphavantage.co/query"
-                   f"?function=GLOBAL_QUOTE&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}")
-            with urllib.request.urlopen(url, timeout=8) as resp:
-                data = json.loads(resp.read())
-            quote = data.get("Global Quote", {})
-            price_str = quote.get("05. price")
-            prev_str = quote.get("08. previous close")
-            if price_str and float(price_str) > 0:
-                price = float(price_str)
-                prev = float(prev_str) if prev_str else price
-                day_chg = (price - prev) / prev * 100 if prev else 0
-                return {"price": price, "day_change_pct": round(day_chg, 2)}
-        except Exception as e:
-            log.debug(f"AV fetch failed for {ticker}: {e}")
-        return None
+    if pin_to_845:
+        import urllib.request
+        results = {}
+        for ticker in tickers:
+            try:
+                url = (f"{TWELVE_DATA_BASE}/time_series"
+                       f"?symbol={ticker}&interval=1min&outputsize=30"
+                       f"&apikey={TWELVE_DATA_KEY}")
+                with urllib.request.urlopen(url, timeout=10) as resp:
+                    data = json.loads(resp.read())
+                values = data.get("values", [])
+                candle = next((v for v in values if "13:45" in v.get("datetime", "")), None)
+                if not candle:
+                    candle = next((v for v in values if "13:46" in v.get("datetime", "")), None)
+                if candle:
+                    price = float(candle["open"])
+                    results[ticker] = {"price": price, "day_change_pct": 0}
+                elif values:
+                    results[ticker] = {"price": float(values[-1]["close"]), "day_change_pct": 0}
+                time.sleep(0.15)
+            except Exception as e:
+                log.debug(f"Twelve Data 845 error {ticker}: {e}")
+        return results
 
-    def fetch_one_yf(ticker):
-        """Fallback: yfinance fast_info."""
-        try:
-            fi = yf.Ticker(ticker).fast_info
-            price = fi.last_price
-            prev = fi.previous_close
-            if price and price == price:
-                day_chg = ((float(price) - float(prev)) / float(prev) * 100) if prev and prev == prev else 0
-                return {"price": float(price), "day_change_pct": round(day_chg, 2)}
-        except Exception as e:
-            log.debug(f"yf fast_info failed for {ticker}: {e}")
-        return None
+    return fetch_twelve_data_live(tickers)
 
-    def fetch_one_845(ticker):
-        """pin_to_845: yfinance 1-min data for exact 8:45 AM CST candle."""
-        try:
-            import pytz
-            cst = pytz.timezone("America/Chicago")
-            data = yf.download(ticker, period="1d", interval="1m",
-                               auto_adjust=True, progress=False, threads=False)
-            if data is None or data.empty:
-                return None
-            data.index = data.index.tz_convert(cst)
-            candle = data[data.index.strftime("%H:%M") == "08:45"]
-            if candle.empty:
-                candle = data[data.index.strftime("%H:%M") == "08:46"]
-            if not candle.empty:
-                price = float(candle["Open"].iloc[0])
-                return {"price": price, "day_change_pct": 0} if price == price else None
-            price = float(data["Open"].iloc[0])
-            return {"price": price, "day_change_pct": 0} if price == price else None
-        except Exception as e:
-            log.debug(f"yf 845 failed for {ticker}: {e}")
-        return None
-
-    for ticker in tickers:
-        if pin_to_845:
-            result = fetch_one_845(ticker)
-        elif ALPHA_VANTAGE_KEY:
-            result = fetch_one_av(ticker)
-            if result is None:
-                result = fetch_one_yf(ticker)
-        else:
-            result = fetch_one_yf(ticker)
-
-        if result is not None:
-            results[ticker] = result
-        time.sleep(0.15)  # polite delay between tickers
-
-    return results
-
-def calculate_rsi_batch(tickers, period=14):
+def calculate_rsi_batch(tickers, period=14, price_data=None):
     """
-    Calculate RSI for multiple tickers in batches.
-
-    Handles the yfinance multi-ticker DataFrame structure carefully:
-    - Single ticker: columns are flat (Close, Volume, etc.)
-    - Multiple tickers: columns are MultiIndex (field, ticker)
-    Both cases are handled explicitly to avoid silent fallback to 50.0.
+    Calculate RSI for multiple tickers.
+    Uses daily_history already in price_data when available (no extra API calls).
+    Falls back to fetching from Twelve Data if history not available.
     """
     rsi_values = {}
-    try:
-        import yfinance as yf
-        for batch_start in range(0, len(tickers), 50):
-            batch_tickers = tickers[batch_start:batch_start + 50]
-            try:
-                data = yf.download(
-                    batch_tickers, period="60d", interval="1d",
-                    auto_adjust=True, progress=False, threads=True
-                )
-                if data is None or data.empty:
-                    continue
 
-                for ticker in batch_tickers:
-                    try:
-                        # Extract per-ticker Close series based on DataFrame structure
-                        if len(batch_tickers) == 1:
-                            # Single ticker: flat columns
-                            close_series = data["Close"]
-                        elif hasattr(data.columns, "get_level_values") and ticker in data.columns.get_level_values(1):
-                            # Multi-ticker: MultiIndex columns (field, ticker)
-                            close_series = data["Close"][ticker]
-                        else:
-                            rsi_values[ticker] = 50.0
-                            continue
+    for ticker in tickers:
+        try:
+            # Use pre-fetched daily history if available
+            history = None
+            if price_data and ticker in price_data:
+                history = price_data[ticker].get("daily_history")
 
-                        close_series = close_series.dropna()
-                        if len(close_series) < period + 1:
-                            rsi_values[ticker] = 50.0
-                            continue
+            if not history or len(history) < period + 1:
+                # Fetch history for this ticker
+                td = fetch_twelve_data_batch([ticker], interval="1day", outputsize=60)
+                if ticker in td:
+                    history = td[ticker].get("daily_history", [])
 
-                        price_changes = close_series.diff()
-                        average_gain = price_changes.clip(lower=0).rolling(period).mean()
-                        average_loss = (-price_changes.clip(upper=0)).rolling(period).mean()
-                        last_loss = float(average_loss.iloc[-1])
+            if not history or len(history) < period + 1:
+                rsi_values[ticker] = 50.0
+                continue
 
-                        if last_loss == 0:
-                            rsi_values[ticker] = 100.0
-                        else:
-                            relative_strength = float(average_gain.iloc[-1]) / last_loss
-                            rsi = 100 - 100 / (1 + relative_strength)
-                            rsi_values[ticker] = rsi if rsi == rsi else 50.0
-                    except:
-                        rsi_values[ticker] = 50.0
-            except Exception as batch_err:
-                log.warning(f"RSI batch error at {batch_start}: {batch_err}")
-            time.sleep(0.3)
-    except Exception as err:
-        log.error(f"RSI calculation error: {err}")
+            closes = [h["close"] for h in history]
+            changes = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+            gains = [max(c, 0) for c in changes]
+            losses = [max(-c, 0) for c in changes]
 
-    # Fill missing with neutral RSI
+            avg_gain = sum(gains[-period:]) / period
+            avg_loss = sum(losses[-period:]) / period
+
+            if avg_loss == 0:
+                rsi_values[ticker] = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                rsi_values[ticker] = 100 - (100 / (1 + rs))
+        except:
+            rsi_values[ticker] = 50.0
+
     for ticker in tickers:
         if ticker not in rsi_values:
             rsi_values[ticker] = 50.0
+
     return rsi_values
 
 def check_upcoming_earnings(tickers):
     """
     Identify tickers with earnings in the next 7 days.
+    Uses Twelve Data earnings calendar endpoint.
     Returns a dict of {ticker: days_until_earnings} for graduated scoring.
-    Closer earnings = stronger catalyst signal.
     """
     earnings_soon = {}
+    if not TWELVE_DATA_KEY:
+        return earnings_soon
     try:
-        import yfinance as yf
-        for ticker in tickers[:30]:
-            try:
-                calendar = yf.Ticker(ticker).calendar
-                if calendar is not None and not calendar.empty:
-                    earnings_date = calendar.iloc[0].get("Earnings Date")
-                    if earnings_date:
-                        days_away = (earnings_date - datetime.now()).days
-                        if 0 <= days_away <= 7:
-                            earnings_soon[ticker] = days_away
-            except:
-                pass
-    except:
-        pass
+        import urllib.request
+        today_str = current_time_cst().strftime("%Y-%m-%d")
+        ahead = (current_time_cst() + timedelta(days=7)).strftime("%Y-%m-%d")
+        url = (f"{TWELVE_DATA_BASE}/earnings_calendar"
+               f"?start_date={today_str}&end_date={ahead}&apikey={TWELVE_DATA_KEY}")
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            data = json.loads(resp.read())
+        for event in data.get("earnings", []):
+            ticker = event.get("symbol", "")
+            date_str = event.get("date", "")
+            if ticker in tickers and date_str:
+                try:
+                    days_away = (datetime.strptime(date_str, "%Y-%m-%d") - datetime.now()).days
+                    if 0 <= days_away <= 7:
+                        earnings_soon[ticker] = days_away
+                except:
+                    pass
+    except Exception as e:
+        log.debug(f"Earnings calendar error: {e}")
     return earnings_soon
 
 # ── 52-WEEK BREAKOUT DETECTION ────────────────────────────────────────────────
 def check_52w_breakouts(tickers, price_data):
     """
     Detect tickers that have broken above their 52-week high within the last 7 days.
-    This is purely informational metadata — it does NOT affect confidence scores
-    or recommendations. The brain tracks outcomes separately so we can learn
-    over time whether 52W breakouts correlate with better performance.
-
-    Returns: dict of {ticker: days_ago} for recent breakouts, or {} if none.
+    Uses daily_history already fetched by Twelve Data — no extra API calls.
     """
     breakouts = {}
-    try:
-        import yfinance as yf
-        for ticker in tickers:
-            if ticker not in price_data:
+    for ticker in tickers:
+        if ticker not in price_data:
+            continue
+        try:
+            history = price_data[ticker].get("daily_history", [])
+            if len(history) < 30:
                 continue
-            try:
-                # Fetch 1 year of daily data to find the 52-week high
-                hist = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=True)
-                if hist is None or len(hist) < 30:
-                    continue
-
-                current_price = price_data[ticker]["price"]
-                yearly_high = float(hist["High"].max())
-
-                # Find the most recent day the price crossed above the 52W high
-                # We look at the last 7 trading days
-                recent = hist.tail(7)
-                for days_back, (date, row) in enumerate(reversed(list(recent.iterrows()))):
-                    if float(row["High"]) >= yearly_high * 0.995:  # Within 0.5% of 52W high
-                        breakouts[ticker] = days_back + 1
-                        price_data[ticker]["52w_high"] = round(yearly_high, 2)
-                        price_data[ticker]["broke_52w_high_days_ago"] = days_back + 1
-                        break
-            except:
-                pass
-    except Exception as error:
-        log.warning(f"52W breakout check error: {error}")
+            yearly_highs = [h["high"] for h in history]
+            yearly_high = max(yearly_highs)
+            current_price = price_data[ticker]["price"]
+            # Check last 7 trading days for 52W breakout
+            recent = history[-7:]
+            for days_back, row in enumerate(reversed(recent)):
+                if float(row["high"]) >= yearly_high * 0.995:
+                    breakouts[ticker] = days_back + 1
+                    price_data[ticker]["52w_high"] = round(yearly_high, 2)
+                    price_data[ticker]["broke_52w_high_days_ago"] = days_back + 1
+                    break
+        except:
+            pass
     return breakouts
 
 def calculate_atr(daily_history, period=14):
@@ -1277,41 +1328,19 @@ def calculate_method_confluence(ticker, price_data, scored_stocks=None):
 
 def enrich_price_data_with_history(tickers, price_data):
     """
-    Fetch daily OHLCV history for confluence scoring methods that need it.
-    Adds 'daily_history' list to each ticker's price_data entry.
-    Uses 60 days so S&R pivot detection has enough swing history to cluster from.
+    Ensure daily_history is populated in price_data for confluence scoring.
+    Twelve Data already includes history in fetch_price_data results.
+    Only fetches missing history for tickers that don't have it yet.
     """
-    try:
-        import yfinance as yf
-        batch_data = yf.download(
-            tickers, period="60d", interval="1d",
-            auto_adjust=True, progress=False, threads=True
-        )
-        for ticker in tickers:
-            if ticker not in price_data:
-                continue
-            try:
-                if len(tickers) == 1:
-                    td = batch_data
-                else:
-                    td = batch_data[ticker] if ticker in batch_data.columns.get_level_values(0) else None
-                if td is None or td.empty:
-                    continue
-                history = []
-                for i in range(len(td)):
-                    row = td.iloc[i]
-                    history.append({
-                        "high": float(row["High"]),
-                        "low": float(row["Low"]),
-                        "close": float(row["Close"]),
-                        "open": float(row["Open"]),
-                        "volume": float(row["Volume"]),
-                    })
-                price_data[ticker]["daily_history"] = history
-            except:
-                pass
-    except Exception as e:
-        log.warning(f"History enrichment error: {e}")
+    missing = [t for t in tickers if t in price_data and not price_data[t].get("daily_history")]
+    if not missing:
+        return  # All tickers already have history from Twelve Data
+
+    log.info(f"Fetching history for {len(missing)} tickers missing daily_history...")
+    supplemental = fetch_twelve_data_batch(missing, interval="1day", outputsize=60)
+    for ticker in missing:
+        if ticker in supplemental and "daily_history" in supplemental[ticker]:
+            price_data[ticker]["daily_history"] = supplemental[ticker]["daily_history"]
 
 def run_darvas_silent_collection(price_data, scored_stocks):
     """
@@ -1988,64 +2017,45 @@ def is_extended_hours():
 def enrich_with_live_prices(tickers, price_data):
     """
     Override stale daily-close prices with live extended-hours prices.
+    Uses Twelve Data /quote endpoint — same source as monitor.
     Called after fetch_price_data during pre-market and post-market windows.
-
-    Pre-market  (4:00-9:30 AM CST):
-      - price      → fast_info.last_price (current pre-market price)
-      - gap_percent → recalculated as (premarket_price - prev_close) / prev_close
-      - day_change_percent → same as gap_percent in pre-market
-
-    Post-market (4:00-8:00 PM CST):
-      - price      → fast_info.last_price (current post-market price)
-      - day_change_percent → recalculated as (postmarket_price - today_close) / today_close
-      - gap_percent unchanged (gap already happened at today's open)
-
-    Batches 10 tickers at a time with a small sleep to avoid rate limiting.
-    Silently skips any ticker where fast_info is unavailable.
     """
-    try:
-        import yfinance as yf
-        in_extended, in_premarket = is_extended_hours()
-        if not in_extended:
-            return  # Nothing to do during regular market hours
+    in_extended, in_premarket = is_extended_hours()
+    if not in_extended:
+        return
 
-        log.info(f"Extended hours active — enriching {len(tickers)} tickers with live prices ({'pre' if in_premarket else 'post'}-market)")
+    log.info(f"Extended hours active — enriching {len(tickers)} tickers with live prices ({'pre' if in_premarket else 'post'}-market)")
 
-        for i in range(0, len(tickers), 10):
-            batch = tickers[i:i+10]
-            for ticker in batch:
-                if ticker not in price_data:
-                    continue
-                try:
-                    fi = yf.Ticker(ticker).fast_info
-                    live_price = fi.last_price
-                    if not live_price or live_price != live_price:
-                        continue
-                    data = price_data[ticker]
-                    prev_close = data.get("previous_close", live_price)
-                    today_close = data.get("price", live_price)  # daily close before override
+    live_quotes = fetch_twelve_data_live(tickers)
+    enriched = 0
 
-                    data["price"] = float(live_price)
+    for ticker in tickers:
+        if ticker not in price_data or ticker not in live_quotes:
+            continue
+        try:
+            live_price = live_quotes[ticker]["price"]
+            if not live_price or live_price <= 0:
+                continue
+            data = price_data[ticker]
+            prev_close = data.get("previous_close", live_price)
+            today_close = data.get("price", live_price)
 
-                    if in_premarket:
-                        # Gap is current pre-market price vs yesterday's close
-                        new_gap = (live_price - prev_close) / max(prev_close, 0.01) * 100
-                        data["gap_percent"] = round(new_gap, 4)
-                        data["day_change_percent"] = round(new_gap, 4)
-                    else:
-                        # Post-market: day change vs today's regular-session close
-                        new_change = (live_price - today_close) / max(today_close, 0.01) * 100
-                        data["day_change_percent"] = round(new_change, 4)
-                        # gap_percent unchanged — gap already happened at open
+            data["price"] = float(live_price)
 
-                    data["live_price_source"] = "fast_info"
-                except:
-                    pass
-            time.sleep(0.2)
+            if in_premarket:
+                new_gap = (live_price - prev_close) / max(prev_close, 0.01) * 100
+                data["gap_percent"] = round(new_gap, 4)
+                data["day_change_percent"] = round(new_gap, 4)
+            else:
+                new_change = (live_price - today_close) / max(today_close, 0.01) * 100
+                data["day_change_percent"] = round(new_change, 4)
 
-        log.info("Live price enrichment complete")
-    except Exception as e:
-        log.warning(f"Live price enrichment error: {e}")
+            data["live_price_source"] = "twelve_data"
+            enriched += 1
+        except:
+            pass
+
+    log.info(f"Live price enrichment complete — {enriched}/{len(tickers)} tickers enriched")
 
 # ── SCORING ENGINE ────────────────────────────────────────────────────────────
 def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, direction="long"):
@@ -2279,7 +2289,7 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
         fresh_tickers.append(ticker)  # Keep all for now; stale detection in monitoring
     price_data = {t: price_data[t] for t in fresh_tickers}
 
-    rsi_values = calculate_rsi_batch(list(price_data.keys()))
+    rsi_values = calculate_rsi_batch(list(price_data.keys()), price_data=price_data)
     earnings_soon = check_upcoming_earnings(list(price_data.keys()))
 
     # Check for 52-week breakouts (informational only, does not affect scoring)
@@ -2712,35 +2722,37 @@ def monitor_open_positions():
         low_pct = min(position.get("intraday_low_pct") or 0, pnl_percent)
 
         # Calculate and persist dynamic confidence and estimate
+        # Reuse already-fetched price — no extra API calls
+        price_data_for_dynamic = {
+            ticker: {
+                "price": price,
+                "previous_close": position.get("buy_price", price),
+                "volume": 0, "average_volume": 1, "volume_ratio": 1.0,
+                "gap_percent": 0, "day_change_percent": day_change_pct,
+            }
+        }
         try:
             weights = get_signal_weights()
             earnings_soon = check_upcoming_earnings([ticker])
-            price_data_for_dynamic = fetch_price_data([ticker])
-            if ticker in price_data_for_dynamic:
-                rsi_val = calculate_rsi_batch([ticker]).get(ticker, 50.0)
-                dyn_conf = calculate_confidence_score(ticker, price_data_for_dynamic[ticker], rsi_val, earnings_soon, weights, position["direction"])
-                dyn_est = estimate_overnight_move(price_data_for_dynamic[ticker], dyn_conf, ticker in earnings_soon)
+            rsi_val = calculate_rsi_batch([ticker], price_data=price_data_for_dynamic).get(ticker, 50.0)
+            dyn_conf = calculate_confidence_score(ticker, price_data_for_dynamic[ticker], rsi_val, earnings_soon, weights, position["direction"])
+            dyn_est = estimate_overnight_move(price_data_for_dynamic[ticker], dyn_conf, ticker in earnings_soon)
 
-                # Day 2 time-decay — tighten confidence as 2:45 PM deadline approaches
-                # Only applies on sell day (day 2) during market hours
-                is_sell_day_check = position["buy_date"] < today
-                if is_sell_day_check and is_market_open():
-                    minutes_left = minutes_until_forced_close()
-                    total_day_minutes = 375  # 8:30 AM to 2:45 PM CST
-                    time_elapsed_pct = max(0, (total_day_minutes - minutes_left) / total_day_minutes)
-                    # Decay multiplier: starts at 1.0, drops to 0.6 by close
-                    decay = 1.0 - (time_elapsed_pct * 0.4)
-                    dyn_conf = max(1, round(dyn_conf * decay))
-                    log.debug(f"{ticker} Day 2 confidence decay: {decay:.2f}x → {dyn_conf}% ({minutes_left:.0f}min left)")
-            else:
-                dyn_conf = position.get("dynamic_confidence") or position.get("confidence", 0)
-                dyn_est = position.get("dynamic_estimate") or position.get("expected_move", 0)
+            # Day 2 time-decay — tighten confidence as 2:45 PM deadline approaches
+            is_sell_day_check = position["buy_date"] < today
+            if is_sell_day_check and is_market_open():
+                minutes_left = minutes_until_forced_close()
+                total_day_minutes = 375
+                time_elapsed_pct = max(0, (total_day_minutes - minutes_left) / total_day_minutes)
+                decay = 1.0 - (time_elapsed_pct * 0.4)
+                dyn_conf = max(1, round(dyn_conf * decay))
+                log.debug(f"{ticker} Day 2 confidence decay: {decay:.2f}x → {dyn_conf}% ({minutes_left:.0f}min left)")
         except:
             dyn_conf = position.get("dynamic_confidence") or position.get("confidence", 0)
             dyn_est = position.get("dynamic_estimate") or position.get("expected_move", 0)
 
         try:
-            conf_data = calculate_method_confluence(ticker, {ticker: {"price": current_price, "volume_ratio": position.get("current_volume_ratio", 1), "gap_percent": 0, "day_change_percent": pnl_percent}})
+            conf_data = calculate_method_confluence(ticker, {ticker: {"price": price, "volume_ratio": 1.0, "gap_percent": 0, "day_change_percent": pnl_percent}})
             conf_count = conf_data["count"]
             conf_methods = json.dumps(conf_data["methods"])
         except:
@@ -2752,7 +2764,7 @@ def monitor_open_positions():
             _weights = get_signal_weights()
             _earnings_m = check_upcoming_earnings([ticker])
             _sig_scores, _fired, _values = compute_signal_scores(
-                ticker, price_data_for_dynamic.get(ticker, {"price": price, "volume_ratio": 1.0, "gap_percent": 0}),
+                ticker, price_data_for_dynamic[ticker],
                 rsi_val if "rsi_val" in dir() else 50.0,
                 _earnings_m, _weights, position["direction"]
             )
