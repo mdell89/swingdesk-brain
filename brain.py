@@ -264,7 +264,6 @@ def get_database():
     timeout=30 prevents 'database is locked' errors when monitor and scans compete."""
     connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False, timeout=30)
     connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA busy_timeout=30000")
     connection.row_factory = sqlite3.Row
     return connection
 
