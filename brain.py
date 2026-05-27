@@ -5412,6 +5412,7 @@ def backfill_missed_closes():
     On every startup, check for positions that should have been force-closed
     but weren't (Railway restarts, missed scheduler windows, holidays).
     Uses last known current_value as the closing price — best available data.
+    All writes use a single DB connection to avoid locking conflicts.
     """
     try:
         now = current_time_cst()
@@ -5420,12 +5421,11 @@ def backfill_missed_closes():
         stuck = [dict(t) for t in db.execute(
             "SELECT * FROM virtual_trades WHERE outcome='open' AND buy_date < ?", [today]
         ).fetchall()]
-        db.close()
         if not stuck:
+            db.close()
             log.info("Startup backfill: no stuck positions found")
             return
         log.info(f"Startup backfill: closing {len(stuck)} stuck positions from previous sessions")
-        db = get_database()
         closed_count = 0
         for position in stuck:
             invested = position["invested_amount"] or DEFAULT_INVESTMENT
@@ -5447,8 +5447,12 @@ def backfill_missed_closes():
                 UPDATE predictions SET outcome=?, actual_move=?, resolved_at=?
                 WHERE id=?
             """, [outcome, round(pnl_percent, 2), now.isoformat(),
-                  f"{position['ticker']}_{position['buy_date']}_{position['direction']}"])
-            add_to_queue(ending_value, position["id"])
+                  "{}_{}_{}" .format(position["ticker"], position["buy_date"], position["direction"])])
+            # Inline queue insert — same connection, no locking conflict
+            db.execute("""
+                INSERT INTO trade_queue (amount, source_trade_id, created_at, consumed)
+                VALUES (?, ?, ?, 0)
+            """, [round(ending_value, 4), position["id"], now.isoformat()])
             closed_count += 1
         db.commit()
         db.close()
