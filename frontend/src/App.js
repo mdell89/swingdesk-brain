@@ -260,7 +260,7 @@ const THEMES = {
   black: {
     BG: "#080809", CARD: "#111113", BORDER: "#2a2a30",
     T1: "#e8e8e8", T2: "#b0b0b0", T3: "#777",
-    GREEN: "#22c55e", RED: "#f87171", BLUE: "#60a5fa",
+    GREEN: "#22c55e", RED: "#ef4444", BLUE: "#60a5fa",
     AMBER: "#FFD700", PURPLE: "#a78bfa",
     CARD_BG_LONG: "#0a1209", CARD_BG_SHORT: "#120a09",
     CARD_BORDER_LONG: "#0f2014", CARD_BORDER_SHORT: "#200f0f",
@@ -268,7 +268,7 @@ const THEMES = {
   navy: {
     BG: "#0d1b2a", CARD: "#132233", BORDER: "#2a4460",
     T1: "#e8f0f8", T2: "#8aaac8", T3: "#5a7a96",
-    GREEN: "#22c55e", RED: "#f87171", BLUE: "#5dade2",
+    GREEN: "#22c55e", RED: "#ef4444", BLUE: "#5dade2",
     AMBER: "#FFD700", PURPLE: "#a569bd",
     CARD_BG_LONG: "#0d2130", CARD_BG_SHORT: "#1a0e1a",
     CARD_BORDER_LONG: "#1a3a4a", CARD_BORDER_SHORT: "#2a1020",
@@ -360,25 +360,35 @@ function SpinePercent({ value, color, fontSize = 12, fontWeight = 600, decimals 
   return (
     <span style={{
       width: SPINE_VALUE_W,
-      display: "inline-grid",
-      gridTemplateColumns: "1fr 4px 2.4ch",
-      alignItems: "baseline",
+      position: "relative",
+      display: "inline-block",
       color,
       fontFamily: "'DM Mono',monospace",
       fontSize,
       fontWeight,
       lineHeight: 1,
       fontVariantNumeric: "tabular-nums",
+      height: `${fontSize}px`,
     }}>
-      <span style={{ textAlign: "right" }}>{sign}{whole}</span>
-      <span style={{ textAlign: "center" }}>.</span>
-      <span style={{ textAlign: "left" }}>{frac}%</span>
+      <span style={{ position: "absolute", right: "calc(50% + 3px)", top: 0, textAlign: "right", whiteSpace: "nowrap" }}>{sign}{whole}</span>
+      <span style={{ position: "absolute", left: "50%", top: 0, transform: "translateX(-50%)", textAlign: "center" }}>.</span>
+      <span style={{ position: "absolute", left: "calc(50% + 5px)", top: 0, textAlign: "left", whiteSpace: "nowrap" }}>{frac}%</span>
     </span>
   );
 }
 
 function SpineCell({ children }) {
   return <div style={{ display: "flex", justifyContent: "center", alignItems: "center", minWidth: 0 }}>{children}</div>;
+}
+
+function SpineBookmarkCell({ children }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "center", alignItems: "center", minWidth: 0 }}>
+      <div style={{ width: SPINE_VALUE_W, display: "flex", justifyContent: "flex-start", transform: "translateX(50%)" }}>
+        {children}
+      </div>
+    </div>
+  );
 }
 
 function SpineTriangle({ color, expanded }) {
@@ -561,7 +571,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
       <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", alignItems: "center", padding: "0 12px 7px", borderBottom: `1px solid ${BORDER}` }}>
         <div style={{ gridColumn: "1 / 3" }}></div>
         {/* Col 3: JOURNAL right-aligned — right edge = col3 right = triangle spine */}
-        <SpineCell>
+        <SpineBookmarkCell>
           {onAddToPersonal && (
             <button onClick={(e) => {
               e.stopPropagation();
@@ -580,7 +590,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
               {journalAdded === "added" ? "ADDED" : journalAdded === "error" ? "ERR" : "JOURNAL"}
             </button>
           )}
-        </SpineCell>
+        </SpineBookmarkCell>
         {/* Col 4: tag slots */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 2 }}>
           <div style={{ width: 28, display: "flex", justifyContent: "center" }}>
@@ -834,14 +844,17 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
 
       {/* ── Sentiment row ── */}
       <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", alignItems: "center", padding: "0 12px 5px", paddingTop: 5, borderBottom: `1px solid ${rulingColor}` }}>
-        {/* Col 1+2: HOLD/WEAK label + phrase + stale tag */}
-        <div style={{ gridColumn: "1 / 3", display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+        {/* Col 1: HOLD/WEAK label + phrase */}
+        <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
           <span style={{ fontSize: 10, fontWeight: 800, color: sentiment.color, letterSpacing: .5 }}>{sentiment.label}</span>
           <span style={{ fontSize: 9, color: T2, whiteSpace: "nowrap" }}>{sentiment.phrase}</span>
-          {isStale && staleTime && <span style={{ fontSize: 7, fontWeight: 700, color: AMBER, padding: "1px 4px", background: "#1a1200", borderRadius: 3, border: `1px solid ${AMBER}44`, letterSpacing: .3 }}>scanned {staleTime}</span>}
+        </div>
+        {/* Col 2: stale tag sits left of the spine, right-aligned */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", minWidth: 0 }}>
+          {isStale && staleTime && <span style={{ fontSize: 7, fontWeight: 700, color: AMBER, padding: "1px 4px", background: "#1a1200", borderRadius: 3, border: `1px solid ${AMBER}44`, letterSpacing: .3, whiteSpace: "nowrap" }}>scanned {staleTime}</span>}
         </div>
         {/* Col 3: JOURNAL right-aligned — right edge = col3 right = triangle spine */}
-        <SpineCell>
+        <SpineBookmarkCell>
           {onAddToPersonal && (
             <button onClick={(e) => {
               e.stopPropagation();
@@ -860,7 +873,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
               {journalAdded === "added" ? "ADDED" : journalAdded === "error" ? "ERR" : "JOURNAL"}
             </button>
           )}
-        </SpineCell>
+        </SpineBookmarkCell>
         {/* Col 4: tag slots */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 2 }}>
           <div style={{ width: 28, display: "flex", justifyContent: "center" }}>
@@ -1153,7 +1166,7 @@ function ExpandButton({ isExpanded, onToggle, totalCount, label }) {
 // ─── TICKER BANNER ────────────────────────────────────────────────────────────
 const BANNER_TICKERS = ["VIX", "SPY", "QQQ", "IWM", "NVDA", "TLT", "BTC-USD", "GLD"];
 const TICKER_GREEN   = "#22c55e";
-const TICKER_RED     = "#f87171";
+const TICKER_RED     = "#ef4444";
 const TICKER_FLAT    = "#666";
 
 function TickerBanner({ openPositions }) {

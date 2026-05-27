@@ -1250,6 +1250,62 @@ def fetch_finnhub_price_at_cst(ticker, target_dt_cst, resolution="5"):
         log.debug(f"Finnhub intraday price error {ticker}: {e}")
         return None
 
+def fetch_alpha_vantage_price_at_cst(ticker, target_dt_cst, interval="5min"):
+    """
+    Fetch the intraday candle open nearest to a target CST/CDT time using Alpha Vantage.
+    Alpha Vantage intraday timestamps are US/Eastern for US equities.
+    """
+    if not ALPHA_VANTAGE_KEY:
+        return None
+    try:
+        import urllib.parse
+        import urllib.request
+        target_et = target_dt_cst + timedelta(hours=1)
+        target_ts = target_et.timestamp()
+        params = urllib.parse.urlencode({
+            "function": "TIME_SERIES_INTRADAY",
+            "symbol": ticker,
+            "interval": interval,
+            "outputsize": "compact",
+            "apikey": ALPHA_VANTAGE_KEY,
+        })
+        url = f"https://www.alphavantage.co/query?{params}"
+        with urllib.request.urlopen(url, timeout=12) as resp:
+            d = json.loads(resp.read())
+
+        series = d.get(f"Time Series ({interval})") or {}
+        if not series:
+            return None
+
+        best_time = None
+        best_row = None
+        best_delta = None
+        for ts_str, row in series.items():
+            try:
+                ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                continue
+            delta = abs(ts.timestamp() - target_ts)
+            if best_delta is None or delta < best_delta:
+                best_delta = delta
+                best_time = ts
+                best_row = row
+
+        if not best_row or best_delta is None or best_delta > 30 * 60:
+            return None
+
+        price = best_row.get("1. open") or best_row.get("4. close")
+        if price is None:
+            return None
+        return {
+            "price": float(price),
+            "timestamp": best_time.isoformat(),
+            "source": f"alpha_vantage_{interval}_candle",
+        }
+    except Exception as e:
+        log.debug(f"Alpha Vantage intraday price error {ticker}: {e}")
+        return None
+
 def fetch_twelve_data_batch(tickers, interval="1day", outputsize=60):
     """
     Fetch OHLCV + history for multiple tickers.
@@ -1448,7 +1504,7 @@ def fetch_current_prices(tickers, pin_to_845=False):
         results = {}
         target = current_time_cst().replace(hour=8, minute=45, second=0, microsecond=0)
         for ticker in tickers:
-            pinned = fetch_finnhub_price_at_cst(ticker, target)
+            pinned = fetch_finnhub_price_at_cst(ticker, target) or fetch_alpha_vantage_price_at_cst(ticker, target)
             if pinned:
                 results[ticker] = {"price": pinned["price"], "day_change_pct": 0, "source": pinned["source"]}
             else:
@@ -5007,12 +5063,26 @@ def api_reprice_open_entries():
                 hour, minute, second = [int(part) for part in buy_time_raw.split(":")[:3]]
                 target = buy_date.replace(hour=hour, minute=minute, second=second, microsecond=0)
 
-                pinned = fetch_finnhub_price_at_cst(ticker, target)
+                pinned = (
+                    fetch_finnhub_price_at_cst(ticker, target)
+                    or fetch_alpha_vantage_price_at_cst(ticker, target)
+                )
                 quote = fetch_finnhub_quote(ticker)
-                if not pinned or not quote:
-                    results.append({"ticker": ticker, "status": "no_price_data"})
+                if not quote:
+                    results.append({"ticker": ticker, "status": "no_current_quote"})
                     time.sleep(1.1)
                     continue
+                if not pinned:
+                    fallback_price = quote.get("open") or quote.get("price")
+                    if not fallback_price:
+                        results.append({"ticker": ticker, "status": "no_entry_price"})
+                        time.sleep(1.1)
+                        continue
+                    pinned = {
+                        "price": float(fallback_price),
+                        "timestamp": None,
+                        "source": "finnhub_day_open_fallback",
+                    }
 
                 old_buy_price = float(position.get("buy_price") or 0)
                 new_buy_price = float(pinned["price"])

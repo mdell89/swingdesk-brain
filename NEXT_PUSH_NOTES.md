@@ -98,6 +98,8 @@
   - Keep `+$0.00` style dollar values; do not over-optimize tiny cent display.
 - Keep `on target` on one line. If it wraps, fix the Journal/status grid spacing instead of changing the wording.
 - Make the journal button visibly populate Personal or show an error if it fails.
+- Move stale scan tags to the left side of the card spine, right-aligned next to it.
+- Use `#ef4444` as the first pass for the app's red tone; adjust only if it still feels too pink or too harsh in live use.
 - Clean up missing/blank stock-card columns.
 - Restore any useful expanded-card metrics removed in recent pushes.
 - Verify on mobile viewport screenshots before shipping.
