@@ -3467,6 +3467,10 @@ def force_close_previous_session():
     Order is randomized to avoid alphabetical bias.
     """
     now = current_time_cst()
+    # Skip weekends — markets are closed, Finnhub returns stale/zero prices
+    if now.weekday() >= 5:
+        log.info("force_close_previous_session: skipping — weekend")
+        return
     today = now.strftime("%Y-%m-%d")
     database = get_database()
     previous_session_positions = [dict(t) for t in database.execute(
@@ -5057,6 +5061,57 @@ def api_today_closed():
     except Exception as e:
         return jsonify([])
 
+
+@app.route("/api/force-close-now", methods=["POST"])
+def api_force_close_now():
+    """
+    Manually trigger force-close for all stuck open positions from previous sessions.
+    Uses last known current_value — no live price fetch needed.
+    Safe to call any time, including weekends.
+    """
+    try:
+        now = current_time_cst()
+        today = now.strftime("%Y-%m-%d")
+        db = get_database()
+        stuck = [dict(t) for t in db.execute(
+            "SELECT * FROM virtual_trades WHERE outcome=\'open\' AND buy_date < ?", [today]
+        ).fetchall()]
+        db.close()
+        if not stuck:
+            return jsonify({"success": True, "closed": 0, "message": "No stuck positions found"})
+        db = get_database()
+        results = []
+        for position in stuck:
+            invested = position["invested_amount"] or DEFAULT_INVESTMENT
+            ending_value = position["current_value"] or invested
+            pnl_dollars = ending_value - invested
+            pnl_percent = (pnl_dollars / invested) * 100 if invested else 0
+            net_pnl = pnl_dollars - FEE_PER_TRADE
+            outcome = "hit" if pnl_percent >= MIN_EXPECTED_MOVE else ("partial" if pnl_percent > 0 else "miss")
+            db.execute("""
+                UPDATE virtual_trades SET
+                    sell_date=?, sell_time=?, sell_price=?, current_value=?,
+                    actual_move=?, gross_pnl=?, net_pnl=?, outcome=?, sell_reason=?
+                WHERE id=?
+            """, [position["buy_date"], "14:45:00", position["buy_price"],
+                  round(ending_value, 4), round(pnl_percent, 2),
+                  round(pnl_dollars, 4), round(net_pnl, 4),
+                  outcome, "forced_close", position["id"]])
+            db.execute("""
+                UPDATE predictions SET outcome=?, actual_move=?, resolved_at=?
+                WHERE id=?
+            """, [outcome, round(pnl_percent, 2), now.isoformat(),
+                  "{}_{}_{}" .format(position["ticker"], position["buy_date"], position["direction"])])
+            add_to_queue(ending_value, position["id"])
+            results.append({"ticker": position["ticker"], "outcome": outcome, "pnl_percent": round(pnl_percent, 2)})
+        db.commit()
+        db.close()
+        log.info(f"Manual force-close: settled {len(results)} positions")
+        return jsonify({"success": True, "closed": len(results), "trades": results})
+    except Exception as e:
+        log.error(f"Manual force-close failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route("/api/all-closed")
 def api_all_closed():
     """
@@ -5350,6 +5405,58 @@ def keep_server_alive():
 DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 initialize_database()
 load_nn_weights()  # Load persisted NN weights on startup
+
+# ── STARTUP BACKFILL — close any positions stuck open from missed scheduler jobs ──
+def backfill_missed_closes():
+    """
+    On every startup, check for positions that should have been force-closed
+    but weren't (Railway restarts, missed scheduler windows, holidays).
+    Uses last known current_value as the closing price — best available data.
+    """
+    try:
+        now = current_time_cst()
+        today = now.strftime("%Y-%m-%d")
+        db = get_database()
+        stuck = [dict(t) for t in db.execute(
+            "SELECT * FROM virtual_trades WHERE outcome='open' AND buy_date < ?", [today]
+        ).fetchall()]
+        db.close()
+        if not stuck:
+            log.info("Startup backfill: no stuck positions found")
+            return
+        log.info(f"Startup backfill: closing {len(stuck)} stuck positions from previous sessions")
+        db = get_database()
+        closed_count = 0
+        for position in stuck:
+            invested = position["invested_amount"] or DEFAULT_INVESTMENT
+            ending_value = position["current_value"] or invested
+            pnl_dollars = ending_value - invested
+            pnl_percent = (pnl_dollars / invested) * 100 if invested else 0
+            net_pnl = pnl_dollars - FEE_PER_TRADE
+            outcome = "hit" if pnl_percent >= MIN_EXPECTED_MOVE else ("partial" if pnl_percent > 0 else "miss")
+            db.execute("""
+                UPDATE virtual_trades SET
+                    sell_date=?, sell_time=?, sell_price=?, current_value=?,
+                    actual_move=?, gross_pnl=?, net_pnl=?, outcome=?, sell_reason=?
+                WHERE id=?
+            """, [position["buy_date"], "14:45:00", position["buy_price"],
+                  round(ending_value, 4), round(pnl_percent, 2),
+                  round(pnl_dollars, 4), round(net_pnl, 4),
+                  outcome, "forced_close", position["id"]])
+            db.execute("""
+                UPDATE predictions SET outcome=?, actual_move=?, resolved_at=?
+                WHERE id=?
+            """, [outcome, round(pnl_percent, 2), now.isoformat(),
+                  f"{position['ticker']}_{position['buy_date']}_{position['direction']}"])
+            add_to_queue(ending_value, position["id"])
+            closed_count += 1
+        db.commit()
+        db.close()
+        log.info(f"Startup backfill: settled {closed_count} positions")
+    except Exception as e:
+        log.error(f"Startup backfill failed: {e}")
+
+backfill_missed_closes()
 threading.Thread(target=run_scheduler, daemon=True).start()
 threading.Thread(target=keep_server_alive, daemon=True).start()
 log.info("Brain v4 initialized — full trading engine with self-regulating queue system + SwingDeskNet NN")
