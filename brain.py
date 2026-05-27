@@ -5165,6 +5165,56 @@ def api_all_closed():
         log.error(f"all-closed error: {e}")
         return jsonify([])
 
+@app.route("/api/nn-debug")
+def api_nn_debug():
+    """Diagnose NN state — torch install, weights, training readiness."""
+    try:
+        import torch as _torch
+        torch_version = _torch.__version__
+        torch_ok = True
+    except ImportError as e:
+        torch_version = None
+        torch_ok = False
+        torch_err = str(e)
+
+    try:
+        db = get_database()
+        weights_row = db.execute("SELECT value FROM app_state WHERE key=?", [NN_MODEL_KEY]).fetchone()
+        has_weights = weights_row is not None
+        closed_count = db.execute("SELECT COUNT(*) as n FROM virtual_trades WHERE outcome != 'open'").fetchone()["n"]
+        db.close()
+    except Exception as e:
+        has_weights = False
+        closed_count = 0
+
+    # Test a dummy inference
+    inference_ok = False
+    inference_score = None
+    try:
+        dummy = {
+            "signal_scores": '{"scores":{"rsi_momentum":0.8,"volume_surge":0.6,"overnight_gap":0.5,"earnings_catalyst":0.5,"support_resistance":0.5,"relative_strength":0.5,"sector_rs":0.5,"vwap_reclaim":0.5,"volatility_squeeze":0.5},"fired":["rsi_momentum"],"values":{"rsi_momentum":55,"volume_surge":1.5,"overnight_gap":5,"earnings_catalyst":null,"support_resistance":{"signal":"open_air","resistance":null,"support":null},"relative_strength":{"stock_5d":2.0,"spy_5d":1.0},"sector_rs":{"etf":"XLK","etf_5d":1.5,"spy_5d":1.0},"vwap_reclaim":{"mode":"proxy","dist":1.0},"volatility_squeeze":0.8}}',
+            "direction": "long", "sector": "Tech", "lock_in_confidence": 70,
+            "expected_move": 8.0, "day_change_percent": 5.0,
+            "broke_52w_high_days_ago": None, "weekend_hold": 0,
+            "news_sentiment_score": 0.1, "news_article_count": 2,
+        }
+        score = nn_score_ticker(dummy, "long")
+        inference_ok = score > 0
+        inference_score = score
+    except Exception as e:
+        inference_ok = False
+
+    return jsonify({
+        "torch_installed": torch_ok,
+        "torch_version": torch_version,
+        "has_saved_weights": has_weights,
+        "closed_trades_for_training": closed_count,
+        "min_trades_needed": 10,
+        "ready_to_train": closed_count >= 10,
+        "inference_test_score": inference_score,
+        "inference_working": inference_ok,
+    })
+
 @app.route("/api/nn-picks")
 def api_nn_picks():
     """Return cached NN scan picks."""
