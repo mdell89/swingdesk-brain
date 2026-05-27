@@ -132,12 +132,15 @@ Confidence Floor:
     it has meaningful conviction about.
 """
 
-import os, json, sqlite3, time, logging, threading, random
+import os, json, sqlite3, time, logging, threading, random, math
 from datetime import datetime, timedelta
 from pathlib import Path
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 load_dotenv()
 
@@ -160,6 +163,313 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
+
+# ── NEURAL NETWORK ────────────────────────────────────────────────────────────
+# SwingDeskNet: feedforward NN for overnight swing trade prediction
+# Input: ~46 features (9 signal scores + raw values + metadata + news sentiment)
+# Architecture: 46 → 32 → 16 → 1, ReLU activations, dropout(0.3), sigmoid output
+# Trains nightly on closed virtual_trades. Runs inference every scan cycle.
+# model.train() during audit, model.eval() during live scanning.
+
+NN_INPUT_SIZE  = 46   # Updated if feature set changes
+NN_HIDDEN1     = 32
+NN_HIDDEN2     = 16
+NN_DROPOUT     = 0.3
+NN_CONFIDENCE_FLOOR = 65  # Same floor as crude algo
+NN_MODEL_KEY   = "nn_model_weights"  # app_state key for persisted weights
+
+class SwingDeskNet(nn.Module):
+    """
+    Feedforward neural network for overnight swing trade prediction.
+    Output: probability 0.0-1.0 that a trade will be a hit.
+    Dropout(0.3) active during training, disabled during inference (model.eval()).
+    """
+    def __init__(self, input_size=NN_INPUT_SIZE):
+        super(SwingDeskNet, self).__init__()
+        self.fc1     = nn.Linear(input_size, NN_HIDDEN1)
+        self.drop1   = nn.Dropout(NN_DROPOUT)
+        self.fc2     = nn.Linear(NN_HIDDEN1, NN_HIDDEN2)
+        self.drop2   = nn.Dropout(NN_DROPOUT)
+        self.fc3     = nn.Linear(NN_HIDDEN2, 1)
+        self.relu    = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.drop1(x)
+        x = self.relu(self.fc2(x))
+        x = self.drop2(x)
+        x = self.sigmoid(self.fc3(x))
+        return x
+
+# Global model instance — loaded at startup, updated nightly
+_nn_model = SwingDeskNet()
+_nn_model.eval()  # Start in eval mode
+
+def save_nn_weights():
+    """Persist model weights to DB so they survive Railway restarts."""
+    try:
+        db = get_database()
+        weights = {k: v.tolist() for k, v in _nn_model.state_dict().items()}
+        db.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
+            [NN_MODEL_KEY, json.dumps(weights)])
+        db.close()
+        log.info("NN weights saved to DB")
+    except Exception as e:
+        log.error(f"Failed to save NN weights: {e}")
+
+def load_nn_weights():
+    """Load persisted model weights from DB on startup."""
+    global _nn_model
+    try:
+        db = get_database()
+        row = db.execute("SELECT value FROM app_state WHERE key=?", [NN_MODEL_KEY]).fetchone()
+        db.close()
+        if row:
+            weights = json.loads(row["value"])
+            state_dict = {k: torch.tensor(v) for k, v in weights.items()}
+            _nn_model.load_state_dict(state_dict)
+            _nn_model.eval()
+            log.info("NN weights loaded from DB")
+        else:
+            log.info("No saved NN weights found — starting with random initialization")
+    except Exception as e:
+        log.warning(f"Could not load NN weights: {e} — using random init")
+
+SECTOR_LIST = ["Tech", "Finance", "Energy", "Healthcare", "Industrial",
+               "Consumer", "Defense", "Auto", "Crypto", "Other"]
+
+SR_SIGNAL_MAP = {
+    "open_air": (1, 0, 0),
+    "open_air+support_floor": (1, 1, 0),
+    "resistance_in_range": (0, 0, 1),
+    "at_resistance": (0, 0, 1),
+    "neutral": (0, 0, 0),
+    "unknown": (0, 0, 0),
+}
+
+def extract_nn_features(trade_row):
+    """
+    Extract and normalize all ~46 input features from a virtual_trades row.
+    Returns a list of floats ready for torch.tensor(), or None if data insufficient.
+
+    Feature groups:
+      [0-8]   9 signal scores (float 0-1)
+      [9-14]  raw RSI, volume_ratio, gap_percent, days_to_earnings, vwap_dist, hv_ratio
+      [15-17] sr_signal binary flags: is_open_air, has_support_floor, is_at_resistance
+      [18-19] vwap_is_real, direction (long=1)
+      [20]    lock_in_confidence normalized (/ 99)
+      [21]    expected_move normalized (/ 25)
+      [22]    day_change_percent normalized (/ 10, clipped)
+      [23]    broke_52w_high binary
+      [24]    broke_52w_days_ago normalized (/ 7, 0 if none)
+      [25]    weekend_hold binary
+      [26]    stock_5d_return normalized (/ 20, clipped)
+      [27]    spy_5d_return normalized (/ 20, clipped)
+      [28]    sector_etf_5d_return normalized (/ 20, clipped)
+      [29-38] sector one-hot (10 categories)
+      [39]    news_sentiment_score (float -1 to 1, 0 if unknown)
+      [40]    news_article_count normalized (/ 5, clipped at 1)
+      [41-45] 5 padding zeros (reserved for future signals)
+    """
+    try:
+        # Parse signal_scores JSON
+        sig_raw = trade_row.get("signal_scores") or "{}"
+        if isinstance(sig_raw, str):
+            sig_data = json.loads(sig_raw)
+        else:
+            sig_data = sig_raw
+        scores = sig_data.get("scores", {})
+        values = sig_data.get("values", {})
+
+        # [0-8] Signal scores
+        f = [
+            float(scores.get("rsi_momentum", 0.5)),
+            float(scores.get("volume_surge", 0.5)),
+            float(scores.get("overnight_gap", 0.5)),
+            float(scores.get("earnings_catalyst", 0.5)),
+            float(scores.get("support_resistance", 0.5)),
+            float(scores.get("relative_strength", 0.5)),
+            float(scores.get("sector_rs", 0.5)),
+            float(scores.get("vwap_reclaim", 0.5)),
+            float(scores.get("volatility_squeeze", 0.5)),
+        ]
+
+        # [9] RSI raw
+        f.append(min(float(values.get("rsi_momentum", 50)) / 100.0, 1.0))
+
+        # [10] volume_ratio
+        f.append(min(float(values.get("volume_surge", 1.0)) / 5.0, 1.0))
+
+        # [11] gap_percent
+        gap = float(values.get("overnight_gap", 0))
+        f.append(max(min(gap / 10.0, 1.0), -1.0))
+
+        # [12] days_to_earnings
+        dte = values.get("earnings_catalyst")
+        f.append(min(float(dte) / 30.0, 1.0) if dte is not None else 1.0)
+
+        # [13] vwap_dist
+        vwap_val = values.get("vwap_reclaim", {})
+        vwap_dist = vwap_val.get("dist", 0) if isinstance(vwap_val, dict) else 0
+        f.append(max(min(float(vwap_dist or 0) / 5.0, 1.0), -1.0))
+
+        # [14] hv_ratio
+        hv = values.get("volatility_squeeze")
+        f.append(max(min(float(hv) / 2.0, 1.0), 0.0) if hv is not None else 0.5)
+
+        # [15-17] sr_signal binary flags
+        sr_val = values.get("support_resistance", {})
+        sr_signal = sr_val.get("signal", "unknown") if isinstance(sr_val, dict) else "unknown"
+        is_open_air, has_support_floor, is_at_resistance = SR_SIGNAL_MAP.get(sr_signal, (0, 0, 0))
+        f.extend([float(is_open_air), float(has_support_floor), float(is_at_resistance)])
+
+        # [18] vwap_is_real
+        vwap_mode = vwap_val.get("mode", "proxy") if isinstance(vwap_val, dict) else "proxy"
+        f.append(1.0 if vwap_mode == "real" else 0.0)
+
+        # [19] direction
+        f.append(1.0 if trade_row.get("direction", "long") == "long" else 0.0)
+
+        # [20] lock_in_confidence
+        f.append(min(float(trade_row.get("lock_in_confidence") or trade_row.get("confidence", 65)) / 99.0, 1.0))
+
+        # [21] expected_move
+        f.append(min(float(trade_row.get("expected_move", 5)) / 25.0, 1.0))
+
+        # [22] day_change_percent
+        f.append(max(min(float(trade_row.get("day_change_percent", 0)) / 10.0, 1.0), -1.0))
+
+        # [23] broke_52w_high
+        f.append(1.0 if trade_row.get("broke_52w_high_days_ago") is not None else 0.0)
+
+        # [24] broke_52w_days_ago
+        days_ago = trade_row.get("broke_52w_high_days_ago")
+        f.append(float(days_ago) / 7.0 if days_ago else 0.0)
+
+        # [25] weekend_hold
+        f.append(float(trade_row.get("weekend_hold", 0) or 0))
+
+        # [26-28] 5d returns
+        rs_val = values.get("relative_strength", {})
+        stock_5d = rs_val.get("stock_5d", 0) if isinstance(rs_val, dict) else 0
+        spy_5d = rs_val.get("spy_5d", 0) if isinstance(rs_val, dict) else 0
+        sector_val = values.get("sector_rs", {})
+        etf_5d = sector_val.get("etf_5d", 0) if isinstance(sector_val, dict) else 0
+        f.append(max(min(float(stock_5d or 0) / 20.0, 1.0), -1.0))
+        f.append(max(min(float(spy_5d or 0) / 20.0, 1.0), -1.0))
+        f.append(max(min(float(etf_5d or 0) / 20.0, 1.0), -1.0))
+
+        # [29-38] sector one-hot
+        sector = trade_row.get("sector", "Other") or "Other"
+        for s in SECTOR_LIST:
+            f.append(1.0 if sector == s else 0.0)
+
+        # [39] news_sentiment_score
+        f.append(float(trade_row.get("news_sentiment_score", 0) or 0))
+
+        # [40] news_article_count
+        f.append(min(float(trade_row.get("news_article_count", 0) or 0) / 5.0, 1.0))
+
+        # [41-45] reserved padding
+        f.extend([0.0, 0.0, 0.0, 0.0, 0.0])
+
+        # Validate length
+        assert len(f) == NN_INPUT_SIZE, f"Feature vector length {len(f)} != {NN_INPUT_SIZE}"
+
+        # Replace any NaN/inf with 0.5
+        f = [0.5 if (v != v or abs(v) == float("inf")) else v for v in f]
+
+        return f
+
+    except Exception as e:
+        log.debug(f"Feature extraction failed: {e}")
+        return None
+
+def train_neural_network():
+    """
+    Nightly training job — trains SwingDeskNet on all closed virtual_trades.
+    Called after Claude audit. Uses model.train() with dropout active.
+    Persists updated weights to DB when done.
+    Min 10 closed trades required to train.
+    """
+    global _nn_model
+    try:
+        db = get_database()
+        closed = [dict(r) for r in db.execute(
+            "SELECT * FROM virtual_trades WHERE outcome != 'open' AND signal_scores IS NOT NULL AND signal_scores != '{}'"
+        ).fetchall()]
+        db.close()
+
+        if len(closed) < 10:
+            log.info(f"NN training skipped — only {len(closed)} closed trades (need 10+)")
+            return
+
+        # Build feature matrix and labels
+        X, y = [], []
+        for trade in closed:
+            features = extract_nn_features(trade)
+            if features is None:
+                continue
+            label = 1.0 if trade.get("outcome") == "hit" else 0.0
+            X.append(features)
+            y.append(label)
+
+        if len(X) < 10:
+            log.info(f"NN training skipped — only {len(X)} usable samples after feature extraction")
+            return
+
+        X_tensor = torch.tensor(X, dtype=torch.float32)
+        y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
+
+        # Class balance check — log win rate going into training
+        win_rate = sum(y) / len(y)
+        log.info(f"NN training: {len(X)} samples, {win_rate:.1%} win rate")
+
+        # Training setup
+        _nn_model.train()
+        optimizer = optim.Adam(_nn_model.parameters(), lr=0.001, weight_decay=1e-4)
+        criterion = nn.BCELoss()
+
+        # Train for 200 epochs — small dataset trains fast
+        for epoch in range(200):
+            optimizer.zero_grad()
+            output = _nn_model(X_tensor)
+            loss = criterion(output, y_tensor)
+            loss.backward()
+            optimizer.step()
+
+        _nn_model.eval()
+        final_loss = loss.item()
+        log.info(f"NN training complete — final loss: {final_loss:.4f}")
+        save_nn_weights()
+
+    except Exception as e:
+        log.error(f"NN training error: {e}")
+        _nn_model.eval()  # Always return to eval mode
+
+def nn_score_ticker(price_data_row, direction="long"):
+    """
+    Score a single ticker using the trained NN model.
+    Returns confidence integer 0-99, same scale as crude algo.
+    Requires signal_scores already computed — call compute_signal_scores first.
+    Uses model.eval() — dropout disabled, full network active.
+    """
+    try:
+        _nn_model.eval()
+        features = extract_nn_features(price_data_row)
+        if features is None:
+            return 0
+        x = torch.tensor([features], dtype=torch.float32)
+        with torch.no_grad():
+            prob = _nn_model(x).item()
+        # Scale probability to 0-99 confidence score
+        # prob 0.65+ → confidence 65+, prob 1.0 → confidence 99
+        confidence = int(prob * 99)
+        return confidence
+    except Exception as e:
+        log.debug(f"NN scoring error: {e}")
+        return 0
 
 # ── TIME UTILITIES ────────────────────────────────────────────────────────────
 def current_time_cst():
@@ -435,6 +745,64 @@ def initialize_database():
             monitoring INTEGER DEFAULT 1
         );
 
+        CREATE TABLE IF NOT EXISTS nn_virtual_trades (
+            id TEXT PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            buy_date TEXT NOT NULL,
+            buy_time TEXT,
+            buy_price REAL,
+            sell_date TEXT,
+            sell_time TEXT,
+            sell_price REAL,
+            invested_amount REAL DEFAULT 10.0,
+            current_value REAL,
+            confidence INTEGER,
+            nn_confidence INTEGER,
+            expected_move REAL,
+            actual_move REAL,
+            gross_pnl REAL,
+            net_pnl REAL,
+            fee REAL DEFAULT 0.02,
+            outcome TEXT DEFAULT 'open',
+            sector TEXT,
+            reasoning TEXT,
+            sell_reason TEXT,
+            intraday_high_pct REAL,
+            intraday_low_pct REAL,
+            dynamic_confidence INTEGER,
+            dynamic_estimate REAL,
+            weekend_hold INTEGER DEFAULT 0,
+            confluence_count INTEGER DEFAULT 0,
+            confluence_methods TEXT DEFAULT '[]',
+            signal_scores TEXT DEFAULT '{}',
+            lock_in_confidence INTEGER,
+            last_price_updated TEXT,
+            day_change_percent REAL,
+            news_sentiment_score REAL,
+            news_article_count INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS personal_trades (
+            id TEXT PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            buy_date TEXT NOT NULL,
+            buy_price REAL,
+            current_price REAL,
+            shares REAL DEFAULT 1.0,
+            invested_amount REAL,
+            current_value REAL,
+            pnl_percent REAL,
+            pnl_dollars REAL,
+            sector TEXT,
+            notes TEXT,
+            source TEXT DEFAULT 'manual',
+            source_portfolio TEXT,
+            added_at TEXT,
+            last_updated TEXT
+        );
+
         /*
          * Trade Queue — Self-Regulating Position Sizing
          * ═══════════════════════════════════════════════
@@ -558,6 +926,9 @@ def initialize_database():
         "lock_in_confidence INTEGER",
         "last_price_updated TEXT",
         "day_change_percent REAL",
+        "news_sentiment_score REAL",
+        "news_article_count INTEGER DEFAULT 0",
+        "broke_52w_high_days_ago INTEGER",
     ]:
         try:
             column_name = column_definition.split()[0]
@@ -1581,12 +1952,11 @@ def _normalize_news_article(title, summary, url, pub_ts, source):
 def _fetch_news_alpha_vantage(ticker):
     """
     Fetch news for a single ticker via Alpha Vantage NEWS_SENTIMENT endpoint.
-    Returns a list of normalized articles (up to 3), or empty list on failure.
-    Alpha Vantage returns real article summaries unlike Yahoo RSS headlines-only.
-    No sentiment scoring is used — display only.
+    Returns (articles, sentiment_score, article_count).
+    Extracts ticker_sentiment_score and overall_sentiment_score for NN training.
     """
     if not ALPHA_VANTAGE_KEY:
-        return []
+        return [], 0.0, 0
     try:
         import urllib.request
         url = (f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT"
@@ -1596,11 +1966,11 @@ def _fetch_news_alpha_vantage(ticker):
             data = json.loads(response.read().decode("utf-8", errors="ignore"))
         feed = data.get("feed", [])
         articles = []
+        sentiment_scores = []
         for item in feed[:5]:
             title = item.get("title", "").strip()
             summary = item.get("summary", "").strip()
             url_str = item.get("url", "").strip()
-            # Alpha Vantage time format: "20260525T085000"
             time_str = item.get("time_published", "")
             pub_ts = 0
             if time_str:
@@ -1609,13 +1979,21 @@ def _fetch_news_alpha_vantage(ticker):
                     pub_ts = dt.timestamp()
                 except:
                     pass
+            # Extract per-ticker sentiment score from ticker_sentiment_label list
+            for ts in item.get("ticker_sentiment", []):
+                if ts.get("ticker", "").upper() == ticker.upper():
+                    try:
+                        sentiment_scores.append(float(ts.get("ticker_sentiment_score", 0)))
+                    except:
+                        pass
             if title and url_str:
                 articles.append(_normalize_news_article(title, summary, url_str, pub_ts, "alpha_vantage"))
         articles.sort(key=lambda x: x["ts"], reverse=True)
-        return articles[:3]
+        avg_sentiment = sum(sentiment_scores) / len(sentiment_scores) if sentiment_scores else 0.0
+        return articles[:3], round(avg_sentiment, 4), len(feed)
     except Exception as err:
         log.debug(f"Alpha Vantage news failed for {ticker}: {err}")
-        return []
+        return [], 0.0, 0
 
 
 def _fetch_news_yahoo_rss(ticker):
@@ -1659,18 +2037,21 @@ def _fetch_news_yahoo_rss(ticker):
 def fetch_ticker_news(tickers, price_data):
     """
     Fetch news articles for each ticker.
-    Primary: Alpha Vantage NEWS_SENTIMENT (real summaries, not just headlines).
-    Fallback: Yahoo Finance RSS (headlines only).
-    All articles normalized to internal schema regardless of source.
-    Display only — no sentiment scoring or ML integration.
+    Primary: Alpha Vantage NEWS_SENTIMENT — extracts sentiment score for NN.
+    Fallback: Yahoo Finance RSS (headlines only, no sentiment score).
+    Stores news, sentiment_score, and article_count on price_data per ticker.
     """
     for ticker in tickers:
         if ticker not in price_data:
             continue
-        articles = _fetch_news_alpha_vantage(ticker)
+        articles, sentiment_score, article_count = _fetch_news_alpha_vantage(ticker)
         if not articles:
             articles = _fetch_news_yahoo_rss(ticker)
-        price_data[ticker]["news"] = articles[:1]  # Show most recent article on card
+            sentiment_score = 0.0
+            article_count = len(articles)
+        price_data[ticker]["news"] = articles[:1]
+        price_data[ticker]["news_sentiment_score"] = sentiment_score
+        price_data[ticker]["news_article_count"] = article_count
 
 
 def calculate_relative_strength(ticker, price_data):
@@ -2533,6 +2914,131 @@ def get_cached_picks():
         return result
     return None
 
+# ── NEURAL NETWORK SCAN ──────────────────────────────────────────────────────
+def run_nn_scan(scan_type="scheduled"):
+    """
+    Run a full scan of the ticker universe using SwingDeskNet instead of
+    the weighted crude algo. Uses the same price data pipeline — zero extra
+    API calls. Writes picks to cached_nn_picks in app_state.
+    Requires signal_scores already computed via compute_signal_scores.
+    """
+    try:
+        _nn_model.eval()
+        weights = get_signal_weights()
+        universe = build_ticker_universe()
+
+        # Exclude open NN positions
+        try:
+            _db = get_database()
+            open_tickers = set(r["ticker"] for r in _db.execute(
+                "SELECT ticker FROM nn_virtual_trades WHERE outcome='open'"
+            ).fetchall())
+            _db.close()
+            universe = [t for t in universe if t not in open_tickers]
+        except:
+            pass
+
+        universe_with_spy = list(dict.fromkeys(universe + ["SPY"]))
+        price_data = fetch_price_data(universe_with_spy)
+        enrich_with_live_prices(universe_with_spy, price_data)
+
+        rsi_values = calculate_rsi_batch(list(price_data.keys()), price_data=price_data)
+        earnings_soon = check_upcoming_earnings(list(price_data.keys()))
+        check_52w_breakouts(list(price_data.keys()), price_data)
+        enrich_price_data_with_history(list(price_data.keys()), price_data)
+
+        for ticker in list(price_data.keys()):
+            try:
+                calculate_support_resistance(ticker, price_data)
+            except:
+                pass
+
+        scored = []
+        for ticker in universe:
+            if ticker not in price_data:
+                continue
+            stock_data = price_data[ticker]
+            rsi = rsi_values.get(ticker, 50.0)
+            earnings = earnings_soon.get(ticker, 99) if isinstance(earnings_soon, dict) else 99
+            if earnings <= 1:
+                continue
+
+            # Compute signal scores — needed for feature extraction
+            sig_scores, fired, sig_values = compute_signal_scores(
+                ticker, price_data, rsi, earnings_soon, weights, "long"
+            )
+
+            # Build a synthetic trade row for feature extraction
+            synthetic = {
+                "ticker": ticker,
+                "direction": "long",
+                "sector": get_sector(ticker),
+                "signal_scores": json.dumps({"scores": sig_scores, "fired": fired, "values": sig_values}),
+                "lock_in_confidence": 0,
+                "expected_move": estimate_overnight_move(stock_data, 70, ticker in earnings_soon),
+                "day_change_percent": stock_data.get("day_change_percent", 0),
+                "broke_52w_high_days_ago": stock_data.get("broke_52w_high_days_ago"),
+                "weekend_hold": 0,
+                "news_sentiment_score": stock_data.get("news_sentiment_score", 0),
+                "news_article_count": stock_data.get("news_article_count", 0),
+            }
+            synthetic["lock_in_confidence"] = calculate_confidence_score(
+                ticker, stock_data, rsi, earnings_soon, weights, "long"
+            )
+            synthetic["expected_move"] = estimate_overnight_move(
+                stock_data, synthetic["lock_in_confidence"], ticker in earnings_soon
+            )
+
+            nn_conf = nn_score_ticker(synthetic, "long")
+            if nn_conf < NN_CONFIDENCE_FLOOR:
+                continue
+
+            confluence = calculate_method_confluence(ticker, price_data)
+            scored.append({
+                "ticker": ticker,
+                "name": ticker,
+                "sector": get_sector(ticker),
+                "price": stock_data["price"],
+                "rsi": round(rsi, 1),
+                "vol_ratio": round(stock_data.get("volume_ratio", 1), 2),
+                "overnight_gap_pct": round(stock_data.get("gap_percent", 0), 2),
+                "day_change_pct": round(stock_data.get("day_change_percent", 0), 2),
+                "long_conf": nn_conf,
+                "long_move": synthetic["expected_move"],
+                "long_reasoning": f"NN confidence {nn_conf}%",
+                "crude_conf": synthetic["lock_in_confidence"],
+                "52w_high": stock_data.get("52w_high"),
+                "broke_52w_high_days_ago": stock_data.get("broke_52w_high_days_ago"),
+                "news": stock_data.get("news", []),
+                "confluence_count": confluence["count"],
+                "confluence_methods": confluence["methods"],
+                "nn_score": nn_conf,
+            })
+
+        scored.sort(key=lambda x: x["long_conf"], reverse=True)
+        top_picks = scored[:MAX_LONG_PICKS]
+
+        result = {
+            "scan_type": f"nn_{scan_type}",
+            "scan_time": current_time_cst().isoformat(),
+            "recommended_longs": top_picks,
+            "recommended_shorts": [],
+            "total_scanned": len(scored),
+        }
+
+        db = get_database()
+        db.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_nn_picks',?)",
+            [json.dumps(result)])
+        db.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_nn_picks_time',?)",
+            [current_time_cst().isoformat()])
+        db.close()
+        log.info(f"NN scan complete: {len(top_picks)} picks from {len(scored)} qualified")
+        return result
+
+    except Exception as e:
+        log.error(f"NN scan error: {e}")
+        return {"recommended_longs": [], "recommended_shorts": [], "total_scanned": 0}
+
 # ── POSITION LIFECYCLE ────────────────────────────────────────────────────────
 def lock_pick_queue():
     """
@@ -2644,18 +3150,35 @@ def execute_opening_positions():
         except:
             _signal_scores_json = json.dumps({"scores": {}, "fired": []})
 
+        # Get news sentiment and 52w data from picks cache
+        _news_sentiment = 0.0
+        _news_count = 0
+        _52w_days_ago = None
+        try:
+            _cached = json.loads(existing.execute(
+                "SELECT value FROM app_state WHERE key='cached_picks'"
+            ).fetchone()["value"] or "{}")
+            for _p in _cached.get("recommended_longs", []):
+                if _p.get("ticker") == ticker:
+                    _news_sentiment = float(_p.get("news_sentiment_score") or 0)
+                    _news_count = int(_p.get("news_article_count") or 0)
+                    _52w_days_ago = _p.get("broke_52w_high_days_ago")
+                    break
+        except:
+            pass
+
         existing.execute("""
             INSERT INTO virtual_trades
             (id, ticker, direction, buy_date, buy_time, buy_price, invested_amount,
              confidence, lock_in_confidence, expected_move, outcome, sector, reasoning, closed_days,
              status, current_value, intraday_high_pct, intraday_low_pct, queue_position,
-             signal_scores)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             signal_scores, news_sentiment_score, news_article_count, broke_52w_high_days_ago)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, [trade_id, ticker, direction, today, "08:45:00", buy_price,
               round(invested_amount, 4), confidence, confidence, expected_move, "open",
               get_sector(ticker), reasoning, closed_days,
               "open", round(invested_amount, 4), 0.0, 0.0, queue_id,
-              _signal_scores_json])
+              _signal_scores_json, _news_sentiment, _news_count, _52w_days_ago])
         existing.commit()
         existing.close()
 
@@ -2849,11 +3372,12 @@ def monitor_open_positions():
             last_news_row = database.execute("SELECT value FROM app_state WHERE key=?", [news_key]).fetchone()
             last_news_ts = float(last_news_row["value"]) if last_news_row else 0
             if time.time() - last_news_ts > 1800:  # 30 min stale threshold
-                fresh_news = _fetch_news_alpha_vantage(ticker) or _fetch_news_yahoo_rss(ticker)
+                av_articles, av_sentiment, av_count = _fetch_news_alpha_vantage(ticker)
+                fresh_news = av_articles or _fetch_news_yahoo_rss(ticker)
                 if fresh_news:
                     database.execute(
-                        "UPDATE virtual_trades SET news=? WHERE id=?",
-                        [json.dumps(fresh_news), position["id"]]
+                        "UPDATE virtual_trades SET news=?, news_sentiment_score=?, news_article_count=? WHERE id=?",
+                        [json.dumps(fresh_news), av_sentiment, av_count, position["id"]]
                     )
                 database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
                     [news_key, str(time.time())])
@@ -3164,9 +3688,28 @@ def run_scheduler():
     def run_audit_if_weekday():
         if current_time_cst().weekday() < 5:
             run_self_audit()
+            # Train NN after audit — fresh data available
+            try:
+                train_neural_network()
+            except Exception as nn_err:
+                log.error(f"NN training failed: {nn_err}")
     schedule.every().day.at("23:55").do(run_audit_if_weekday)
 
-    log.info("Scheduler started — comprehensive scans every 30min, position monitoring 2.5min regular/5min extended")
+    # NN scan runs every 30 min alongside crude algo scan
+    for hour, minute, label in [
+        (9,"00","4:00am"),(9,30,"4:30am"),(10,"00","5:00am"),(10,30,"5:30am"),
+        (11,"00","6:00am"),(11,30,"6:30am"),(12,"00","7:00am"),(12,30,"7:30am"),
+        (13,"00","8:00am"),(13,30,"8:30am"),(14,"00","9:00am"),(14,30,"9:30am"),
+        (15,"00","10:00am"),(15,30,"10:30am"),(16,"00","11:00am"),(16,30,"11:30am"),
+        (17,"00","12:00pm"),(17,30,"12:30pm"),(18,"00","1:00pm"),(18,30,"1:30pm"),
+        (19,"00","2:00pm"),(19,30,"2:30pm"),(20,"00","3:00pm"),(20,30,"3:30pm"),
+        (21,"00","4:00pm"),(21,30,"4:30pm"),(22,"00","5:00pm"),(22,30,"5:30pm"),
+        (23,"00","6:00pm"),(23,30,"6:30pm"),(0,"00","7:00pm"),(0,30,"7:30pm"),
+    ]:
+        time_str = f"{hour:02d}:{minute:02d}" if isinstance(minute, int) else f"{hour:02d}:{minute}"
+        schedule.every().day.at(time_str).do(lambda st=label: run_nn_scan(scan_type=st))
+
+    log.info("Scheduler started — comprehensive scans every 30min, position monitoring 2.5min regular/5min extended, NN scan every 30min")
 
     # Dynamic monitoring loop — 2.5 min during regular hours, 5 min during pre/post market
     last_monitor_time = 0
@@ -4567,6 +5110,142 @@ def api_all_closed():
         log.error(f"all-closed error: {e}")
         return jsonify([])
 
+@app.route("/api/nn-picks")
+def api_nn_picks():
+    """Return cached NN scan picks."""
+    try:
+        db = get_database()
+        row = db.execute("SELECT value FROM app_state WHERE key='cached_nn_picks'").fetchone()
+        db.close()
+        if row:
+            return jsonify(json.loads(row["value"]))
+        return jsonify({"recommended_longs": [], "recommended_shorts": [], "total_scanned": 0})
+    except Exception as e:
+        return jsonify({"recommended_longs": [], "recommended_shorts": [], "total_scanned": 0})
+
+@app.route("/api/nn-positions")
+def api_nn_positions():
+    """Return open positions in the NN portfolio."""
+    try:
+        db = get_database()
+        rows = [dict(r) for r in db.execute(
+            "SELECT * FROM nn_virtual_trades WHERE outcome='open' ORDER BY buy_date DESC"
+        ).fetchall()]
+        db.close()
+        return jsonify(rows)
+    except Exception as e:
+        return jsonify([])
+
+@app.route("/api/nn-stats")
+def api_nn_stats():
+    """Return NN portfolio performance stats — source of truth from nn_virtual_trades."""
+    try:
+        db = get_database()
+        closed = [dict(r) for r in db.execute(
+            "SELECT outcome, actual_move, gross_pnl FROM nn_virtual_trades WHERE outcome != 'open'"
+        ).fetchall()]
+        open_count = db.execute(
+            "SELECT COUNT(*) as n FROM nn_virtual_trades WHERE outcome='open'"
+        ).fetchone()["n"]
+        db.close()
+        resolved = len(closed)
+        hits = sum(1 for t in closed if t["outcome"] == "hit")
+        misses = sum(1 for t in closed if t["outcome"] == "miss")
+        partials = sum(1 for t in closed if t["outcome"] == "partial")
+        total_pnl = sum(float(t["gross_pnl"] or 0) for t in closed)
+        return jsonify({
+            "resolved": resolved,
+            "hits": hits,
+            "misses": misses,
+            "partials": partials,
+            "win_rate": round(hits / resolved * 100, 1) if resolved else None,
+            "total_gross_pnl": round(total_pnl, 2),
+            "open_positions": open_count,
+        })
+    except Exception as e:
+        return jsonify({"resolved": 0, "hits": 0, "misses": 0, "win_rate": None})
+
+@app.route("/api/nn-all-closed")
+def api_nn_all_closed():
+    """Return all closed NN trades for the Neural Analytics subpage."""
+    try:
+        db = get_database()
+        closed = [dict(r) for r in db.execute(
+            "SELECT * FROM nn_virtual_trades WHERE outcome != 'open' ORDER BY sell_date DESC, sell_time DESC"
+        ).fetchall()]
+        db.close()
+        return jsonify(closed)
+    except:
+        return jsonify([])
+
+@app.route("/api/personal-trades")
+def api_personal_trades():
+    """Return all personal portfolio positions."""
+    try:
+        db = get_database()
+        rows = [dict(r) for r in db.execute(
+            "SELECT * FROM personal_trades ORDER BY added_at DESC"
+        ).fetchall()]
+        db.close()
+        return jsonify(rows)
+    except Exception as e:
+        return jsonify([])
+
+@app.route("/api/personal-trades/add", methods=["POST"])
+def api_personal_trades_add():
+    """
+    Add a position to the personal portfolio.
+    Called when user taps 'Add to personal' on a Brain or Neural card.
+    Body: {ticker, direction, buy_price, invested_amount, sector, source_portfolio, notes}
+    """
+    try:
+        body = request.get_json() or {}
+        ticker = body.get("ticker", "").upper().strip()
+        if not ticker:
+            return jsonify({"error": "ticker required"}), 400
+        now = current_time_cst()
+        trade_id = f"personal_{ticker}_{now.strftime('%Y%m%d%H%M%S')}"
+        buy_price = float(body.get("buy_price", 0))
+        invested = float(body.get("invested_amount", 10))
+        db = get_database()
+        db.execute("""
+            INSERT OR REPLACE INTO personal_trades
+            (id, ticker, direction, buy_date, buy_price, invested_amount,
+             current_value, sector, notes, source, source_portfolio, added_at, last_updated)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, [
+            trade_id, ticker,
+            body.get("direction", "long"),
+            now.strftime("%Y-%m-%d"),
+            buy_price, invested, invested,
+            body.get("sector", get_sector(ticker)),
+            body.get("notes", ""),
+            "manual",
+            body.get("source_portfolio", "brain"),
+            now.isoformat(), now.isoformat()
+        ])
+        db.close()
+        log.info(f"Personal trade added: {ticker} from {body.get('source_portfolio', 'brain')}")
+        return jsonify({"success": True, "id": trade_id})
+    except Exception as e:
+        log.error(f"personal-trades/add error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/personal-trades/remove", methods=["POST"])
+def api_personal_trades_remove():
+    """Remove a position from the personal portfolio."""
+    try:
+        body = request.get_json() or {}
+        trade_id = body.get("id")
+        if not trade_id:
+            return jsonify({"error": "id required"}), 400
+        db = get_database()
+        db.execute("DELETE FROM personal_trades WHERE id=?", [trade_id])
+        db.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/reset-weights", methods=["POST"])
 def api_reset_weights():
     """
@@ -4670,9 +5349,10 @@ def keep_server_alive():
 # ── INITIALIZATION ────────────────────────────────────────────────────────────
 DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 initialize_database()
+load_nn_weights()  # Load persisted NN weights on startup
 threading.Thread(target=run_scheduler, daemon=True).start()
 threading.Thread(target=keep_server_alive, daemon=True).start()
-log.info("Brain v4 initialized — full trading engine with self-regulating queue system")
+log.info("Brain v4 initialized — full trading engine with self-regulating queue system + SwingDeskNet NN")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
