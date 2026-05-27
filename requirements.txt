@@ -7,3 +7,5 @@ requests
 schedule
 gunicorn
 twilio
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
