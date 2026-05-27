@@ -88,7 +88,15 @@
   - Make the hex nut control visually match the color toggle at minimum.
   - Preferred direction: make hex nut, color toggle, and net-view toggle share the same control height for a cleaner toolbar rhythm.
   - Keep icon glyphs optically centered inside their hit areas.
-- Restore exact midpoint alignment for decimal dots, triangle spines, and the journal/bookmark button.
+- Restore exact midpoint alignment for decimal dots, triangle apexes, and the journal/bookmark button.
+- Treat the stock cards as a strict grid:
+  - `OPEN P&L` header must align with the `OPEN P&L` values.
+  - `OPEN P&L` values should always render to one decimal place.
+  - The `OPEN P&L` decimal point must always sit on the same vertical axis as the expand triangle apex.
+  - The expand triangle apex must use the same vertical axis on every card.
+  - Keep the confidence delta tag format as-is.
+  - Keep `+$0.00` style dollar values; do not over-optimize tiny cent display.
+- Keep `on target` on one line. If it wraps, fix the Journal/status grid spacing instead of changing the wording.
 - Make the journal button visibly populate Personal or show an error if it fails.
 - Clean up missing/blank stock-card columns.
 - Restore any useful expanded-card metrics removed in recent pushes.
