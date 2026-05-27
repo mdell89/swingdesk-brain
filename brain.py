@@ -5165,6 +5165,15 @@ def api_all_closed():
         log.error(f"all-closed error: {e}")
         return jsonify([])
 
+@app.route("/api/nn-train-now", methods=["POST"])
+def api_nn_train_now():
+    """Manually trigger NN training. Returns training result."""
+    try:
+        result = train_neural_network()
+        return jsonify({"success": True, "result": str(result)})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route("/api/nn-debug")
 def api_nn_debug():
     """Diagnose NN state — torch install, weights, training readiness."""
