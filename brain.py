@@ -1213,6 +1213,43 @@ def fetch_finnhub_candles(ticker, days=60):
         log.debug(f"Finnhub candles error {ticker}: {e}")
         return []
 
+def fetch_finnhub_price_at_cst(ticker, target_dt_cst, resolution="5"):
+    """
+    Fetch the intraday candle open nearest to a target CST/CDT time.
+    Used for virtual entry prices, especially the 8:45 AM execution price.
+    """
+    if not FINNHUB_KEY:
+        return None
+    try:
+        import urllib.request
+        target_utc = target_dt_cst - timedelta(hours=TIMEZONE_OFFSET)
+        from_ts = int((target_utc - timedelta(minutes=15)).timestamp())
+        to_ts = int((target_utc + timedelta(minutes=20)).timestamp())
+        target_ts = int(target_utc.timestamp())
+        url = (f"{FINNHUB_BASE}/stock/candle"
+               f"?symbol={ticker}&resolution={resolution}&from={from_ts}&to={to_ts}&token={FINNHUB_KEY}")
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            d = json.loads(resp.read())
+        if d.get("s") != "ok":
+            return None
+
+        times = d.get("t", [])
+        opens = d.get("o", [])
+        closes = d.get("c", [])
+        if not times:
+            return None
+
+        best_idx = min(range(len(times)), key=lambda i: abs(int(times[i]) - target_ts))
+        price = opens[best_idx] if best_idx < len(opens) and opens[best_idx] else closes[best_idx]
+        return {
+            "price": float(price),
+            "timestamp": int(times[best_idx]),
+            "source": f"finnhub_{resolution}m_candle",
+        }
+    except Exception as e:
+        log.debug(f"Finnhub intraday price error {ticker}: {e}")
+        return None
+
 def fetch_twelve_data_batch(tickers, interval="1day", outputsize=60):
     """
     Fetch OHLCV + history for multiple tickers.
@@ -1394,6 +1431,30 @@ def fetch_current_prices(tickers, pin_to_845=False):
             quote = fetch_finnhub_quote(ticker)
             if quote:
                 results[ticker] = {"price": quote["price"], "day_change_pct": 0}
+            time.sleep(1.1)
+        return results
+
+    return fetch_twelve_data_live(tickers)
+
+def fetch_current_prices(tickers, pin_to_845=False):
+    """
+    Fetch current prices for monitoring, or true 8:45 AM candle entries.
+    Returns {ticker: {"price": float, "day_change_pct": float}}.
+    """
+    if not tickers:
+        return {}
+
+    if pin_to_845:
+        results = {}
+        target = current_time_cst().replace(hour=8, minute=45, second=0, microsecond=0)
+        for ticker in tickers:
+            pinned = fetch_finnhub_price_at_cst(ticker, target)
+            if pinned:
+                results[ticker] = {"price": pinned["price"], "day_change_pct": 0, "source": pinned["source"]}
+            else:
+                quote = fetch_finnhub_quote(ticker)
+                if quote:
+                    results[ticker] = {"price": quote["open"], "day_change_pct": 0, "source": "finnhub_day_open_fallback"}
             time.sleep(1.1)
         return results
 
@@ -4920,6 +4981,81 @@ def api_fix_buy_prices():
         return jsonify({"success": False, "error": str(e)}), 500
 
 # ── BACKFILL TAGS ─────────────────────────────────────────────────────────────
+@app.route("/api/reprice-open-entries", methods=["POST"])
+def api_reprice_open_entries():
+    """
+    Recalculate open trade entry prices from their recorded buy_time candle.
+    Use after a manual recovery if entries were approximated with live quotes.
+    """
+    try:
+        database = get_database()
+        open_positions = [dict(r) for r in database.execute(
+            "SELECT * FROM virtual_trades WHERE outcome='open'"
+        ).fetchall()]
+
+        if not open_positions:
+            database.close()
+            return jsonify({"success": True, "updated": 0, "results": []})
+
+        results = []
+        updated = 0
+        for position in open_positions:
+            ticker = position["ticker"]
+            try:
+                buy_date = datetime.strptime(position["buy_date"], "%Y-%m-%d")
+                buy_time_raw = position.get("buy_time") or "08:45:00"
+                hour, minute, second = [int(part) for part in buy_time_raw.split(":")[:3]]
+                target = buy_date.replace(hour=hour, minute=minute, second=second, microsecond=0)
+
+                pinned = fetch_finnhub_price_at_cst(ticker, target)
+                quote = fetch_finnhub_quote(ticker)
+                if not pinned or not quote:
+                    results.append({"ticker": ticker, "status": "no_price_data"})
+                    time.sleep(1.1)
+                    continue
+
+                old_buy_price = float(position.get("buy_price") or 0)
+                new_buy_price = float(pinned["price"])
+                current_price = float(quote["price"])
+                invested = float(position.get("invested_amount") or DEFAULT_INVESTMENT)
+                pnl_pct = (current_price - new_buy_price) / max(new_buy_price, 0.01) * 100
+                if position.get("direction") == "short":
+                    pnl_pct = -pnl_pct
+                current_value = invested * (1 + pnl_pct / 100)
+
+                database.execute("""
+                    UPDATE virtual_trades
+                    SET buy_price=?, current_value=?, intraday_high_pct=MAX(COALESCE(intraday_high_pct, 0), ?),
+                        intraday_low_pct=MIN(COALESCE(intraday_low_pct, 0), ?), last_price_updated=?
+                    WHERE id=?
+                """, [
+                    round(new_buy_price, 4), round(current_value, 4),
+                    round(max(pnl_pct, 0), 2), round(min(pnl_pct, 0), 2),
+                    current_time_cst().isoformat(), position["id"]
+                ])
+                updated += 1
+                results.append({
+                    "ticker": ticker,
+                    "old_buy_price": round(old_buy_price, 4),
+                    "new_buy_price": round(new_buy_price, 4),
+                    "current_price": round(current_price, 4),
+                    "pnl_pct": round(pnl_pct, 2),
+                    "current_value": round(current_value, 4),
+                    "source": pinned.get("source"),
+                    "status": "updated",
+                })
+                time.sleep(1.1)
+            except Exception as item_error:
+                results.append({"ticker": ticker, "status": "error", "error": str(item_error)})
+
+        database.commit()
+        database.close()
+        log.info(f"Repriced open entries: updated {updated}/{len(open_positions)} positions")
+        return jsonify({"success": True, "updated": updated, "results": results})
+    except Exception as e:
+        log.error(f"Reprice open entries error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route("/api/backfill-tags", methods=["POST"])
 def api_backfill_tags():
     """
