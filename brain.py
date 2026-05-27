@@ -5169,8 +5169,29 @@ def api_all_closed():
 def api_nn_train_now():
     """Manually trigger NN training. Returns training result."""
     try:
-        result = train_neural_network()
-        return jsonify({"success": True, "result": str(result)})
+        train_neural_network()
+        # Force save weights with a fresh connection after training
+        try:
+            weights = {k: v.tolist() for k, v in _nn_model.state_dict().items()}
+            db = get_database()
+            db.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
+                [NN_MODEL_KEY, json.dumps(weights)])
+            db.commit()
+            db.close()
+            saved = True
+        except Exception as se:
+            saved = False
+            log.error(f"Weight save failed: {se}")
+        return jsonify({"success": True, "weights_saved": saved})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/nn-scan-now", methods=["POST"])
+def api_nn_scan_now():
+    """Manually trigger NN scan. Returns picks."""
+    try:
+        result = run_nn_scan(scan_type="manual")
+        return jsonify({"success": True, "total_scanned": result.get("total_scanned", 0), "picks": len(result.get("recommended_longs", []))})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
