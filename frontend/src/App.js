@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 
 /*
  * Overnight Swing Desk — Frontend v32 (Push 46)
@@ -11,7 +11,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from "react"
  *     weekends never flagged as stale
  *
  * Push 45:
- *   - POS_GRID: MKT VALUE replaced with DAY % column, CONF fixed at 90px
+ *   - CARD_METRIC_GRID: stable stock-card columns for TICKER / DAY / P&L / $ / CONF
  *     fixes +$ alignment offset caused by auto-expanding CONF column
  *   - PositionCard: DAY % shows day_change_percent from DB (monitor-written)
  *   - Confidence delta: single number when both sides equal, right side uses
@@ -345,12 +345,12 @@ function refreshThemeTokens(key) {
   CARD_BORDER_LONG = _theme.CARD_BORDER_LONG; CARD_BORDER_SHORT = _theme.CARD_BORDER_SHORT;
 }
 
-const POS_GRID  = "minmax(38px,0.91fr) 0.7fr 1fr 1fr 90px";
-const PICK_GRID = "minmax(50px,0.8fr) 1fr 1fr auto";
+const CARD_METRIC_GRID = "0.95fr 0.72fr 1.05fr 0.92fr 1.05fr";
+const CARD_GRID_GAP = "8px";
 const CARD_PAD_L = "15px";
 const CARD_PAD_R = "12px";
 const TOOLBAR_CONTROL_H = 26;
-const SPINE_VALUE_W = 56;
+const SPINE_VALUE_W = 66;
 
 function SpinePercent({ value, color, fontSize = 12, fontWeight = 600, decimals = 1 }) {
   const n = Number(value) || 0;
@@ -381,22 +381,90 @@ function SpineCell({ children }) {
   return <div style={{ display: "flex", justifyContent: "center", alignItems: "center", minWidth: 0 }}>{children}</div>;
 }
 
-function SpineBookmarkCell({ children }) {
-  return (
-    <div style={{ display: "flex", justifyContent: "center", alignItems: "center", minWidth: 0 }}>
-      <div style={{ width: SPINE_VALUE_W, display: "flex", justifyContent: "flex-start", transform: "translateX(50%)" }}>
-        {children}
-      </div>
-    </div>
-  );
-}
-
 function SpineTriangle({ color, expanded }) {
   return (
     <div style={{ width: SPINE_VALUE_W, display: "flex", justifyContent: "center" }}>
       <svg width="44" height="4" viewBox="0 0 44 4" style={{ transform: expanded ? "scaleY(-1)" : "none", display: "block" }}>
         <polygon points="22,4 2,0 42,0" fill={color} />
       </svg>
+    </div>
+  );
+}
+
+function CardMetricGrid({ children, style = {} }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: CARD_METRIC_GRID, columnGap: CARD_GRID_GAP, alignItems: "center", ...style }}>
+      {children}
+    </div>
+  );
+}
+
+function JournalButton({ state, onClick }) {
+  return (
+    <button onClick={onClick} style={{
+      background: state === "added" ? BLUE + "22" : state === "error" ? RED + "18" : "transparent",
+      border: `1px solid ${state === "error" ? RED + "66" : BLUE + "55"}`,
+      borderRadius: 4,
+      color: state === "added" ? BLUE : state === "error" ? RED : BLUE + "99",
+      fontSize: 8,
+      fontWeight: 700,
+      letterSpacing: 0.5,
+      lineHeight: 1,
+      padding: "4px 7px",
+      cursor: "pointer",
+      flexShrink: 0,
+      transition: "all 0.2s",
+    }}>
+      {state === "added" ? "ADDED" : state === "error" ? "ERR" : "JOURNAL"}
+    </button>
+  );
+}
+
+function StaleBadge({ staleTime }) {
+  if (!staleTime) return null;
+  return (
+    <span style={{
+      fontSize: 7,
+      fontWeight: 700,
+      color: AMBER,
+      padding: "2px 5px",
+      background: "#1a1200",
+      borderRadius: 3,
+      border: `1px solid ${AMBER}44`,
+      letterSpacing: .3,
+      whiteSpace: "nowrap",
+      flexShrink: 0,
+    }}>
+      scanned {staleTime}
+    </span>
+  );
+}
+
+function CardActionRow({ statusLabel, statusPhrase, statusColor, staleTime, journal, tags, borderColor }) {
+  return (
+    <div style={{
+      display: "grid",
+      gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)",
+      alignItems: "center",
+      gap: CARD_GRID_GAP,
+      padding: "0 12px 7px",
+      borderBottom: `1px solid ${borderColor}`,
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+        {statusLabel && <span style={{ fontSize: 10, fontWeight: 800, color: statusColor, letterSpacing: .5, flexShrink: 0 }}>{statusLabel}</span>}
+        {statusPhrase && <span style={{ fontSize: 9, color: T2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", minWidth: 0 }}>{statusPhrase}</span>}
+        <span style={{ marginLeft: "auto", display: "flex", justifyContent: "flex-end", minWidth: 0 }}>
+          <StaleBadge staleTime={staleTime} />
+        </span>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+        <div style={{ width: SPINE_VALUE_W, display: "flex", justifyContent: "flex-start", flexShrink: 0 }}>
+          {journal}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-start", gap: 3, minWidth: 0, overflow: "hidden" }}>
+          {tags}
+        </div>
+      </div>
     </div>
   );
 }
@@ -549,8 +617,8 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
   return (
     <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, overflow: "hidden", cursor: "pointer", borderLeft: `3px solid ${borderColor}` }}
       onClick={() => onToggle(cardKey)}>
-      {/* Header row — POS_GRID: TICKER | % CHG | EST. MOVE | blank | CONF */}
-      <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", alignItems: "center", padding: "12px" }}>
+      {/* Header row: TICKER | % CHG | EST. MOVE | blank | CONF */}
+      <CardMetricGrid style={{ padding: "12px" }}>
         <div style={{ display: "flex", flexDirection: "column", justifyContent: "center" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
             <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 14, fontWeight: 600, color: T1, lineHeight: 1.2 }}>{pick.ticker}</span>
@@ -565,48 +633,36 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
         <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center", alignSelf: "center" }}>
           <div style={{ fontSize: 13, fontWeight: 700, color: borderColor, lineHeight: 1, fontFamily: "'DM Mono',monospace" }}>{confidence}%</div>
         </div>
-      </div>
+      </CardMetricGrid>
 
-      {/* Bottom row — POS_GRID: empty | empty | JOURNAL right-aligned | tag slots | empty */}
-      <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", alignItems: "center", padding: "0 12px 7px", borderBottom: `1px solid ${BORDER}` }}>
-        <div style={{ gridColumn: "1 / 3" }}></div>
-        {/* Col 3: JOURNAL right-aligned — right edge = col3 right = triangle spine */}
-        <SpineBookmarkCell>
-          {onAddToPersonal && (
-            <button onClick={(e) => {
+      {/* Action row: status/staleness left of spine, journal/tags right of spine */}
+      <CardActionRow
+        borderColor={BORDER}
+        journal={onAddToPersonal && (
+          <JournalButton
+            state={journalAdded}
+            onClick={(e) => {
               e.stopPropagation();
               Promise.resolve(onAddToPersonal(pick)).then(ok => {
                 setJournalAdded(ok === false ? "error" : "added");
                 setTimeout(() => setJournalAdded(false), 1500);
               });
-            }} style={{
-              background: journalAdded === "added" ? BLUE + "22" : journalAdded === "error" ? RED + "18" : "transparent",
-              border: `1px solid ${journalAdded === "error" ? RED + "66" : BLUE + "55"}`,
-              borderRadius: 4,
-              color: journalAdded === "added" ? BLUE : journalAdded === "error" ? RED : BLUE + "99",
-              fontSize: 8, fontWeight: 700, letterSpacing: 0.5,
-              padding: "2px 6px", cursor: "pointer", transition: "all 0.2s"
-            }}>
-              {journalAdded === "added" ? "ADDED" : journalAdded === "error" ? "ERR" : "JOURNAL"}
-            </button>
-          )}
-        </SpineBookmarkCell>
-        {/* Col 4: tag slots */}
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 2 }}>
-          <div style={{ width: 28, display: "flex", justifyContent: "center" }}>
+            }}
+          />
+        )}
+        tags={<>
+          <div style={{ width: 28, display: "flex", justifyContent: "center", flexShrink: 0 }}>
             {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 ? (
               <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a" }}>52W</span>
             ) : null}
           </div>
-          <div style={{ width: 28, display: "flex", justifyContent: "center" }}>
+          <div style={{ width: 28, display: "flex", justifyContent: "center", flexShrink: 0 }}>
             {pick.confluence_count > 0 ? (
               <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center" }}>{pick.confluence_count}/10</span>
             ) : null}
           </div>
-        </div>
-        {/* Col 5: empty */}
-        <div></div>
-      </div>
+        </>}
+      />
       {expanded && (
         <div style={{ padding: "0 12px 12px", borderTop: `1px solid ${CARD_BORDER_LONG}` }}>
             {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 && (
@@ -674,12 +730,12 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
           </div>
       )}
       {/* ── Expand triangle — apex at col3 right edge = decimal position ── */}
-      <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", padding: "8px 12px 6px" }}>
+      <CardMetricGrid style={{ padding: "8px 12px 6px", alignItems: "start" }}>
         <div style={{ gridColumn: "1 / 3" }}></div>
         <SpineCell><SpineTriangle color={borderColor} expanded={expanded} /></SpineCell>
         <div></div>
         <div></div>
-      </div>
+      </CardMetricGrid>
     </div>
   );
 }
@@ -817,7 +873,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
       onMouseDown={handlePressStart} onMouseUp={handlePressEnd} onMouseLeave={handlePressEnd}
       onTouchStart={handlePressStart} onTouchEnd={handlePressEnd}>
       {/* ── Header row: TICKER | DAY % | OPEN P&L | +$ | CONF ── */}
-      <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", alignItems: "center", padding: "12px" }}>
+      <CardMetricGrid style={{ padding: "12px" }}>
         <div style={{ display: "flex", flexDirection: "column", justifyContent: "center" }}>
           <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 14, fontWeight: 600, color: T1, lineHeight: 1.2 }}>{trade.ticker}</span>
           {trade.name && <span style={{ fontSize: 9, color: T3, lineHeight: 1.2, marginTop: 1 }}>{trade.name}</span>}
@@ -840,53 +896,39 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
             </div>
           )}
         </div>
-      </div>
+      </CardMetricGrid>
 
       {/* ── Sentiment row ── */}
-      <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", alignItems: "center", padding: "0 12px 5px", paddingTop: 5, borderBottom: `1px solid ${rulingColor}` }}>
-        {/* Col 1: HOLD/WEAK label + phrase */}
-        <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
-          <span style={{ fontSize: 10, fontWeight: 800, color: sentiment.color, letterSpacing: .5 }}>{sentiment.label}</span>
-          <span style={{ fontSize: 9, color: T2, whiteSpace: "nowrap" }}>{sentiment.phrase}</span>
-        </div>
-        {/* Col 2: stale tag sits left of the spine, right-aligned */}
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", minWidth: 0 }}>
-          {isStale && staleTime && <span style={{ fontSize: 7, fontWeight: 700, color: AMBER, padding: "1px 4px", background: "#1a1200", borderRadius: 3, border: `1px solid ${AMBER}44`, letterSpacing: .3, whiteSpace: "nowrap" }}>scanned {staleTime}</span>}
-        </div>
-        {/* Col 3: JOURNAL right-aligned — right edge = col3 right = triangle spine */}
-        <SpineBookmarkCell>
-          {onAddToPersonal && (
-            <button onClick={(e) => {
+      <CardActionRow
+        statusLabel={sentiment.label}
+        statusPhrase={sentiment.phrase}
+        statusColor={sentiment.color}
+        staleTime={isStale ? staleTime : null}
+        borderColor={rulingColor}
+        journal={onAddToPersonal && (
+          <JournalButton
+            state={journalAdded}
+            onClick={(e) => {
               e.stopPropagation();
               Promise.resolve(onAddToPersonal(trade)).then(ok => {
                 setJournalAdded(ok === false ? "error" : "added");
                 setTimeout(() => setJournalAdded(false), 1500);
               });
-            }} style={{
-              background: journalAdded === "added" ? BLUE + "22" : journalAdded === "error" ? RED + "18" : "transparent",
-              border: `1px solid ${journalAdded === "error" ? RED + "66" : BLUE + "55"}`,
-              borderRadius: 4,
-              color: journalAdded === "added" ? BLUE : journalAdded === "error" ? RED : BLUE + "99",
-              fontSize: 8, fontWeight: 700, letterSpacing: 0.5,
-              padding: "2px 6px", cursor: "pointer", flexShrink: 0, transition: "all 0.2s"
-            }}>
-              {journalAdded === "added" ? "ADDED" : journalAdded === "error" ? "ERR" : "JOURNAL"}
-            </button>
-          )}
-        </SpineBookmarkCell>
-        {/* Col 4: tag slots */}
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 2 }}>
-          <div style={{ width: 28, display: "flex", justifyContent: "center" }}>
+            }}
+          />
+        )}
+        tags={<>
+          <div style={{ width: 28, display: "flex", justifyContent: "center", flexShrink: 0 }}>
             {trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7 ? (
               <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a" }}>52W</span>
             ) : null}
           </div>
-          <div style={{ width: 28, display: "flex", justifyContent: "center" }}>
+          <div style={{ width: 28, display: "flex", justifyContent: "center", flexShrink: 0 }}>
             {trade.signal_fired?.length > 0 ? (
               <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: BLUE, letterSpacing: .3, padding: "1px 4px", background: "#0a1020", borderRadius: 3, border: "1px solid #1a2a40", textAlign: "center" }}>{trade.signal_fired.length}/9</span>
             ) : null}
           </div>
-          <div style={{ width: 28, display: "flex", justifyContent: "center" }}>
+          <div style={{ width: 28, display: "flex", justifyContent: "center", flexShrink: 0 }}>
             {trade.confluence_count > 0 ? (
               <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center" }}>{trade.confluence_count}/10</span>
             ) : null}
@@ -897,10 +939,8 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
               DONE
             </button>
           )}
-        </div>
-        {/* Col 5: empty */}
-        <div></div>
-      </div>
+        </>}
+      />
 
       {/* ── Expanded detail — 2-column grid ── */}
       {expanded && (
@@ -1071,12 +1111,12 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
       )}
       {expanded && <div style={{ borderTop: `1px solid ${rulingColor}`, margin: "0 12px" }} />}
       {/* ── Expand triangle — apex at col3 right edge = decimal position ── */}
-      <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", padding: "8px 12px 6px" }}>
+      <CardMetricGrid style={{ padding: "8px 12px 6px", alignItems: "start" }}>
         <div style={{ gridColumn: "1 / 3" }}></div>
         <SpineCell><SpineTriangle color={pnlColor} expanded={expanded} /></SpineCell>
         <div></div>
         <div></div>
-      </div>
+      </CardMetricGrid>
     </div>
   );
 }
@@ -2015,13 +2055,13 @@ export default function App() {
                   </div>
                 ) : (
                   <>
-                    <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", padding: `0 ${CARD_PAD_R} 5px ${CARD_PAD_L}` }}>
+                    <CardMetricGrid style={{ padding: `0 ${CARD_PAD_R} 5px ${CARD_PAD_L}` }}>
                       <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
                       <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center" }}>% Chg</div>
                       <SpineCell><div style={{ width: SPINE_VALUE_W, fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center", whiteSpace: "nowrap" }}>Move</div></SpineCell>
                       <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}></div>
                       <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right" }}>Conf</div>
-                    </div>
+                    </CardMetricGrid>
                     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                       {buyVisible.map(pick => (
                         <PickCard key={pick.ticker + "_l"} pick={pick} isLong={true}
@@ -2104,13 +2144,13 @@ export default function App() {
 
                 {/* ── Column header (shared for both sections) ── */}
                 {(sellTodayPositions.length > 0 || holdingPositions.length > 0) && (
-                  <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", padding: `0 ${CARD_PAD_R} 5px ${CARD_PAD_L}` }}>
+                  <CardMetricGrid style={{ padding: `0 ${CARD_PAD_R} 5px ${CARD_PAD_L}` }}>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center" }}>Day %</div>
                     <SpineCell><div style={{ width: SPINE_VALUE_W, fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center", whiteSpace: "nowrap" }}>Open P&L</div></SpineCell>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right", paddingRight: 0 }}>+$</div>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right" }}>Conf</div>
-                  </div>
+                  </CardMetricGrid>
                 )}
 
                 {/* ── Sell Today ── */}
