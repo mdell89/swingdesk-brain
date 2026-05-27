@@ -1,9 +1,16 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
 /*
- * Overnight Swing Desk — Frontend v31 (Push 45)
+ * Overnight Swing Desk — Frontend v32 (Push 46)
  * ══════════════════════════════════════════════
- * Changes in Push 45:
+ * Changes in Push 46:
+ *   - SettingsDrawer: Telegram bot info section — shows configured/not configured
+ *     provider label updates (Telegram vs Twilio) on notification toggle
+ *     setup instructions shown when Telegram not configured
+ *   - Stale threshold: 5 min regular hours, 10 min pre/post market
+ *     weekends never flagged as stale
+ *
+ * Push 45:
  *   - POS_GRID: MKT VALUE replaced with DAY % column, CONF fixed at 90px
  *     fixes +$ alignment offset caused by auto-expanding CONF column
  *   - PositionCard: DAY % shows day_change_percent from DB (monitor-written)
@@ -125,11 +132,12 @@ async function apiFetchWithFallback(path, fallbackPath = "/last-known") {
 }
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
-function confidenceColor(score) {
+function confidenceColor(score, theme) {
   if (score >= 85) return "#FFD700";
   if (score >= 75) return "#22c55e";
   if (score >= 65) return "#60a5fa";
-  return "#555";
+  // Below floor — muted but theme-aware
+  return theme === "navy" ? "#3a5570" : "#555";
 }
 
 function mapPickFields(pick) {
@@ -467,9 +475,10 @@ const METHOD_DEFINITIONS = {
   "Vol Squeeze": "Historical Volatility Ratio measures compression. When a stock's recent volatility shrinks relative to its 20-day average, it's coiling. Volatility compression historically precedes explosive directional moves — the tighter the squeeze, the stronger the breakout.",
 };
 
-function PickCard({ pick, isLong = true, expanded, onToggle }) {
+function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black", onAddToPersonal }) {
   const [expandedMethod, setExpandedMethod] = React.useState(null);
   const [glowing, setGlowing] = React.useState(false);
+  const [journalAdded, setJournalAdded] = React.useState(false);
   React.useEffect(() => {
     if (expanded) {
       const t = setTimeout(() => setGlowing(true), 50);
@@ -481,7 +490,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle }) {
   const confidence = isLong ? pick.lc : pick.sc;
   const estimatedMove = isLong ? pick.lm : pick.sm;
   const reasoningText = isLong ? pick.lr : pick.sr;
-  const borderColor = confidenceColor(confidence);
+  const borderColor = confidenceColor(confidence, themeKey);
   const dayChange = pick.dayChg || 0;
   const dayUp = dayChange >= 0;
   const cardKey = pick.ticker + "_" + (isLong ? "l" : "s");
@@ -489,33 +498,61 @@ function PickCard({ pick, isLong = true, expanded, onToggle }) {
   return (
     <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, overflow: "hidden", cursor: "pointer", borderLeft: `3px solid ${borderColor}` }}
       onClick={() => onToggle(cardKey)}>
-      <div style={{ display: "grid", gridTemplateColumns: PICK_GRID, gap: "0 4px", alignItems: "center", padding: "12px 12px 8px 10px" }}>
+      {/* Header row — POS_GRID: TICKER | % CHG | EST. MOVE | blank | CONF */}
+      <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", alignItems: "center", padding: "12px" }}>
         <div style={{ display: "flex", flexDirection: "column", justifyContent: "center" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
             <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 14, fontWeight: 600, color: T1, lineHeight: 1.2 }}>{pick.ticker}</span>
           </div>
           {pick.name && <span style={{ fontSize: 9, color: T3, lineHeight: 1.2, marginTop: 1 }}>{pick.name}</span>}
         </div>
-        <div style={{ fontSize: 11, fontWeight: 600, color: dayUp ? GREEN : RED }}>{dayUp ? "+" : ""}{dayChange.toFixed(1)}%</div>
-        <div style={{ fontSize: 13, fontWeight: 600, color: isLong ? GREEN : RED }}>{isLong ? "+" : "-"}{estimatedMove.toFixed(1)}%</div>
-        <div style={{ display: "inline-flex", flexDirection: "column", alignItems: "stretch" }}>
-          <div style={{ fontSize: 15, fontWeight: 700, color: borderColor, lineHeight: 1, fontFamily: "'DM Mono',monospace" }}>{confidence}%</div>
-          <div style={{ height: 2, background: borderColor + "44", borderRadius: 1, marginTop: 4 }}>
-            <div style={{ width: "100%", height: "100%", background: borderColor, borderRadius: 1 }} />
-          </div>
+        <div style={{ fontSize: 11, fontWeight: 600, color: dayUp ? GREEN : RED, textAlign: "center" }}>{dayUp ? "+" : ""}{dayChange.toFixed(1)}%</div>
+        <div style={{ fontSize: 12, fontWeight: 600, color: isLong ? GREEN : RED, fontFamily: "'DM Mono',monospace", textAlign: "right", paddingRight: 0 }}>{isLong ? "+" : "-"}{estimatedMove.toFixed(1)}%</div>
+        <div></div>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center", alignSelf: "center" }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: borderColor, lineHeight: 1, fontFamily: "'DM Mono',monospace" }}>{confidence}%</div>
         </div>
       </div>
-      {/* Tags row */}
-      {(pick.confluence_count > 0 || (pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7)) && (
-        <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 4, padding: "0 12px 5px" }}>
-          {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 && (
-            <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a" }}>52W</span>
-          )}
-          {pick.confluence_count > 0 && (
-            <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", minWidth: "2.8ch", textAlign: "center" }}>{pick.confluence_count}/10</span>
+
+      {/* Bottom row — POS_GRID: empty | empty | JOURNAL right-aligned | tag slots | empty */}
+      <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", alignItems: "center", padding: "0 12px 7px", borderBottom: `1px solid ${BORDER}` }}>
+        <div style={{ gridColumn: "1 / 3" }}></div>
+        {/* Col 3: JOURNAL right-aligned — right edge = col3 right = triangle spine */}
+        <div style={{ display: "flex", justifyContent: "flex-end" }}>
+          {onAddToPersonal && (
+            <button onClick={(e) => {
+              e.stopPropagation();
+              onAddToPersonal(pick);
+              setJournalAdded(true);
+              setTimeout(() => setJournalAdded(false), 1500);
+            }} style={{
+              background: journalAdded ? BLUE + "22" : "transparent",
+              border: `1px solid ${BLUE}55`,
+              borderRadius: 4,
+              color: journalAdded ? BLUE : BLUE + "99",
+              fontSize: 8, fontWeight: 700, letterSpacing: 0.5,
+              padding: "2px 6px", cursor: "pointer", transition: "all 0.2s"
+            }}>
+              {journalAdded ? "✓ ADDED" : "JOURNAL"}
+            </button>
           )}
         </div>
-      )}
+        {/* Col 4: tag slots */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 2 }}>
+          <div style={{ width: 28, display: "flex", justifyContent: "center" }}>
+            {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 ? (
+              <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a" }}>52W</span>
+            ) : null}
+          </div>
+          <div style={{ width: 28, display: "flex", justifyContent: "center" }}>
+            {pick.confluence_count > 0 ? (
+              <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center" }}>{pick.confluence_count}/10</span>
+            ) : null}
+          </div>
+        </div>
+        {/* Col 5: empty */}
+        <div></div>
+      </div>
       {expanded && (
         <div style={{ padding: "0 12px 12px", borderTop: `1px solid ${CARD_BORDER_LONG}` }}>
             {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 && (
@@ -548,6 +585,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle }) {
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
                   {pick.confluence_methods.map(m => (
                     <span key={m} onClick={(e) => { e.stopPropagation(); setExpandedMethod(expandedMethod === m ? null : m); }}
+                      className={glowing ? "tag-glow" : ""}
                       style={{ fontSize: 9, color: expandedMethod === m ? "#000" : "#ddd", background: expandedMethod === m ? "#ddd" : "#000", padding: "2px 6px", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer" }}>{m}</span>
                   ))}
                 </div>
@@ -581,11 +619,16 @@ function PickCard({ pick, isLong = true, expanded, onToggle }) {
             </div>
           </div>
       )}
-      {/* ── Expand triangle — always at physical bottom ── */}
-      <div style={{ display: "flex", justifyContent: "center", padding: "12px 0" }}>
-        <svg width="44" height="4" viewBox="0 0 44 4" style={{ transform: expanded ? "scaleY(-1)" : "none" }}>
-          <polygon points="22,4 2,0 42,0" fill={borderColor} />
-        </svg>
+      {/* ── Expand triangle — apex at col3 right edge = decimal position ── */}
+      <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", padding: "8px 12px 6px" }}>
+        <div style={{ gridColumn: "1 / 3" }}></div>
+        <div style={{ display: "flex", justifyContent: "flex-end" }}>
+          <svg width="44" height="4" viewBox="0 0 44 4" style={{ transform: expanded ? "scaleY(-1)" : "none" }}>
+            <polygon points="22,4 2,0 42,0" fill={borderColor} />
+          </svg>
+        </div>
+        <div></div>
+        <div></div>
       </div>
     </div>
   );
@@ -618,10 +661,11 @@ function PostCloseCard({ trade, onDismiss }) {
   );
 }
 
-function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClosed, onDone, onView, onClose, pdtRemaining = 3 }) {
+function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClosed, onDone, onView, onClose, pdtRemaining = 3, themeKey = "black", onAddToPersonal }) {
   const [expandedMethod, setExpandedMethod] = React.useState(null);
   const [expandedSignal, setExpandedSignal] = React.useState(null);
   const [glowing, setGlowing] = React.useState(false);
+  const [journalAdded, setJournalAdded] = React.useState(false);
   const longPressTimer = React.useRef(null);
 
   React.useEffect(() => {
@@ -671,16 +715,26 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
 
   const sentiment = getSentimentLabel(pnlPercent, frozenTarget, trade.sentiment_icon, pdtRemaining);
 
-  // Stale data detection — flag if last_price_updated is >5 min old during market hours
-  const isStale = (() => {
-    if (!trade.last_price_updated) return false;
+  // Stale data detection — flag if last_price_updated is >5 min old during regular hours
+  // or >10 min old during pre/post market (monitor runs every 5 min there)
+  const { isStale, staleTime } = (() => {
+    if (!trade.last_price_updated) return { isStale: false, staleTime: null };
     const now = new Date();
     const cst = new Date(now.toLocaleString("en-US", { timeZone: "America/Chicago" }));
     const h = cst.getHours(), wd = cst.getDay();
-    const marketOpen = wd >= 1 && wd <= 5 && h >= 8 && h < 15;
-    if (!marketOpen) return false;
+    if (wd === 0 || wd === 6) return { isStale: false, staleTime: null };
+    const regularHours = h >= 8 && h < 15;
+    const extendedHours = (h >= 4 && h < 8) || (h >= 15 && h < 20);
+    if (!regularHours && !extendedHours) return { isStale: false, staleTime: null };
+    const threshold = regularHours ? 5 * 60 * 1000 : 10 * 60 * 1000;
     const updated = new Date(trade.last_price_updated);
-    return (now - updated) > 5 * 60 * 1000;
+    const stale = (now - updated) > threshold;
+    const scanCst = new Date(updated.toLocaleString("en-US", { timeZone: "America/Chicago" }));
+    const hh = scanCst.getHours(), mm = scanCst.getMinutes();
+    const ampm = hh >= 12 ? "PM" : "AM";
+    const h12 = hh % 12 || 12;
+    const timeStr = `${h12}:${String(mm).padStart(2, "0")} ${ampm}`;
+    return { isStale: stale, staleTime: timeStr };
   })();
   const cardKey = trade.id || trade.ticker;
   const isRedCard = sentiment.label === "WEAK";
@@ -721,45 +775,61 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
         <div style={{ fontSize: 11, fontWeight: 600, color: (() => { const d = Number(trade.day_change_percent) || 0; return d > 0 ? GREEN : d < 0 ? RED : T3; })(), fontFamily: "'DM Mono',monospace", textAlign: "center" }}>
           {(() => { const d = Number(trade.day_change_percent) || 0; return `${d >= 0 ? "+" : ""}${d.toFixed(1)}%`; })()}
         </div>
-        <div style={{ fontSize: 12, fontWeight: 600, color: pnlColor, fontFamily: "'DM Mono',monospace", textAlign: "center" }}>{pnlPercent >= 0 ? "+" : ""}{Math.abs(pnlPercent) < 0.1 && pnlPercent !== 0 ? pnlPercent.toFixed(2) : pnlPercent.toFixed(1)}%</div>
+        <div style={{ fontSize: 12, fontWeight: 600, color: pnlColor, fontFamily: "'DM Mono',monospace", textAlign: "right", paddingRight: 0 }}>{pnlPercent >= 0 ? "+" : ""}{Math.abs(pnlPercent) < 0.1 && pnlPercent !== 0 ? pnlPercent.toFixed(2) : pnlPercent.toFixed(1)}%</div>
         <div style={{ fontSize: 13, fontWeight: 700, color: pnlColor, fontFamily: "'DM Mono',monospace", textAlign: "right", paddingRight: 6 }}>{pnlDollars >= 0 ? "+" : "-"}${Math.abs(pnlDollars).toFixed(2)}</div>
-        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end" }}>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center", alignSelf: "center" }}>
           {confDelta === 0 ? (
-            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 13, fontWeight: 700, color: confidenceColor(lockInConfidence), lineHeight: 1 }}>{lockInConfidence}%</div>
+            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 13, fontWeight: 700, color: confidenceColor(lockInConfidence, themeKey), lineHeight: 1 }}>{lockInConfidence}%</div>
           ) : (
             <div style={{ display: "flex", alignItems: "center", gap: 2, fontFamily: "'DM Mono',monospace", lineHeight: 1 }}>
-              <span style={{ fontSize: 11, fontWeight: 600, color: confidenceColor(lockInConfidence) }}>{lockInConfidence}%</span>
+              <span style={{ fontSize: 13, fontWeight: 700, color: confidenceColor(lockInConfidence, themeKey) }}>{lockInConfidence}%</span>
               <span style={{ fontSize: 9, color: confDeltaColor, margin: "0 1px" }}>→</span>
-              <span style={{ fontSize: 13, fontWeight: 700, color: confidenceColor(dynamicConfidence) }}>{dynamicConfidence}%</span>
+              <span style={{ fontSize: 13, fontWeight: 700, color: confidenceColor(dynamicConfidence, themeKey) }}>{dynamicConfidence}%</span>
             </div>
           )}
-          <div style={{ width: "100%", height: 2, background: confidenceColor(dynamicConfidence) + "44", borderRadius: 1, marginTop: 3 }}>
-            <div style={{ width: `${Math.min(dynamicConfidence, 100)}%`, height: "100%", background: confidenceColor(dynamicConfidence), borderRadius: 1 }} />
-          </div>
         </div>
       </div>
 
       {/* ── Sentiment row ── */}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 12px 5px", paddingTop: 5, borderBottom: `1px solid ${rulingColor}` }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+      <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", alignItems: "center", padding: "0 12px 5px", paddingTop: 5, borderBottom: `1px solid ${rulingColor}` }}>
+        {/* Col 1+2: HOLD/WEAK label + phrase + stale tag */}
+        <div style={{ gridColumn: "1 / 3", display: "flex", alignItems: "center", gap: 6 }}>
           <span style={{ fontSize: 10, fontWeight: 800, color: sentiment.color, letterSpacing: .5 }}>{sentiment.label}</span>
           <span style={{ fontSize: 9, color: T2 }}>{sentiment.phrase}</span>
-          {isStale && <span style={{ fontSize: 7, fontWeight: 700, color: AMBER, padding: "1px 4px", background: "#1a1200", borderRadius: 3, border: `1px solid ${AMBER}44`, letterSpacing: .3 }}>⚠ stale</span>}
+          {isStale && staleTime && <span style={{ fontSize: 7, fontWeight: 700, color: AMBER, padding: "1px 4px", background: "#1a1200", borderRadius: 3, border: `1px solid ${AMBER}44`, letterSpacing: .3 }}>scanned {staleTime}</span>}
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-          {/* Slot 1: 52W — green */}
+        {/* Col 3: JOURNAL right-aligned — right edge = col3 right = triangle spine */}
+        <div style={{ display: "flex", justifyContent: "flex-end" }}>
+          {onAddToPersonal && (
+            <button onClick={(e) => {
+              e.stopPropagation();
+              onAddToPersonal(trade);
+              setJournalAdded(true);
+              setTimeout(() => setJournalAdded(false), 1500);
+            }} style={{
+              background: journalAdded ? BLUE + "22" : "transparent",
+              border: `1px solid ${BLUE}55`,
+              borderRadius: 4,
+              color: journalAdded ? BLUE : BLUE + "99",
+              fontSize: 8, fontWeight: 700, letterSpacing: 0.5,
+              padding: "2px 6px", cursor: "pointer", flexShrink: 0, transition: "all 0.2s"
+            }}>
+              {journalAdded ? "✓ ADDED" : "JOURNAL"}
+            </button>
+          )}
+        </div>
+        {/* Col 4: tag slots */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 2 }}>
           <div style={{ width: 28, display: "flex", justifyContent: "center" }}>
             {trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7 ? (
               <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a" }}>52W</span>
             ) : null}
           </div>
-          {/* Slot 2: signal indicators fired count — blue */}
           <div style={{ width: 28, display: "flex", justifyContent: "center" }}>
             {trade.signal_fired?.length > 0 ? (
               <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: BLUE, letterSpacing: .3, padding: "1px 4px", background: "#0a1020", borderRadius: 3, border: "1px solid #1a2a40", textAlign: "center" }}>{trade.signal_fired.length}/9</span>
             ) : null}
           </div>
-          {/* Slot 3: confluence methods count — white/black */}
           <div style={{ width: 28, display: "flex", justifyContent: "center" }}>
             {trade.confluence_count > 0 ? (
               <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center" }}>{trade.confluence_count}/10</span>
@@ -772,6 +842,8 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
             </button>
           )}
         </div>
+        {/* Col 5: empty */}
+        <div></div>
       </div>
 
       {/* ── Expanded detail — 2-column grid ── */}
@@ -780,6 +852,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 12px" }}>
             {[
               ["Entry price", `$${buyPrice.toFixed(2)}`],
+              ["Current price", (() => { const cp = trade.current_value && investedAmount > 0 ? (trade.current_value / investedAmount) * buyPrice : null; return cp ? `$${cp.toFixed(2)}` : "—"; })()],
               ["Sector", trade.sector],
               ["Opened", formatDate(trade.buy_date)],
               ["Held", `${daysHeld(trade.buy_date)}d`],
@@ -941,11 +1014,16 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
         </div>
       )}
       {expanded && <div style={{ borderTop: `1px solid ${rulingColor}`, margin: "0 12px" }} />}
-      {/* ── Expand triangle — always at physical bottom ── */}
-      <div style={{ display: "flex", justifyContent: "center", padding: "12px 0" }}>
-        <svg width="44" height="4" viewBox="0 0 44 4" style={{ transform: expanded ? "scaleY(-1)" : "none" }}>
-          <polygon points="22,4 2,0 42,0" fill={pnlColor} />
-        </svg>
+      {/* ── Expand triangle — apex at col3 right edge = decimal position ── */}
+      <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", padding: "8px 12px 6px" }}>
+        <div style={{ gridColumn: "1 / 3" }}></div>
+        <div style={{ display: "flex", justifyContent: "flex-end" }}>
+          <svg width="44" height="4" viewBox="0 0 44 4" style={{ transform: expanded ? "scaleY(-1)" : "none" }}>
+            <polygon points="22,4 2,0 42,0" fill={pnlColor} />
+          </svg>
+        </div>
+        <div></div>
+        <div></div>
       </div>
     </div>
   );
@@ -1123,12 +1201,10 @@ function TickerBanner({ openPositions }) {
 }
 
 // ─── THEME TOGGLE ─────────────────────────────────────────────────────────────
-function ThemeToggle({ themeKey, onToggle }) {
-  // Single unified SVG — ring and sphere in one object.
-  // No containers, no nested elements, no flexbox centering needed.
-  // The ring and sphere are drawn at exact pixel coordinates within a 22x22 square viewBox.
+function ThemeToggle({ themeKey, onToggle, T3: t3Color }) {
   const isNavy = themeKey === "navy";
   const gradId = isNavy ? "sphereNavy" : "sphereBlack";
+  const ringColor = t3Color || (isNavy ? "#5a7a96" : "#777");
   return (
     <div onClick={onToggle} style={{ cursor: "pointer", flexShrink: 0, lineHeight: 0 }} title={`Theme: ${themeKey}`}>
       <svg width="22" height="22" viewBox="0 0 22 22" style={{ verticalAlign: "middle", display: "block" }}>
@@ -1145,7 +1221,7 @@ function ThemeToggle({ themeKey, onToggle }) {
             </>}
           </radialGradient>
         </defs>
-        <circle cx="11" cy="11" r="10" stroke={BORDER} strokeWidth="1" fill="none"/>
+        <circle cx="11" cy="11" r="10" stroke={ringColor} strokeWidth="1" fill="none"/>
         <circle cx="11" cy="11" r="6.5" fill={`url(#${gradId})`}/>
       </svg>
     </div>
@@ -1167,14 +1243,15 @@ function SettingsIcon({ color }) {
 function SettingsDrawer({ open, onClose, T1, T2, T3, BORDER, BG, CARD, GREEN, BLUE, AMBER }) {
   const API = "https://swingdesk-brain-production-205e.up.railway.app";
   const [notifyOn, setNotifyOn] = React.useState(true);
-  const [testStatus, setTestStatus] = React.useState(null); // null | "sending" | "sent" | "error"
+  const [testStatus, setTestStatus] = React.useState(null);
   const [loaded, setLoaded] = React.useState(false);
+  const [settings, setSettings] = React.useState({});
 
   React.useEffect(() => {
     if (open && !loaded) {
       fetch(`${API}/api/notification-settings`)
         .then(r => r.json())
-        .then(d => { setNotifyOn(d.notify_on_close !== false); setLoaded(true); })
+        .then(d => { setNotifyOn(d.notify_on_close !== false); setSettings(d); setLoaded(true); })
         .catch(() => setLoaded(true));
     }
   }, [open]);
@@ -1203,6 +1280,9 @@ function SettingsDrawer({ open, onClose, T1, T2, T3, BORDER, BG, CARD, GREEN, BL
     setTimeout(() => setTestStatus(null), 4000);
   };
 
+  const provider = settings.provider || "twilio";
+  const telegramConfigured = settings.telegram_configured;
+
   if (!open) return null;
   return (
     <>
@@ -1216,11 +1296,28 @@ function SettingsDrawer({ open, onClose, T1, T2, T3, BORDER, BG, CARD, GREEN, BL
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px", background: BG, borderRadius: 10, border: `1px solid ${BORDER}`, marginBottom: 8 }}>
           <div>
             <div style={{ fontSize: 13, color: T1, fontWeight: 500 }}>Notify when a position closes</div>
-            <div style={{ fontSize: 10, color: T3, marginTop: 2 }}>SMS via Twilio — cut, force close, or reversal</div>
+            <div style={{ fontSize: 10, color: T3, marginTop: 2 }}>
+              {provider === "telegram" ? "via Telegram bot" : "SMS via Twilio"} — cut, force close, or reversal
+            </div>
           </div>
           <div onClick={toggle} style={{ cursor: "pointer", width: 44, height: 24, borderRadius: 12, background: notifyOn ? GREEN : BORDER, transition: "background 0.2s", position: "relative", flexShrink: 0, marginLeft: 12 }}>
             <div style={{ position: "absolute", top: 2, left: notifyOn ? 22 : 2, width: 20, height: 20, borderRadius: "50%", background: "#fff", transition: "left 0.2s" }}/>
           </div>
+        </div>
+
+        {/* Telegram setup info */}
+        <div style={{ padding: "10px 12px", background: BG, borderRadius: 10, border: `1px solid ${telegramConfigured ? BLUE + "44" : BORDER}`, marginBottom: 8 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ fontSize: 12, color: T1, fontWeight: 500 }}>Telegram Bot</div>
+            <div style={{ fontSize: 10, fontWeight: 600, color: telegramConfigured ? GREEN : T3 }}>
+              {telegramConfigured ? "✓ configured" : "not configured"}
+            </div>
+          </div>
+          {!telegramConfigured && (
+            <div style={{ fontSize: 10, color: T3, marginTop: 4, lineHeight: 1.5 }}>
+              To enable: message @BotFather on Telegram, create a bot, then add TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID + NOTIFY_PROVIDER=telegram to Railway env vars.
+            </div>
+          )}
         </div>
 
         {/* Test button */}
@@ -1283,10 +1380,20 @@ export default function App() {
   const [lastScan, setLastScan] = useState(null);
   const [totalScanned, setTotalScanned] = useState(0);
   const [queueStatus, setQueueStatus] = useState(null);
+  const [openExecution, setOpenExecution] = useState(null);
+  const [recoveringOpen, setRecoveringOpen] = useState(false);
 
   const [tab, setTab] = useState("today");
   const [tabLoading, setTabLoading] = useState(false);
   const [longSub, setLongSub] = useState("buy");
+  const [closedTab, setClosedTab] = useState("all");
+  const [analyticsPage, setAnalyticsPage] = useState("performance"); // performance | closed
+  const [portfolioTab, setPortfolioTab] = useState("brain"); // brain | neural | personal
+  const [nnPositions, setNnPositions] = useState([]);
+  const [nnPicks, setNnPicks] = useState({ recommended_longs: [], recommended_shorts: [] });
+  const [nnStats, setNnStats] = useState(null);
+  const [personalTrades, setPersonalTrades] = useState([]);
+  const [addingToPersonal, setAddingToPersonal] = useState({});
   const [sortMode, setSortMode] = useState("smart");
   const SORT_OPTIONS = [
     { id: "smart",      label: "Smart"      },
@@ -1312,6 +1419,53 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [showNetInfo, setShowNetInfo] = useState(false);
 
+
+  const handleAddToPersonal = async (item, sourcePortfolio = "brain") => {
+    const ticker = item.ticker || item.pick?.ticker;
+    if (!ticker || addingToPersonal[ticker]) return;
+    setAddingToPersonal(prev => ({ ...prev, [ticker]: true }));
+    try {
+      const body = {
+        ticker,
+        direction: item.direction || "long",
+        buy_price: item.buy_price || item.price || 0,
+        invested_amount: item.invested_amount || 10,
+        sector: item.sector,
+        source_portfolio: sourcePortfolio,
+      };
+      const result = await apiFetch("/personal-trades/add", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (result.success) {
+        const fresh = await apiFetch("/personal-trades").catch(() => []);
+        setPersonalTrades(fresh);
+      }
+    } catch {}
+    setAddingToPersonal(prev => ({ ...prev, [ticker]: false }));
+  };
+
+  const recoverMissedOpen = async () => {
+    if (recoveringOpen) return;
+    setRecoveringOpen(true);
+    try {
+      const result = await apiFetch("/recover-missed-open", { method: "POST" });
+      setOpenExecution(result);
+      const [positions, perfData, statsData] = await Promise.all([
+        apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
+        apiFetch("/perf-history").catch(() => []),
+        apiFetch("/stats").catch(() => null),
+      ]);
+      setOpenPositions(positions);
+      if (statsData?.open_execution) setOpenExecution(statsData.open_execution);
+      if (statsData?.queue) setQueueStatus(statsData.queue);
+      buildPerfHistory(perfData, positions);
+    } catch (error) {
+      setOpenExecution(prev => ({ ...(prev || {}), last_error: error.message }));
+    }
+    setRecoveringOpen(false);
+  };
   // ── Initial data load ──
   useEffect(() => {
     (async () => {
@@ -1335,13 +1489,18 @@ export default function App() {
         apiFetch("/ping").catch(() => {});
 
         // Fire all requests in parallel
-        const [picksData, positions, statsData, runnersData, perfData, closedData] = await Promise.all([
+        const [picksData, positions, statsData, runnersData, perfData, closedData,
+               nnPicksData, nnPositionsData, nnStatsData, personalData] = await Promise.all([
           apiFetch("/picks").catch(() => ({ longs: [], shorts: [] })),
           apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
           apiFetch("/stats").catch(() => ({})),
           apiFetch("/extended-runners").catch(() => []),
           apiFetch("/perf-history").catch(() => []),
           apiFetch("/today-closed").catch(() => []),
+          apiFetch("/nn-picks").catch(() => ({ recommended_longs: [], recommended_shorts: [] })),
+          apiFetch("/nn-positions").catch(() => []),
+          apiFetch("/nn-stats").catch(() => null),
+          apiFetch("/personal-trades").catch(() => []),
         ]);
 
         // Auto-backfill lock_in_confidence for existing trades silently
@@ -1358,9 +1517,14 @@ export default function App() {
         setWeights(statsData.weights || {});
         setLastAudit(statsData.last_audit || null);
         setQueueStatus(statsData.queue || null);
+        setOpenExecution(statsData.open_execution || null);
         setPdtUsed(statsData.pdt_used || 0);
         setPdtRemaining(statsData.pdt_remaining ?? 3);
         buildPerfHistory(perfData, positions);
+        setNnPicks(nnPicksData || { recommended_longs: [], recommended_shorts: [] });
+        setNnPositions(nnPositionsData || []);
+        setNnStats(nnStatsData);
+        setPersonalTrades(personalData || []);
 
         setLoadStatus("Ready"); setLoadProgress(100);
       } catch (error) {
@@ -1439,13 +1603,15 @@ export default function App() {
   useEffect(() => {
     const interval = setInterval(async () => {
       try {
-        const [positions, perfData, closedData] = await Promise.all([
+        const [positions, perfData, closedData, statsData] = await Promise.all([
           apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
           apiFetch("/perf-history").catch(() => []),
           apiFetch("/today-closed").catch(() => []),
+          apiFetch("/stats").catch(() => null),
         ]);
         setOpenPositions(positions);
         setTodayClosed(closedData || []);
+        if (statsData?.open_execution) setOpenExecution(statsData.open_execution);
         buildPerfHistory(perfData, positions);
       } catch {}
     }, 2.5 * 60 * 1000);
@@ -1461,21 +1627,31 @@ export default function App() {
   const openLongPositions = openPositions.filter(t => t.direction === "long" && t.outcome === "open");
   const openShortPositions = openPositions.filter(t => t.direction === "short" && t.outcome === "open");
 
-  // On weekends all positions show under "Bought" tab (market closed, nothing to sell today)
-  // On trading days "Sell today" shows positions opened before today (held overnight)
   const isWeekendNow = (() => { const d = new Date().getDay(); return d === 0 || d === 6; })();
-  const longSellList = isWeekendNow ? [] : openPositions.filter(t => t.buy_date < today && t.outcome === "open" && t.direction === "long");
+  // Sell Today = previous session positions (buy_date < today), active on trading days
+  const sellTodayPositions = isWeekendNow ? openLongPositions : openLongPositions.filter(t => t.buy_date < today);
+  // Holding = current session positions (opened today)
+  const holdingPositions = openLongPositions.filter(t => t.buy_date === today);
+  // Keep for legacy compat
+  const longSellList = sellTodayPositions;
   const shortCoverList = isWeekendNow ? [] : openPositions.filter(t => t.buy_date < today && t.outcome === "open" && t.direction === "short");
+
+  // Recently closed = closed positions not yet dismissed, within 30 days
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString().split("T")[0];
+  const recentlyClosed = openPositions.filter(t =>
+    t.outcome !== "open" &&
+    !dismissedClosed[t.id] &&
+    (t.sell_date == null || t.sell_date >= thirtyDaysAgo)
+  );
 
   // Sort positions: CUT first (worst P&L), then rest by P&L descending
   function getSentimentPriority(trade) {
     const pnl = trade.current_pnl_percent || 0;
     const icon = trade.sentiment_icon;
-    // Post-close cards always float to top
     if (trade.is_post_close) return -1;
-    if (icon === "x") return 0;  // CUT
-    if (pnl < 0) return 2;       // WEAK
-    return 1;                     // HOLD
+    if (icon === "x") return 0;
+    if (pnl < 0) return 2;
+    return 1;
   }
 
   function sortPositions(positions) {
@@ -1492,7 +1668,6 @@ export default function App() {
       default:          return arr.sort((a, b) => {
         const ap = getSentimentPriority(a), bp = getSentimentPriority(b);
         if (ap !== bp) return ap - bp;
-        // Within same sentiment group: confidence descending, then P&L descending
         const confDiff = (b.confidence || 0) - (a.confidence || 0);
         if (confDiff !== 0) return confDiff;
         return (b.current_pnl_percent || 0) - (a.current_pnl_percent || 0);
@@ -1500,6 +1675,8 @@ export default function App() {
     }
   }
 
+  const sortedSellToday = sortPositions(sellTodayPositions);
+  const sortedHolding = sortPositions(holdingPositions);
   const sortedLongPositions = sortPositions(openLongPositions);
   const sortedShortPositions = sortPositions(openShortPositions);
 
@@ -1514,7 +1691,11 @@ export default function App() {
   }, 0);
 
   const resolved = predictions.filter(p => p.outcome !== "pending");
-  const winRate = resolved.length > 0 ? Math.round(resolved.filter(p => p.outcome === "hit").length / resolved.length * 100) : null;
+  // Single source of truth: win rate from virtual_trades closed outcomes only
+  const _closedForWinRate = virtualTrades.filter(t => t.outcome !== "open");
+  const winRate = _closedForWinRate.length > 0
+    ? Math.round(_closedForWinRate.filter(t => t.outcome === "hit").length / _closedForWinRate.length * 100)
+    : null;
 
   // Portfolio balance = last closed balance + unrealized P&L
   const tradingPerfPoints = perfHistory.filter(p => {
@@ -1589,6 +1770,26 @@ export default function App() {
       {/* ════════ TODAY TAB ════════ */}
       {tab === "today" && (
         <div className="fadeIn">
+
+          {/* ── Portfolio Tab Bar: Brain | Neural | Personal ── */}
+          <div style={{ display: "flex", gap: 4, padding: "10px 16px 0", marginBottom: 2 }}>
+            {[
+              ["brain",    "Brain",    BLUE],
+              ["neural",   "Neural",   "#a78bfa"],
+              ["personal", "Personal", AMBER],
+            ].map(([id, label, color]) => (
+              <button key={id} onClick={() => setPortfolioTab(id)} style={{
+                flex: 1, padding: "7px 0", borderRadius: 8, fontSize: 11, fontWeight: 700,
+                border: `1px solid ${portfolioTab === id ? color + "66" : BORDER}`,
+                cursor: "pointer", letterSpacing: .4, transition: ".15s",
+                background: portfolioTab === id ? color + "18" : "transparent",
+                color: portfolioTab === id ? color : T3,
+              }}>{label}</button>
+            ))}
+          </div>
+
+          {/* ── BRAIN PORTFOLIO ── */}
+          {portfolioTab === "brain" && <div>
           <div style={{ padding: "10px 16px 14px" }}>
             {/* SwingDesk Brain row — evenly spaced across full width */}
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, minHeight: 24 }}>
@@ -1608,7 +1809,7 @@ export default function App() {
                   {feeAdjusted ? "● Net view" : "○ Net view"}
                 </button>
                 <div style={{ flex: 1, display: "flex", justifyContent: "center", alignItems: "center" }}>
-                  <ThemeToggle themeKey={themeKey} onToggle={() => setThemeKey(k => k === "black" ? "navy" : "black")} />
+                  <ThemeToggle themeKey={themeKey} onToggle={() => setThemeKey(k => k === "black" ? "navy" : "black")} T3={T3} />
                 </div>
                 <div onClick={() => setSettingsOpen(true)} style={{ cursor: "pointer", flexShrink: 0, lineHeight: 0 }}>
                   <SettingsIcon color={T3} />
@@ -1634,6 +1835,7 @@ export default function App() {
                   <div style={{ textAlign: "right", lineHeight: 1 }}>
                     <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&L</div>
                     <div style={{ fontSize: 16, fontWeight: 600, color: dayUp2 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{dayUp2 ? "+" : ""}${dayPnl.toFixed(2)}</div>
+                    <div style={{ fontSize: 8, color: T3, marginTop: 3 }}>age: {Math.floor((Date.now() - new Date("2026-05-22T00:00:00").getTime()) / 86400000)}d</div>
                   </div>
                 );
               })()}
@@ -1657,20 +1859,43 @@ export default function App() {
 
           {/* METRIC STRIP */}
           <div style={{ display: "flex", gap: 8, padding: "0 16px 14px" }}>
-            <div style={{ flex: 1, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 12px" }}>
-              <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 4 }}>Live P&L</div>
+            <div style={{ flex: 1, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
+              <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Live P&L</div>
               <div style={{ fontSize: 16, fontWeight: 600, color: livePnl >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{livePnl >= 0 ? "+" : ""}${Math.abs(feeAdjusted ? livePnl - openPositions.filter(t=>t.outcome==="open").length * 0.02 : livePnl).toFixed(2)}</div>
             </div>
-            <div style={{ flex: 1, background: CARD, border: `1px solid ${pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : BORDER}`, borderRadius: 10, padding: "10px 12px" }}>
-              <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 4 }}>Day trades</div>
-              <div style={{ fontSize: 16, fontWeight: 600, color: pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : GREEN, fontFamily: "'DM Mono',monospace" }}>{pdtUsed}/3</div>
-              <div style={{ fontSize: 8, color: pdtRemaining === 0 ? RED : T3, marginTop: 2 }}>{pdtRemaining === 0 ? "limit reached" : `${pdtRemaining} left`}</div>
+            <div style={{ flex: 1, background: CARD, border: `1px solid ${pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
+              <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Day trades</div>
+              <div style={{ display: "flex", alignItems: "baseline", gap: 4 }}>
+                <span style={{ fontSize: 16, fontWeight: 600, color: pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : GREEN, fontFamily: "'DM Mono',monospace" }}>{pdtUsed}/3</span>
+                <span style={{ fontSize: 8, color: pdtRemaining === 0 ? RED : T3 }}>{pdtRemaining === 0 ? "limit reached" : `${pdtRemaining} left`}</span>
+              </div>
             </div>
-            <div style={{ flex: 1, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 12px" }}>
-              <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 4 }}>Open</div>
+            <div style={{ flex: 1, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
+              <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Open</div>
               <div style={{ fontSize: 16, fontWeight: 600, color: openPositions.length > 0 ? GREEN : T2 }}>{openPositions.filter(t => t.outcome === "open").length}</div>
             </div>
           </div>
+
+          {openExecution?.missed_open_alert && (
+            <div style={{ margin: "0 16px 10px", background: "#1a0f05", border: `1px solid ${AMBER}66`, borderRadius: 8, padding: "9px 10px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 10, color: AMBER, fontWeight: 800, textTransform: "uppercase", letterSpacing: .5 }}>Open execution missed</div>
+                <div style={{ fontSize: 9, color: T2, marginTop: 2 }}>
+                  {openExecution.cached_pick_count_live || openExecution.cached_pick_count || 0} picks, {openExecution.open_position_count_live || 0} open
+                </div>
+              </div>
+              <button onClick={recoverMissedOpen} disabled={recoveringOpen}
+                style={{ background: AMBER + "22", border: `1px solid ${AMBER}77`, color: AMBER, borderRadius: 5, padding: "5px 8px", fontSize: 9, fontWeight: 800, cursor: recoveringOpen ? "default" : "pointer", whiteSpace: "nowrap", opacity: recoveringOpen ? .7 : 1 }}>
+                {recoveringOpen ? "OPENING..." : "RECOVER"}
+              </button>
+            </div>
+          )}
+
+          {!openExecution?.missed_open_alert && openExecution?.last_error && (
+            <div style={{ margin: "0 16px 10px", background: "#160909", border: `1px solid ${RED}55`, borderRadius: 8, padding: "8px 10px", fontSize: 9, color: RED }}>
+              Open execution issue: {openExecution.last_error}
+            </div>
+          )}
 
           {/* CONFIDENCE LEGEND */}
           <div style={{ margin: "0 16px 10px", background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 14px" }}>
@@ -1686,11 +1911,11 @@ export default function App() {
 
 
 
-          {/* SUB TOGGLE — Buy/Sell + Sort */}
+          {/* SUB TOGGLE — Picks/Open + Sort */}
           <div style={{ display: "flex", margin: "0 16px 12px", gap: 4, alignItems: "stretch" }}>
             {[
-              ["buy", `Bought (${openLongPositions.length})`, BLUE, "#0f1e35", `1px solid ${BLUE}44`],
-              ["sell", `Sell (${longSellList.length})`, GREEN, "#091a0d", `1px solid ${GREEN}44`]
+              ["buy", `Picks (${allBuyPicks.length})`, BLUE, "#0f1e35", `1px solid ${BLUE}44`],
+              ["sell", `Open (${openLongPositions.length})`, GREEN, "#091a0d", `1px solid ${GREEN}44`]
             ].map(([id, label, color, activeBg, border]) => (
               <button key={id} onClick={() => setLongSub(id)} style={{
                 flex: 1, padding: "7px 0", borderRadius: 6, fontSize: 11, fontWeight: 600,
@@ -1726,107 +1951,274 @@ export default function App() {
           {/* CONTENT AREA */}
           <div style={{ padding: "0 16px" }}>
 
-            {/* LONGS > BUY TODAY */}
+            {/* PICKS TAB */}
             {longSub === "buy" && (
               <>
-                {/* Today's closed positions — shown above open positions with DONE button */}
-                {todayClosed.filter(t => !dismissedClosed[t.id]).length > 0 && (
-                  <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 8 }}>
-                    <div style={{ fontSize: 9, color: T3, textTransform: "uppercase", letterSpacing: .5, padding: "4px 0 2px" }}>Closed today</div>
-                    {todayClosed.filter(t => !dismissedClosed[t.id]).map(trade => {
-                      const pnlPct = trade.actual_move || 0;
-                      const gross = trade.gross_pnl || 0;
-                      const pnlColor = pnlPct >= 0 ? GREEN : RED;
-                      const typeColor = trade.outcome_type === "cut" ? RED : trade.outcome_type === "force" ? AMBER : trade.outcome_type === "profit" ? GREEN : RED;
-                      return (
-                        <div key={trade.id} style={{ display: "flex", alignItems: "center", padding: "8px 12px", gap: 8, background: CARD, borderRadius: 10, border: `1px solid ${BORDER}`, borderLeft: `3px solid ${typeColor}` }}>
-                          <div style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0 }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                              <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 13, fontWeight: 600, color: T1 }}>{trade.ticker}</span>
-                              <span style={{ fontSize: 8, fontWeight: 700, color: typeColor, textTransform: "uppercase", letterSpacing: .4 }}>{trade.outcome_label}</span>
-                            </div>
-                            <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 2 }}>
-                              <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, fontWeight: 600, color: pnlColor }}>{pnlPct >= 0 ? "+" : ""}{pnlPct.toFixed(1)}%</span>
-                              <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: pnlColor }}>{gross >= 0 ? "+" : ""}${Math.abs(gross).toFixed(2)}</span>
-                              {trade.sell_time && <span style={{ fontSize: 9, color: T3 }}>{trade.sell_time?.slice(0,5)}</span>}
-                            </div>
-                          </div>
-                          <button onClick={() => setDismissedClosed(prev => ({ ...prev, [trade.id]: true }))}
-                            style={{ background: "#222", border: `1px solid #444`, borderRadius: 4, color: "#ccc", fontSize: 9, fontWeight: 700, letterSpacing: 0.5, padding: "3px 10px", cursor: "pointer", flexShrink: 0 }}>
-                            DONE
-                          </button>
-                        </div>
-                      );
-                    })}
+                {allBuyPicks.length === 0 ? (
+                  <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 20, fontSize: 13, color: T3, textAlign: "center" }}>
+                    {portfolioTab === "neural" ? "Neural picks will appear after the NN scan runs." : "No picks yet — pre-market scan runs from 4–8:15 AM CST."}
                   </div>
-                )}
-                <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", padding: `0 ${CARD_PAD_R} 5px ${CARD_PAD_L}` }}>
-                  <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
-                  <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center" }}>Day %</div>
-                  <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center" }}>Open P&L</div>
-                  <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right" }}>+$</div>
-                  <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right" }}>Conf</div>
-                </div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  {sortedLongPositions.map(trade => <PositionCard key={trade.id} trade={trade} isLong={true}
-                    expanded={expandedCards[trade.id || trade.ticker]}
-                    isDone={doneCuts[trade.id || trade.ticker] === "done"}
-                    isClosed={doneCuts[trade.id || trade.ticker] === "closed"}
-                    pdtRemaining={pdtRemaining}
-                    onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
-                    onDone={key => { setDoneCuts(prev => ({ ...prev, [key]: "done" })); setExpandedCards(prev => ({ ...prev, [key]: false })); }}
-                    onView={key => { setDoneCuts(prev => ({ ...prev, [key]: "open" })); }}
-                    onClose={key => setDoneCuts(prev => ({ ...prev, [key]: "closed" }))}
-                  />)}
-                  {buyVisible.length > 0 && sortedLongPositions.length > 0 && (
-                    <>
-                      <div style={{ textAlign: "center", fontSize: 9, color: T3, textTransform: "uppercase", letterSpacing: .5, padding: "8px 0 4px" }}>Recommendations</div>
-                      <div style={{ height: 1, background: BORDER, margin: "0 0 6px" }} />
-                    </>
-                  )}
-                  {buyVisible.length > 0 && (
-                    <div style={{ display: "grid", gridTemplateColumns: PICK_GRID, gap: "0 4px", padding: "0 12px 4px 12px" }}>
-                      <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
-                      <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>% Chg</div>
-                      <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Est. move</div>
-                      <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right" }}>Conf</div>
-                    </div>
-                  )}
-                  {buyVisible.map(pick => (
-                    <PickCard key={pick.ticker + "_l"} pick={pick} isLong={true}
-                      expanded={expandedCards[pick.ticker + "_l"]}
-                      onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))} />
-                  ))}
-                  <ExpandButton isExpanded={buyListExpanded} onToggle={() => setBuyListExpanded(e => !e)} totalCount={allBuyPicks.length} label="picks" />
-                </div>
-              </>
-            )}
-
-            {/* LONGS > SELL TODAY */}
-            {longSub === "sell" && (
-              <>
-                {longSellList.length === 0 ? (
-                  <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 20, fontSize: 13, color: T3, textAlign: "center" }}>No positions to sell today.</div>
                 ) : (
                   <>
                     <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", padding: `0 ${CARD_PAD_R} 5px ${CARD_PAD_L}` }}>
                       <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
-                      <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center" }}>Day %</div>
-                      <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center" }}>Open P&L</div>
-                      <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right" }}>+$</div>
+                      <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center" }}>% Chg</div>
+                      <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right", paddingRight: 0, whiteSpace: "nowrap" }}>Move</div>
+                      <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}></div>
                       <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right" }}>Conf</div>
                     </div>
                     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                      {sellVisible.map(trade => <PositionCard key={trade.id} trade={trade} isLong={true} pdtRemaining={pdtRemaining} expanded={expandedCards[trade.id]} onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))} />)}
-                      <ExpandButton isExpanded={sellListExpanded} onToggle={() => setSellListExpanded(e => !e)} totalCount={longSellList.length} label="positions" />
+                      {buyVisible.map(pick => (
+                        <PickCard key={pick.ticker + "_l"} pick={pick} isLong={true}
+                          expanded={expandedCards[pick.ticker + "_l"]}
+                          themeKey={themeKey}
+                          onAddToPersonal={pick => handleAddToPersonal(pick, "brain")}
+                          onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))} />
+                      ))}
+                      <ExpandButton isExpanded={buyListExpanded} onToggle={() => setBuyListExpanded(e => !e)} totalCount={allBuyPicks.length} label="picks" />
                     </div>
                   </>
                 )}
               </>
             )}
 
+            {/* OPEN TAB */}
+            {longSub === "sell" && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
+
+                {/* ── Recently Closed (top, no label, vanishes when empty) ── */}
+                {recentlyClosed.length > 0 && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 12 }}>
+                    {recentlyClosed.map(trade => {
+                      const pnlPct = trade.actual_move || 0;
+                      const gross = trade.gross_pnl || 0;
+                      const pnlColor = pnlPct >= 0 ? GREEN : RED;
+                      const isExpanded = expandedCards["closed_" + trade.id];
+                      const outcomeColor = trade.outcome === "hit" ? GREEN : trade.outcome === "partial" ? AMBER : RED;
+                      const outcomeLabel = trade.outcome === "hit" ? "WIN" : trade.outcome === "partial" ? "PARTIAL" : trade.sell_reason === "forced_close" ? "FORCE CLOSED" : "LOSS";
+                      const sellReasonLabel = trade.sell_reason === "forced_close" ? "Force closed 2:45 PM" : trade.sell_reason === "cut_loss" ? "Cut at loss" : trade.sell_reason === "stop_loss" ? "Stop loss" : trade.sell_reason || "Closed";
+                      return (
+                        <div key={trade.id} style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, borderLeft: `3px solid ${outcomeColor}`, overflow: "hidden" }}>
+                          <div style={{ display: "flex", alignItems: "center", padding: "8px 12px", gap: 8 }}>
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                                <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 13, fontWeight: 600, color: T1 }}>{trade.ticker}</span>
+                                <span style={{ fontSize: 8, fontWeight: 700, color: outcomeColor, textTransform: "uppercase", letterSpacing: .4, padding: "1px 4px", background: outcomeColor + "22", borderRadius: 3 }}>{outcomeLabel}</span>
+                              </div>
+                              <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 2 }}>
+                                <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, fontWeight: 600, color: pnlColor }}>{pnlPct >= 0 ? "+" : ""}{pnlPct.toFixed(1)}%</span>
+                                <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: pnlColor }}>{gross >= 0 ? "+" : ""}${Math.abs(gross).toFixed(2)}</span>
+                                <span style={{ fontSize: 9, color: T3 }}>{sellReasonLabel}</span>
+                              </div>
+                            </div>
+                            <div style={{ display: "flex", gap: 4 }}>
+                              <button onClick={() => setExpandedCards(prev => ({ ...prev, ["closed_" + trade.id]: !prev["closed_" + trade.id] }))}
+                                style={{ background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 4, color: T3, fontSize: 9, fontWeight: 700, padding: "3px 8px", cursor: "pointer" }}>
+                                {isExpanded ? "HIDE" : "VIEW"}
+                              </button>
+                              <button onClick={() => setDismissedClosed(prev => ({ ...prev, [trade.id]: true }))}
+                                style={{ background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 4, color: T3, fontSize: 9, fontWeight: 700, padding: "3px 8px", cursor: "pointer" }}>
+                                CLOSE
+                              </button>
+                            </div>
+                          </div>
+                          {isExpanded && (
+                            <div style={{ padding: "0 12px 10px", borderTop: `1px solid ${BORDER}` }}>
+                              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 12px", paddingTop: 8 }}>
+                                {[
+                                  ["Buy date", trade.buy_date],
+                                  ["Sell date", trade.sell_date],
+                                  ["Entry", trade.buy_price ? `$${Number(trade.buy_price).toFixed(2)}` : "—"],
+                                  ["Exit", trade.sell_price ? `$${Number(trade.sell_price).toFixed(2)}` : "—"],
+                                  ["Invested", `$${Number(trade.invested_amount || 10).toFixed(2)}`],
+                                  ["Net P&L", trade.net_pnl != null ? `${trade.net_pnl >= 0 ? "+" : ""}$${Math.abs(trade.net_pnl).toFixed(2)}` : "—"],
+                                ].map(([label, value]) => (
+                                  <div key={label} style={{ display: "flex", justifyContent: "space-between", borderBottom: `1px solid ${BORDER}`, paddingBottom: 3 }}>
+                                    <span style={{ fontSize: 9, color: T3 }}>{label}</span>
+                                    <span style={{ fontSize: 9, color: T1, fontFamily: "'DM Mono',monospace" }}>{value}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* ── Column header (shared for both sections) ── */}
+                {(sellTodayPositions.length > 0 || holdingPositions.length > 0) && (
+                  <div style={{ display: "grid", gridTemplateColumns: POS_GRID, gap: "0 10px", padding: `0 ${CARD_PAD_R} 5px ${CARD_PAD_L}` }}>
+                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
+                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center" }}>Day %</div>
+                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right", paddingRight: 0 }}>Open P&L</div>
+                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right", paddingRight: 0 }}>+$</div>
+                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right" }}>Conf</div>
+                  </div>
+                )}
+
+                {/* ── Sell Today ── */}
+                {sellTodayPositions.length > 0 && (
+                  <div style={{ marginBottom: 12 }}>
+                    <div style={{ fontSize: 9, color: AMBER, fontWeight: 700, textTransform: "uppercase", letterSpacing: .8, padding: "4px 0 6px" }}>
+                      Sell Today ({sellTodayPositions.length})
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      {sortedSellToday.map(trade => (
+                        <PositionCard key={trade.id} trade={trade} isLong={true}
+                          expanded={expandedCards[trade.id || trade.ticker]}
+                          isDone={doneCuts[trade.id || trade.ticker] === "done"}
+                          isClosed={doneCuts[trade.id || trade.ticker] === "closed"}
+                          pdtRemaining={pdtRemaining}
+                          themeKey={themeKey}
+                          onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
+                          onDone={key => { setDoneCuts(prev => ({ ...prev, [key]: "done" })); setExpandedCards(prev => ({ ...prev, [key]: false })); }}
+                          onView={key => setDoneCuts(prev => ({ ...prev, [key]: "open" }))}
+                          onClose={key => setDoneCuts(prev => ({ ...prev, [key]: "closed" }))}
+                          onAddToPersonal={trade => handleAddToPersonal(trade, "brain")}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* ── Holding ── */}
+                {holdingPositions.length > 0 && (
+                  <div style={{ marginBottom: 12 }}>
+                    <div style={{ fontSize: 9, color: T3, fontWeight: 700, textTransform: "uppercase", letterSpacing: .8, padding: "4px 0 6px" }}>
+                      Holding ({holdingPositions.length})
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      {sortedHolding.map(trade => (
+                        <PositionCard key={trade.id} trade={trade} isLong={true}
+                          expanded={expandedCards[trade.id || trade.ticker]}
+                          isDone={doneCuts[trade.id || trade.ticker] === "done"}
+                          isClosed={doneCuts[trade.id || trade.ticker] === "closed"}
+                          pdtRemaining={pdtRemaining}
+                          themeKey={themeKey}
+                          onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
+                          onDone={key => { setDoneCuts(prev => ({ ...prev, [key]: "done" })); setExpandedCards(prev => ({ ...prev, [key]: false })); }}
+                          onView={key => setDoneCuts(prev => ({ ...prev, [key]: "open" }))}
+                          onClose={key => setDoneCuts(prev => ({ ...prev, [key]: "closed" }))}
+                          onAddToPersonal={trade => handleAddToPersonal(trade, "brain")}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Empty state */}
+                {openLongPositions.length === 0 && recentlyClosed.length === 0 && (
+                  <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 20, fontSize: 13, color: T3, textAlign: "center" }}>
+                    No open positions. Positions appear here after 8:45 AM execution.
+                  </div>
+                )}
+
+              </div>
+            )}
+
 
           </div>
+          </div>} {/* end Brain portfolio */}
+
+          {/* ── NEURAL PORTFOLIO ── */}
+          {portfolioTab === "neural" && (
+            <div style={{ padding: "10px 16px 0" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>SwingDeskNet — Neural Brain</div>
+                {nnStats && nnStats.win_rate != null && (
+                  <div style={{ fontSize: 10, color: nnStats.win_rate >= 60 ? GREEN : nnStats.win_rate >= 45 ? AMBER : RED, fontWeight: 600 }}>{nnStats.win_rate}% win rate</div>
+                )}
+              </div>
+
+              {/* NN Open Positions */}
+              {nnPositions.filter(t => t.outcome === "open").length > 0 && (
+                <div style={{ marginBottom: 16 }}>
+                  <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 6 }}>Open positions</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    {nnPositions.filter(t => t.outcome === "open").map(trade => (
+                      <PositionCard key={trade.id} trade={trade} isLong={true}
+                        themeKey={themeKey}
+                        pdtRemaining={pdtRemaining}
+                        expanded={expandedCards[trade.id]}
+                        onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
+                        onAddToPersonal={trade => handleAddToPersonal(trade, "neural")} />
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* NN Picks */}
+              {nnPicks.recommended_longs && nnPicks.recommended_longs.length > 0 ? (
+                <div>
+                  <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 6 }}>NN Picks</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    {nnPicks.recommended_longs.map(pick => (
+                      <PickCard key={pick.ticker + "_nn"} pick={mapPickFields(pick)} isLong={true}
+                        themeKey={themeKey}
+                        expanded={expandedCards[pick.ticker + "_nn"]}
+                        onAddToPersonal={pick => handleAddToPersonal(pick, "neural")}
+                        onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))} />
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 20, textAlign: "center", fontSize: 12, color: T3 }}>
+                  Neural network is training. Picks will appear after first nightly audit.
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── PERSONAL PORTFOLIO ── */}
+          {portfolioTab === "personal" && (
+            <div style={{ padding: "10px 16px 0" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                <div style={{ fontSize: 10, color: AMBER, fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>Personal Portfolio</div>
+                <div style={{ fontSize: 9, color: T3 }}>Add positions from Brain or Neural tabs</div>
+              </div>
+
+              {personalTrades.length === 0 ? (
+                <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 24, textAlign: "center" }}>
+                  <div style={{ fontSize: 13, color: T2, marginBottom: 6 }}>No personal positions yet.</div>
+                  <div style={{ fontSize: 11, color: T3 }}>Tap "Add to 📝" on any Brain or Neural stock card.</div>
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  {personalTrades.map(trade => {
+                    const pnl = trade.pnl_percent || 0;
+                    const pnlColor = pnl >= 0 ? GREEN : RED;
+                    return (
+                      <div key={trade.id} style={{ display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", padding: "11px 14px", background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, borderLeft: `3px solid ${AMBER}` }}>
+                        <div>
+                          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                            <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 14, fontWeight: 600, color: T1 }}>{trade.ticker}</span>
+                            <span style={{ fontSize: 8, color: AMBER, fontWeight: 700, letterSpacing: .3 }}>PERSONAL</span>
+                            {trade.source_portfolio && <span style={{ fontSize: 8, color: T3 }}>via {trade.source_portfolio}</span>}
+                          </div>
+                          <div style={{ fontSize: 9, color: T3, marginTop: 2 }}>{trade.buy_date} · {trade.sector || "—"}</div>
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <div style={{ textAlign: "right" }}>
+                            <div style={{ fontSize: 13, fontWeight: 700, color: pnlColor, fontFamily: "'DM Mono',monospace" }}>{pnl >= 0 ? "+" : ""}{pnl.toFixed(1)}%</div>
+                            <div style={{ fontSize: 9, color: T3, marginTop: 1 }}>${Number(trade.buy_price || 0).toFixed(2)} entry</div>
+                          </div>
+                          <button onClick={async () => {
+                            try {
+                              await apiFetch("/personal-trades/remove", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: trade.id }) });
+                              setPersonalTrades(prev => prev.filter(t => t.id !== trade.id));
+                            } catch {}
+                          }} style={{ background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 4, color: T3, fontSize: 9, padding: "3px 7px", cursor: "pointer" }}>✕</button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
         </div>
       )}
 
@@ -1835,6 +2227,19 @@ export default function App() {
         <div className="fadeIn" style={{ padding: "10px 16px 0" }}>
           {tabLoading && <div style={{ textAlign: "center", padding: 20, fontSize: 11, color: T3 }}>Loading...</div>}
 
+          {/* ── Analytics internal nav: Performance | Closed Trades ── */}
+          <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
+            {[["performance", "Performance"], ["closed", "Closed Trades"]].map(([id, label]) => (
+              <button key={id} onClick={() => setAnalyticsPage(id)} style={{
+                flex: 1, padding: "8px 0", border: `1px solid ${analyticsPage === id ? BLUE + "66" : BORDER}`,
+                borderRadius: 8, background: analyticsPage === id ? BLUE + "18" : "transparent",
+                color: analyticsPage === id ? BLUE : T3, fontSize: 11, fontWeight: 700,
+                letterSpacing: .4, cursor: "pointer", textTransform: "uppercase"
+              }}>{label}</button>
+            ))}
+          </div>
+
+          {analyticsPage === "performance" && (<>
           {/* ── Extended Runners ── */}
           {extendedRunners.length > 0 && (
             <div style={{ marginBottom: 16 }}>
@@ -1969,35 +2374,80 @@ export default function App() {
               </div>
             );
           })()}
+          </>)}
 
-          {/* ── Trade History ── */}
-          {virtualTrades.filter(t => t.outcome !== "open").length > 0 && (
-            <div style={{ marginTop: 16 }}>
-              <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8, marginBottom: 8 }}>Trade history</div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                {virtualTrades.filter(t => t.outcome !== "open").slice(0, 60).map(trade => {
-                  const tradeColor = trade.outcome === "hit" ? GREEN : trade.outcome === "partial" ? AMBER : RED;
-                  return (
-                    <div key={trade.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "11px 14px", background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, borderLeft: `3px solid ${tradeColor}` }}>
-                      <div>
-                        <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 14, fontWeight: 600, color: T1 }}>{trade.ticker}</span>
-                        <span style={{ fontSize: 10, color: T3, marginLeft: 8 }}>{trade.direction} · {trade.buy_date}</span>
-                      </div>
-                      <div style={{ textAlign: "right" }}>
-                        {trade.actual_move != null ? (
-                          <div style={{ fontSize: 11, color: trade.actual_move >= 0 ? GREEN : RED, fontWeight: 500 }}>{trade.actual_move >= 0 ? "+" : ""}{trade.actual_move.toFixed(1)}%</div>
-                        ) : (
-                          <div style={{ fontSize: 11, color: GREEN, fontWeight: 500 }}>+{trade.expected_move?.toFixed(1) || "?"}% est</div>
-                        )}
-                        <div style={{ fontSize: 9, fontWeight: 700, color: tradeColor, marginTop: 2 }}>{trade.outcome.toUpperCase()}</div>
-                      </div>
-                    </div>
-                  );
-                })}
+          {/* ── Closed Trades Subpage ── */}
+          {analyticsPage === "closed" && (() => {
+            const allClosed = virtualTrades.filter(t => t.outcome !== "open");
+            const wins = allClosed.filter(t => t.outcome === "hit");
+            const cuts = allClosed.filter(t => t.outcome === "miss" || t.sell_reason === "cut_loss" || t.sell_reason === "stop_loss");
+            const partials = allClosed.filter(t => t.outcome === "partial");
+            const winRate = allClosed.length > 0 ? Math.round(wins.length / allClosed.length * 100) : null;
+            const totalPnl = allClosed.reduce((s, t) => s + (t.gross_pnl || 0), 0);
+            const tabData = closedTab === "wins" ? wins : closedTab === "cuts" ? cuts : allClosed;
+
+            return (
+              <div style={{ marginTop: 16 }}>
+                {/* Header row: label + win rate */}
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8 }}>Closed trades</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    {winRate !== null && (
+                      <span style={{ fontSize: 11, fontWeight: 700, color: winRate >= 60 ? GREEN : winRate >= 45 ? AMBER : RED }}>{winRate}% win rate</span>
+                    )}
+                    <span style={{ fontSize: 10, color: T3, fontFamily: "'DM Mono',monospace" }}>{totalPnl >= 0 ? "+" : ""}${totalPnl.toFixed(2)}</span>
+                  </div>
+                </div>
+
+                {/* Sub-tabs */}
+                <div style={{ display: "flex", gap: 4, marginBottom: 10 }}>
+                  {[["all", `All (${allClosed.length})`], ["wins", `Wins (${wins.length})`], ["cuts", `Cuts (${cuts.length})`]].map(([id, label]) => (
+                    <button key={id} onClick={() => setClosedTab(id)} style={{
+                      padding: "5px 12px", borderRadius: 20, fontSize: 10, fontWeight: 600,
+                      border: "none", cursor: "pointer",
+                      background: closedTab === id ? (id === "wins" ? GREEN + "22" : id === "cuts" ? RED + "22" : BORDER) : "transparent",
+                      color: closedTab === id ? (id === "wins" ? GREEN : id === "cuts" ? RED : T1) : T3,
+                    }}>{label}</button>
+                  ))}
+                </div>
+
+                {tabData.length === 0 ? (
+                  <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 20, fontSize: 12, color: T3, textAlign: "center" }}>
+                    {allClosed.length === 0 ? "No closed trades yet." : "No trades in this category."}
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    {tabData.map(trade => {
+                      const tradeColor = trade.outcome === "hit" ? GREEN : trade.outcome === "partial" ? AMBER : RED;
+                      const pnl = trade.actual_move;
+                      const conf = trade.lock_in_confidence || trade.confidence;
+                      return (
+                        <div key={trade.id} style={{ display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", padding: "10px 14px", background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, borderLeft: `3px solid ${tradeColor}` }}>
+                          <div>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                              <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 14, fontWeight: 600, color: T1 }}>{trade.ticker}</span>
+                              <span style={{ fontSize: 9, fontWeight: 700, color: tradeColor, letterSpacing: .3 }}>{trade.outcome === "hit" ? "WIN" : trade.outcome === "partial" ? "PARTIAL" : "LOSS"}</span>
+                              {conf > 0 && <span style={{ fontSize: 8, color: confidenceColor(conf, themeKey), fontFamily: "'DM Mono',monospace" }}>{conf}%</span>}
+                            </div>
+                            <div style={{ fontSize: 9, color: T3, marginTop: 2 }}>
+                              {trade.sell_date} · {trade.sector || "—"}
+                              {trade.sell_reason && <span style={{ marginLeft: 6, color: T3 }}>· {trade.sell_reason.replace(/_/g, " ")}</span>}
+                            </div>
+                          </div>
+                          <div style={{ textAlign: "right" }}>
+                            <div style={{ fontSize: 13, fontWeight: 700, color: pnl >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{pnl >= 0 ? "+" : ""}{pnl != null ? pnl.toFixed(1) : "—"}%</div>
+                            {trade.gross_pnl != null && <div style={{ fontSize: 9, color: trade.gross_pnl >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace", marginTop: 1 }}>{trade.gross_pnl >= 0 ? "+" : ""}${trade.gross_pnl.toFixed(2)}</div>}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
-            </div>
-          )}
+            );
+          })()}
 
+          {analyticsPage === "performance" && (<>
           {queueStatus && (
             <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "12px 14px", marginTop: 16 }}>
               <div style={{ fontSize: 10, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, marginBottom: 8 }}>Trade queue</div>
@@ -2216,6 +2666,7 @@ export default function App() {
               </div>
             );
           })()}
+          </>)}
 
         </div>
       )}

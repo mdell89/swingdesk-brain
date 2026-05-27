@@ -1012,6 +1012,37 @@ def save_signal_weights(weights):
     database.commit()
     database.close()
 
+def set_app_state(key, value):
+    """Persist a small app_state value."""
+    database = get_database()
+    database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)", [key, value])
+    database.commit()
+    database.close()
+
+def get_app_state_json(key, default=None):
+    """Read a JSON app_state value, returning default if missing or invalid."""
+    database = get_database()
+    row = database.execute("SELECT value FROM app_state WHERE key=?", [key]).fetchone()
+    database.close()
+    if not row:
+        return default
+    try:
+        return json.loads(row["value"])
+    except Exception:
+        return default
+
+def record_open_execution_status(status):
+    """Persist the latest open-position execution diagnostic payload."""
+    payload = {
+        **status,
+        "recorded_at": current_time_cst().isoformat(),
+    }
+    set_app_state("last_open_execution", json.dumps(payload))
+    for key in ("attempted_at", "success_at", "cached_pick_count", "opened_count", "skipped_count", "last_error"):
+        if key in payload:
+            set_app_state(f"open_execution_{key}", str(payload.get(key) if payload.get(key) is not None else ""))
+    return payload
+
 # ── TRADE QUEUE — Self-Regulating Position Sizing ─────────────────────────────
 def get_dynamic_fallback_amount():
     """
@@ -3071,7 +3102,7 @@ def unlock_pick_queue():
         log.error(f"Queue unlock error: {e}")
 
 
-def execute_opening_positions():
+def _execute_opening_positions_legacy():
     """
     Execute at 8:45 AM CST: Convert committed picks into open positions.
     
@@ -3187,6 +3218,162 @@ def execute_opening_positions():
         opened_count += 1
 
     log.info(f"Opened {opened_count} positions at 8:45 AM CST")
+
+def execute_opening_positions(trigger="scheduled", buy_time="08:45:00"):
+    """
+    Convert cached picks into open positions and persist a diagnostic payload.
+
+    Safe to run more than once: existing trade ids for today's ticker/direction
+    are skipped before any queue amount is consumed.
+    """
+    attempted_at = current_time_cst().isoformat()
+    status = {
+        "trigger": trigger,
+        "attempted_at": attempted_at,
+        "success_at": None,
+        "cached_pick_count": 0,
+        "opened_count": 0,
+        "skipped_count": 0,
+        "queue_consumed_count": 0,
+        "fallback_count": 0,
+        "opened": [],
+        "skipped": [],
+        "last_error": None,
+    }
+    record_open_execution_status(status)
+
+    try:
+        today = current_time_cst().strftime("%Y-%m-%d")
+        database = get_database()
+        cached = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
+        database.close()
+
+        if not cached:
+            status["last_error"] = "No cached picks to execute"
+            log.warning(status["last_error"])
+            return record_open_execution_status(status)
+
+        picks = json.loads(cached["value"])
+        cached_longs = picks.get("longs") or picks.get("recommended_longs") or []
+        all_picks = cached_longs[:MAX_LONG_PICKS]
+        status["cached_pick_count"] = len(all_picks)
+
+        if not all_picks:
+            status["last_error"] = "Cached picks contained zero long picks"
+            log.warning(status["last_error"])
+            return record_open_execution_status(status)
+
+        tickers = [pick["ticker"] for pick in all_picks if pick.get("ticker")]
+        try:
+            current_prices = fetch_current_prices(tickers, pin_to_845=True) if tickers else {}
+        except Exception as price_error:
+            current_prices = {}
+            status["last_error"] = f"Price fetch failed; using cached pick prices: {price_error}"
+            log.warning(status["last_error"])
+
+        indexed_picks = list(enumerate(all_picks))
+        random.shuffle(indexed_picks)
+
+        for original_index, pick in indexed_picks:
+            direction = "long" if original_index < MAX_LONG_PICKS else "short"
+            ticker = pick.get("ticker")
+            if not ticker:
+                status["skipped_count"] += 1
+                status["skipped"].append({"ticker": None, "reason": "missing ticker"})
+                continue
+
+            trade_id = f"{ticker}_{today}_{direction}_vt"
+            existing = get_database()
+            if existing.execute("SELECT id FROM virtual_trades WHERE id=?", [trade_id]).fetchone():
+                existing.close()
+                status["skipped_count"] += 1
+                status["skipped"].append({"ticker": ticker, "reason": "already executed today"})
+                continue
+
+            raw_price = current_prices.get(ticker)
+            buy_price = (raw_price["price"] if isinstance(raw_price, dict) else raw_price) or pick.get("open_price") or pick.get("price") or 0
+            confidence = pick.get("long_conf") if direction == "long" else pick.get("short_conf")
+            expected_move = pick.get("long_move") if direction == "long" else pick.get("short_move")
+            reasoning = pick.get("long_reasoning", "") if direction == "long" else pick.get("short_reasoning", "")
+
+            queue_id, invested_amount = get_next_queue_amount()
+
+            closed_days = 3 if current_time_cst().weekday() == 4 else 1
+
+            try:
+                _weights = get_signal_weights()
+                _earnings = check_upcoming_earnings([ticker])
+                _open_price_data = {ticker: {
+                    "price": buy_price,
+                    "volume_ratio": pick.get("vol_ratio", 1.0),
+                    "gap_percent": pick.get("overnight_gap_pct", 0),
+                    "day_change_percent": pick.get("day_change_pct", 0),
+                    "daily_history": [],
+                }}
+                _sig_scores, _fired, _values = compute_signal_scores(
+                    ticker, _open_price_data, pick.get("rsi", 50.0),
+                    _earnings, _weights, direction
+                )
+                _signal_scores_json = json.dumps({"scores": _sig_scores, "fired": _fired, "values": _values})
+            except Exception as signal_error:
+                log.warning(f"Signal snapshot failed for {ticker}: {signal_error}")
+                _signal_scores_json = json.dumps({"scores": {}, "fired": []})
+
+            _news_sentiment = 0.0
+            _news_count = 0
+            _52w_days_ago = pick.get("broke_52w_high_days_ago")
+            try:
+                _news_sentiment = float(pick.get("news_sentiment_score") or 0)
+                _news_count = int(pick.get("news_article_count") or len(pick.get("news", []) or []))
+            except Exception:
+                pass
+
+            try:
+                existing.execute("""
+                    INSERT INTO virtual_trades
+                    (id, ticker, direction, buy_date, buy_time, buy_price, invested_amount,
+                     confidence, lock_in_confidence, expected_move, outcome, sector, reasoning, closed_days,
+                     status, current_value, intraday_high_pct, intraday_low_pct, queue_position,
+                     signal_scores, news_sentiment_score, news_article_count, broke_52w_high_days_ago)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, [trade_id, ticker, direction, today, buy_time, buy_price,
+                      round(invested_amount, 4), confidence, confidence, expected_move, "open",
+                      get_sector(ticker), reasoning, closed_days,
+                      "open", round(invested_amount, 4), 0.0, 0.0, queue_id,
+                      _signal_scores_json, _news_sentiment, _news_count, _52w_days_ago])
+                existing.commit()
+                existing.close()
+                consume_queue_amount(queue_id, trade_id)
+                if queue_id is None:
+                    status["fallback_count"] += 1
+                else:
+                    status["queue_consumed_count"] += 1
+                status["opened_count"] += 1
+                status["opened"].append({
+                    "ticker": ticker,
+                    "trade_id": trade_id,
+                    "buy_price": buy_price,
+                    "invested_amount": round(invested_amount, 4),
+                    "queue_id": queue_id,
+                })
+            except Exception as insert_error:
+                existing.close()
+                status["skipped_count"] += 1
+                status["skipped"].append({"ticker": ticker, "reason": str(insert_error)})
+                log.error(f"Open execution failed for {ticker}: {insert_error}")
+
+        status["success_at"] = current_time_cst().isoformat()
+        if status["opened_count"] > 0:
+            status["last_error"] = None
+        log.info(
+            f"Open execution {trigger}: opened {status['opened_count']}, "
+            f"skipped {status['skipped_count']}, cached {status['cached_pick_count']}"
+        )
+        return record_open_execution_status(status)
+    except Exception as error:
+        status["last_error"] = str(error)
+        log.error(f"Open execution {trigger} failed: {error}")
+        return record_open_execution_status(status)
 
 def monitor_open_positions():
     """
@@ -4074,6 +4261,36 @@ def api_ping():
     """Lightweight wake-up endpoint. Frontend hits this first to warm Railway before real requests."""
     return jsonify({"ok": True, "ts": current_time_cst().isoformat()})
 
+def get_open_execution_status(open_position_count=None):
+    """Return latest open execution diagnostics plus a missed-open alert flag."""
+    status = get_app_state_json("last_open_execution", {}) or {}
+    try:
+        database = get_database()
+        cached = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
+        if open_position_count is None:
+            open_position_count = database.execute(
+                "SELECT COUNT(*) as n FROM virtual_trades WHERE outcome='open'"
+            ).fetchone()["n"]
+        database.close()
+        cached_pick_count = 0
+        if cached:
+            picks = json.loads(cached["value"])
+            cached_pick_count = len((picks.get("longs") or picks.get("recommended_longs") or [])[:MAX_LONG_PICKS])
+    except Exception:
+        cached_pick_count = status.get("cached_pick_count", 0) or 0
+
+    now = current_time_cst()
+    after_open_execution = now.weekday() < 5 and (now.hour > 8 or (now.hour == 8 and now.minute >= 45))
+    before_force_close = now.hour < 14 or (now.hour == 14 and now.minute < 45)
+    missed_open_alert = bool(after_open_execution and before_force_close and cached_pick_count > 0 and int(open_position_count or 0) == 0)
+
+    return {
+        **status,
+        "cached_pick_count_live": cached_pick_count,
+        "open_position_count_live": int(open_position_count or 0),
+        "missed_open_alert": missed_open_alert,
+    }
+
 @app.route("/api/stats")
 def api_stats():
     database = get_database()
@@ -4112,6 +4329,7 @@ def api_stats():
         "last_scan": last_scan["value"] if last_scan else None,
         "weights": get_signal_weights(),
         "queue": get_queue_status(),
+        "open_execution": get_open_execution_status(open_position_count),
         "pdt_used": get_pdt_count(),
         "pdt_remaining": max(0, 3 - get_pdt_count()),
     })
@@ -5060,6 +5278,30 @@ def api_today_closed():
         return jsonify(enriched)
     except Exception as e:
         return jsonify([])
+
+
+@app.route("/api/open-execution-status")
+def api_open_execution_status():
+    """Return latest open-position execution diagnostics."""
+    try:
+        return jsonify(get_open_execution_status())
+    except Exception as e:
+        return jsonify({"last_error": str(e), "missed_open_alert": False}), 500
+
+@app.route("/api/recover-missed-open", methods=["POST"])
+def api_recover_missed_open():
+    """
+    Manually recover a missed 8:45 AM open execution.
+
+    Idempotent: existing ticker/date/direction trade ids are skipped before
+    queue amounts are consumed.
+    """
+    try:
+        result = execute_opening_positions(trigger="manual_recovery", buy_time="08:45:00")
+        return jsonify({"success": result.get("last_error") is None, **result})
+    except Exception as e:
+        log.error(f"Manual missed-open recovery failed: {e}")
+        return jsonify({"success": False, "last_error": str(e)}), 500
 
 
 @app.route("/api/force-close-now", methods=["POST"])
