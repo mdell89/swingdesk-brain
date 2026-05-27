@@ -853,7 +853,9 @@ def fetch_twelve_data_live(tickers):
     """
     Fetch real-time quotes for monitoring — Finnhub /quote endpoint.
     One call per ticker with rate limiting (60/min free tier).
-    Returns {ticker: {"price": float, "day_change_pct": float}}
+    Returns {ticker: {"price", "day_change_pct", "open", "previous_close",
+                       "gap_percent", "high", "low"}}
+    Volume is not available from Finnhub /quote — enriched separately from candle cache.
     """
     results = {}
     RATE_LIMIT_DELAY = 1.1
@@ -864,8 +866,36 @@ def fetch_twelve_data_live(tickers):
             results[ticker] = {
                 "price": quote["price"],
                 "day_change_pct": quote["day_change_percent"],
+                "day_change_percent": quote["day_change_percent"],
+                "open": quote.get("open", quote["price"]),
+                "previous_close": quote.get("previous_close", quote["price"]),
+                "gap_percent": quote.get("gap_percent", 0),
+                "high": quote.get("high", quote["price"]),
+                "low": quote.get("low", quote["price"]),
             }
         time.sleep(RATE_LIMIT_DELAY)
+
+    # Enrich with volume from candle cache where available
+    try:
+        cached_raw = None
+        db = get_database()
+        row = db.execute("SELECT value FROM app_state WHERE key='price_cache'").fetchone()
+        if row:
+            cached_raw = json.loads(row["value"])
+        db.close()
+        if cached_raw:
+            for ticker in results:
+                cached = cached_raw.get(ticker, {})
+                hist = cached.get("daily_history", [])
+                if hist:
+                    latest = hist[-1]
+                    vol = latest.get("volume", 0)
+                    avg_vol = sum(h.get("volume", 0) for h in hist[-20:]) / max(len(hist[-20:]), 1)
+                    results[ticker]["volume"] = vol
+                    results[ticker]["average_volume"] = max(avg_vol, 1)
+                    results[ticker]["volume_ratio"] = vol / max(avg_vol, 1) if avg_vol > 0 else 1.0
+    except Exception as e:
+        log.debug(f"Volume enrichment skipped: {e}")
 
     log.info(f"Finnhub live: {len(results)}/{len(tickers)} tickers")
     return results
@@ -2739,13 +2769,19 @@ def monitor_open_positions():
         low_pct = min(position.get("intraday_low_pct") or 0, pnl_percent)
 
         # Calculate and persist dynamic confidence and estimate
-        # Reuse already-fetched price — no extra API calls
+        # Use all available fields from the enriched live quote — not skeleton defaults
         price_data_for_dynamic = {
             ticker: {
                 "price": price,
-                "previous_close": position.get("buy_price", price),
-                "volume": 0, "average_volume": 1, "volume_ratio": 1.0,
-                "gap_percent": 0, "day_change_percent": day_change_pct,
+                "previous_close": price_data.get("previous_close", position.get("buy_price", price)),
+                "open": price_data.get("open", price),
+                "high": price_data.get("high", price),
+                "low": price_data.get("low", price),
+                "volume": price_data.get("volume", 0),
+                "average_volume": price_data.get("average_volume", 1),
+                "volume_ratio": price_data.get("volume_ratio", 1.0),
+                "gap_percent": price_data.get("gap_percent", 0),
+                "day_change_percent": day_change_pct,
             }
         }
         try:
@@ -2805,6 +2841,24 @@ def monitor_open_positions():
                 WHERE id=?
             """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2),
                   now.isoformat(), day_change_pct, position["id"]])
+
+        # Refresh news for open positions — once per monitor cycle, rate-limited
+        # Only refresh if news is stale (>30 min old) to stay within Alpha Vantage limits
+        try:
+            news_key = f"last_news_fetch_{ticker}"
+            last_news_row = database.execute("SELECT value FROM app_state WHERE key=?", [news_key]).fetchone()
+            last_news_ts = float(last_news_row["value"]) if last_news_row else 0
+            if time.time() - last_news_ts > 1800:  # 30 min stale threshold
+                fresh_news = _fetch_news_alpha_vantage(ticker) or _fetch_news_yahoo_rss(ticker)
+                if fresh_news:
+                    database.execute(
+                        "UPDATE virtual_trades SET news=? WHERE id=?",
+                        [json.dumps(fresh_news), position["id"]]
+                    )
+                database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
+                    [news_key, str(time.time())])
+        except Exception as e:
+            log.debug(f"News refresh skipped for {ticker}: {e}")
 
         # Skip sell decisions outside regular market hours
         if not is_market_open():
@@ -3476,12 +3530,23 @@ def api_ping():
 @app.route("/api/stats")
 def api_stats():
     database = get_database()
-    total_predictions = database.execute("SELECT COUNT(*) as n FROM predictions").fetchone()["n"]
-    resolved_count = database.execute("SELECT COUNT(*) as n FROM predictions WHERE outcome!='pending'").fetchone()["n"]
-    hit_count = database.execute("SELECT COUNT(*) as n FROM predictions WHERE outcome='hit'").fetchone()["n"]
-    miss_count = database.execute("SELECT COUNT(*) as n FROM predictions WHERE outcome='miss'").fetchone()["n"]
+
+    # virtual_trades is the single source of truth for all performance stats
     virtual_trade_count = database.execute("SELECT COUNT(*) as n FROM virtual_trades").fetchone()["n"]
     open_position_count = database.execute("SELECT COUNT(*) as n FROM virtual_trades WHERE outcome='open'").fetchone()["n"]
+    closed_rows = database.execute(
+        "SELECT outcome, actual_move, gross_pnl FROM virtual_trades WHERE outcome != 'open'"
+    ).fetchall()
+    resolved_count = len(closed_rows)
+    hit_count = sum(1 for t in closed_rows if t["outcome"] == "hit")
+    partial_count = sum(1 for t in closed_rows if t["outcome"] == "partial")
+    miss_count = sum(1 for t in closed_rows if t["outcome"] == "miss")
+    total_gross_pnl = sum(float(t["gross_pnl"] or 0) for t in closed_rows)
+    win_rate = round(hit_count / resolved_count * 100, 1) if resolved_count else None
+
+    # predictions table used only for audit/weight system — not for performance stats
+    total_predictions = database.execute("SELECT COUNT(*) as n FROM predictions").fetchone()["n"]
+
     last_audit = database.execute("SELECT value FROM app_state WHERE key='last_audit'").fetchone()
     last_scan = database.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
     database.close()
@@ -3490,8 +3555,10 @@ def api_stats():
         "total_predictions": total_predictions,
         "resolved": resolved_count,
         "hits": hit_count,
+        "partials": partial_count,
         "misses": miss_count,
-        "win_rate": round(hit_count / resolved_count * 100, 1) if resolved_count else None,
+        "win_rate": win_rate,
+        "total_gross_pnl": round(total_gross_pnl, 2),
         "virtual_trades": virtual_trade_count,
         "virtual_open": open_position_count,
         "last_audit": last_audit["value"] if last_audit else None,
@@ -4445,6 +4512,59 @@ def api_today_closed():
             })
         return jsonify(enriched)
     except Exception as e:
+        return jsonify([])
+
+@app.route("/api/all-closed")
+def api_all_closed():
+    """
+    Return all closed trades across all dates — single source of truth from virtual_trades.
+    Used by the Analytics Closed Trades subpage.
+    """
+    try:
+        database = get_database()
+        closed = [dict(t) for t in database.execute("""
+            SELECT ticker, name, direction, buy_date, sell_date, buy_price, sell_price,
+                   actual_move, gross_pnl, net_pnl, outcome, sell_reason,
+                   lock_in_confidence, confidence, expected_move, sector
+            FROM virtual_trades
+            WHERE outcome != 'open'
+            ORDER BY sell_date DESC, sell_time DESC
+        """).fetchall()]
+        database.close()
+
+        enriched = []
+        for t in closed:
+            outcome = t.get("outcome") or ""
+            sell_reason = t.get("sell_reason") or ""
+            pnl_pct = t.get("actual_move") or 0
+            gross = t.get("gross_pnl") or 0
+
+            if sell_reason in ("force_close", "forced_close"):
+                label = "Force closed"
+                label_type = "force"
+            elif sell_reason in ("cut_loss", "stop_loss"):
+                label = "Cut"
+                label_type = "cut"
+            elif outcome == "hit":
+                label = "Win"
+                label_type = "win"
+            elif outcome == "partial":
+                label = "Partial"
+                label_type = "partial"
+            else:
+                label = "Loss"
+                label_type = "loss"
+
+            enriched.append({
+                **t,
+                "outcome_label": label,
+                "outcome_type": label_type,
+                "lock_in_confidence": t.get("lock_in_confidence") or t.get("confidence") or 0,
+            })
+
+        return jsonify(enriched)
+    except Exception as e:
+        log.error(f"all-closed error: {e}")
         return jsonify([])
 
 @app.route("/api/reset-weights", methods=["POST"])
