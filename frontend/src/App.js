@@ -1469,6 +1469,7 @@ export default function App() {
   const [nnPositions, setNnPositions] = useState([]);
   const [nnPicks, setNnPicks] = useState({ recommended_longs: [], recommended_shorts: [] });
   const [nnStats, setNnStats] = useState(null);
+  const [nnAction, setNnAction] = useState(null);
   const [personalTrades, setPersonalTrades] = useState([]);
   const [addingToPersonal, setAddingToPersonal] = useState({});
   const [sortMode, setSortMode] = useState("smart");
@@ -1524,6 +1525,27 @@ export default function App() {
     } catch {}
     setAddingToPersonal(prev => ({ ...prev, [ticker]: false }));
     return false;
+  };
+
+  const refreshNeuralPortfolio = async () => {
+    const [nnPicksData, nnPositionsData, nnStatsData] = await Promise.all([
+      apiFetch("/nn-picks").catch(() => ({ recommended_longs: [], recommended_shorts: [] })),
+      apiFetch("/nn-positions").catch(() => []),
+      apiFetch("/nn-stats").catch(() => null),
+    ]);
+    setNnPicks(nnPicksData || { recommended_longs: [], recommended_shorts: [] });
+    setNnPositions(nnPositionsData || []);
+    setNnStats(nnStatsData);
+  };
+
+  const runNeuralAction = async (kind) => {
+    if (nnAction) return;
+    setNnAction(kind);
+    try {
+      await apiFetch(kind === "scan" ? "/nn-scan-now" : "/nn-open-now", { method: "POST" });
+      await refreshNeuralPortfolio();
+    } catch {}
+    setNnAction(null);
   };
 
   const recoverMissedOpen = async () => {
@@ -1683,15 +1705,22 @@ export default function App() {
   useEffect(() => {
     const interval = setInterval(async () => {
       try {
-        const [positions, perfData, closedData, statsData] = await Promise.all([
+        const [positions, perfData, closedData, statsData,
+               nnPicksData, nnPositionsData, nnStatsData] = await Promise.all([
           apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
           apiFetch("/perf-history").catch(() => []),
           apiFetch("/today-closed").catch(() => []),
           apiFetch("/stats").catch(() => null),
+          apiFetch("/nn-picks").catch(() => ({ recommended_longs: [], recommended_shorts: [] })),
+          apiFetch("/nn-positions").catch(() => []),
+          apiFetch("/nn-stats").catch(() => null),
         ]);
         setOpenPositions(positions);
         setTodayClosed(closedData || []);
         if (statsData?.open_execution) setOpenExecution(statsData.open_execution);
+        setNnPicks(nnPicksData || { recommended_longs: [], recommended_shorts: [] });
+        setNnPositions(nnPositionsData || []);
+        setNnStats(nnStatsData);
         buildPerfHistory(perfData, positions);
       } catch {}
     }, 2.5 * 60 * 1000);
@@ -2207,9 +2236,29 @@ export default function App() {
             <div style={{ padding: "10px 16px 0" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
                 <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>SwingDeskNet — Neural Brain</div>
-                {nnStats && nnStats.win_rate != null && (
-                  <div style={{ fontSize: 10, color: nnStats.win_rate >= 60 ? GREEN : nnStats.win_rate >= 45 ? AMBER : RED, fontWeight: 600 }}>{nnStats.win_rate}% win rate</div>
-                )}
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button onClick={() => runNeuralAction("scan")} disabled={!!nnAction}
+                    style={{ background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 5, color: "#a78bfa", fontSize: 9, fontWeight: 700, letterSpacing: .4, padding: "4px 8px", cursor: nnAction ? "default" : "pointer", opacity: nnAction ? .55 : 1 }}>
+                    {nnAction === "scan" ? "..." : "SCAN"}
+                  </button>
+                  <button onClick={() => runNeuralAction("open")} disabled={!!nnAction}
+                    style={{ background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 5, color: GREEN, fontSize: 9, fontWeight: 700, letterSpacing: .4, padding: "4px 8px", cursor: nnAction ? "default" : "pointer", opacity: nnAction ? .55 : 1 }}>
+                    {nnAction === "open" ? "..." : "OPEN"}
+                  </button>
+                </div>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 12 }}>
+                {[
+                  ["Balance", nnStats?.portfolio_value != null ? `$${Number(nnStats.portfolio_value).toFixed(2)}` : "$1,000.00", T1],
+                  ["Open", nnStats?.open_positions ?? nnPositions.filter(t => t.outcome === "open").length, GREEN],
+                  ["Next", nnStats?.next_investment_amount != null ? `$${Number(nnStats.next_investment_amount).toFixed(2)}` : "$10.00", "#a78bfa"],
+                ].map(([label, value, color]) => (
+                  <div key={label} style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "8px 10px" }}>
+                    <div style={{ fontSize: 8, color: T3, fontWeight: 700, textTransform: "uppercase", letterSpacing: .6, marginBottom: 4 }}>{label}</div>
+                    <div style={{ fontSize: 13, color, fontWeight: 800, fontFamily: "'DM Mono',monospace", lineHeight: 1 }}>{value}</div>
+                  </div>
+                ))}
               </div>
 
               {/* NN Open Positions */}

@@ -150,6 +150,7 @@ ALPHA_VANTAGE_KEY    = os.getenv("ALPHA_VANTAGE_KEY")
 DATABASE_PATH        = Path(os.environ.get("DATABASE_PATH", "/app/data/portfolio_brain.db"))
 FEE_PER_TRADE        = 0.02      # Cash App sell fee
 DEFAULT_INVESTMENT   = 10.00     # Fallback when queue is empty
+STARTING_PORTFOLIO_VALUE = 1000.0
 CONFIDENCE_FLOOR     = 65        # Minimum confidence to recommend/trade
 MIN_EXPECTED_MOVE    = 5.0       # Minimum predicted overnight move (%)
 MAX_LONG_PICKS       = 20        # Maximum long recommendations per scan
@@ -936,6 +937,25 @@ def initialize_database():
         except:
             pass  # Column already exists
 
+    # Add new columns to nn_virtual_trades if upgrading from earlier schema
+    for column_definition in [
+        "dynamic_confidence INTEGER",
+        "dynamic_estimate REAL",
+        "weekend_hold INTEGER DEFAULT 0",
+        "confluence_count INTEGER DEFAULT 0",
+        "confluence_methods TEXT DEFAULT '[]'",
+        "signal_scores TEXT DEFAULT '{}'",
+        "lock_in_confidence INTEGER",
+        "last_price_updated TEXT",
+        "day_change_percent REAL",
+        "news_sentiment_score REAL",
+        "news_article_count INTEGER DEFAULT 0",
+    ]:
+        try:
+            database.execute(f"ALTER TABLE nn_virtual_trades ADD COLUMN {column_definition}")
+        except:
+            pass  # Column already exists
+
     # Seed default signal weights if not already set
     existing_weights = database.execute("SELECT value FROM app_state WHERE key='weights'").fetchone()
     if not existing_weights:
@@ -1134,6 +1154,46 @@ def get_queue_status():
     }
 
 # ── PRICE DATA ────────────────────────────────────────────────────────────────
+def get_nn_portfolio_value():
+    """Return the NN portfolio value from its own closed/open trade ledger."""
+    database = get_database()
+    closed = database.execute(
+        "SELECT COALESCE(SUM(net_pnl), 0) as total_pnl FROM nn_virtual_trades WHERE outcome != 'open'"
+    ).fetchone()
+    open_rows = database.execute(
+        "SELECT invested_amount, current_value FROM nn_virtual_trades WHERE outcome='open'"
+    ).fetchall()
+    database.close()
+
+    closed_pnl = float(closed["total_pnl"] or 0)
+    open_pnl = 0.0
+    for row in open_rows:
+        invested = float(row["invested_amount"] or 0)
+        current = float(row["current_value"] or invested)
+        open_pnl += current - invested
+    return STARTING_PORTFOLIO_VALUE + closed_pnl + open_pnl
+
+def get_nn_investment_amount():
+    """
+    Independent NN position sizing.
+    Starts at $10, then uses 1% of the NN portfolio once it has trade history.
+    """
+    database = get_database()
+    closed_count = database.execute(
+        "SELECT COUNT(*) as n FROM nn_virtual_trades WHERE outcome != 'open'"
+    ).fetchone()["n"]
+    database.close()
+    if closed_count < 10:
+        return DEFAULT_INVESTMENT
+    return max(round(get_nn_portfolio_value() * 0.01, 2), 1.00)
+
+def record_nn_open_execution_status(status):
+    """Persist the latest NN open execution diagnostics for API/UI debugging."""
+    payload = dict(status or {})
+    payload.setdefault("attempted_at", current_time_cst().isoformat())
+    set_app_state("last_nn_open_execution", json.dumps(payload))
+    return payload
+
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 TWELVE_DATA_BASE = "https://api.twelvedata.com"
 FINNHUB_KEY = os.getenv("FINNHUB_KEY")
@@ -3492,6 +3552,270 @@ def execute_opening_positions(trigger="scheduled", buy_time="08:45:00"):
         log.error(f"Open execution {trigger} failed: {error}")
         return record_open_execution_status(status)
 
+def execute_nn_opening_positions(trigger="scheduled", buy_time="08:45:00"):
+    """
+    Convert cached NN picks into open NN portfolio positions.
+    The NN portfolio has independent capital and does not consume the main queue.
+    """
+    status = {
+        "trigger": trigger,
+        "attempted_at": current_time_cst().isoformat(),
+        "success_at": None,
+        "cached_pick_count": 0,
+        "opened_count": 0,
+        "skipped_count": 0,
+        "opened": [],
+        "skipped": [],
+        "last_error": None,
+    }
+    record_nn_open_execution_status(status)
+
+    try:
+        today = current_time_cst().strftime("%Y-%m-%d")
+        database = get_database()
+        cached = database.execute("SELECT value FROM app_state WHERE key='cached_nn_picks'").fetchone()
+        database.close()
+
+        if not cached:
+            status["last_error"] = "No cached NN picks to execute"
+            log.warning(status["last_error"])
+            return record_nn_open_execution_status(status)
+
+        picks = json.loads(cached["value"])
+        all_picks = (picks.get("recommended_longs") or picks.get("longs") or [])[:MAX_LONG_PICKS]
+        status["cached_pick_count"] = len(all_picks)
+
+        if not all_picks:
+            status["last_error"] = "Cached NN picks contained zero long picks"
+            log.warning(status["last_error"])
+            return record_nn_open_execution_status(status)
+
+        tickers = [pick["ticker"] for pick in all_picks if pick.get("ticker")]
+        try:
+            current_prices = fetch_current_prices(tickers, pin_to_845=True) if tickers else {}
+        except Exception as price_error:
+            current_prices = {}
+            status["last_error"] = f"NN price fetch failed; using cached pick prices: {price_error}"
+            log.warning(status["last_error"])
+
+        indexed_picks = list(enumerate(all_picks))
+        random.shuffle(indexed_picks)
+
+        for original_index, pick in indexed_picks:
+            ticker = pick.get("ticker")
+            if not ticker:
+                status["skipped_count"] += 1
+                status["skipped"].append({"ticker": None, "reason": "missing ticker"})
+                continue
+
+            direction = "long"
+            trade_id = f"nn_{ticker}_{today}_{direction}_vt"
+            existing = get_database()
+            if existing.execute("SELECT id FROM nn_virtual_trades WHERE id=?", [trade_id]).fetchone():
+                existing.close()
+                status["skipped_count"] += 1
+                status["skipped"].append({"ticker": ticker, "reason": "already executed today"})
+                continue
+
+            raw_price = current_prices.get(ticker)
+            buy_price = (raw_price["price"] if isinstance(raw_price, dict) else raw_price) or pick.get("open_price") or pick.get("price") or 0
+            if not buy_price:
+                existing.close()
+                status["skipped_count"] += 1
+                status["skipped"].append({"ticker": ticker, "reason": "missing buy price"})
+                continue
+
+            nn_confidence = int(round(float(pick.get("nn_score") or pick.get("long_conf") or 0)))
+            crude_confidence = int(round(float(pick.get("crude_conf") or pick.get("confidence") or nn_confidence)))
+            expected_move = float(pick.get("long_move") or pick.get("expected_move") or 0)
+            invested_amount = get_nn_investment_amount()
+            reasoning = pick.get("long_reasoning") or f"NN confidence {nn_confidence}%"
+
+            try:
+                weights = get_signal_weights()
+                earnings = check_upcoming_earnings([ticker])
+                open_price_data = {ticker: {
+                    "price": buy_price,
+                    "volume_ratio": pick.get("vol_ratio", 1.0),
+                    "gap_percent": pick.get("overnight_gap_pct", 0),
+                    "day_change_percent": pick.get("day_change_pct", 0),
+                    "daily_history": [],
+                }}
+                sig_scores, fired, sig_values = compute_signal_scores(
+                    ticker, open_price_data, pick.get("rsi", 50.0), earnings, weights, direction
+                )
+                signal_scores_json = json.dumps({"scores": sig_scores, "fired": fired, "values": sig_values})
+            except Exception as signal_error:
+                log.warning(f"NN signal snapshot failed for {ticker}: {signal_error}")
+                signal_scores_json = json.dumps({"scores": {}, "fired": [], "values": {}})
+
+            try:
+                confluence_methods = json.dumps(pick.get("confluence_methods") or [])
+            except Exception:
+                confluence_methods = "[]"
+
+            try:
+                existing.execute("""
+                    INSERT INTO nn_virtual_trades
+                    (id, ticker, direction, buy_date, buy_time, buy_price, invested_amount,
+                     current_value, confidence, nn_confidence, lock_in_confidence, expected_move,
+                     outcome, sector, reasoning, intraday_high_pct, intraday_low_pct,
+                     dynamic_confidence, dynamic_estimate, confluence_count, confluence_methods,
+                     signal_scores, day_change_percent, news_sentiment_score, news_article_count,
+                     last_price_updated)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, [
+                    trade_id, ticker, direction, today, buy_time, buy_price,
+                    round(invested_amount, 4), round(invested_amount, 4),
+                    crude_confidence, nn_confidence, nn_confidence, expected_move,
+                    "open", get_sector(ticker), reasoning, 0.0, 0.0,
+                    nn_confidence, expected_move, int(pick.get("confluence_count") or 0),
+                    confluence_methods, signal_scores_json, pick.get("day_change_pct", 0),
+                    float(pick.get("news_sentiment_score") or 0),
+                    int(pick.get("news_article_count") or len(pick.get("news", []) or [])),
+                    current_time_cst().isoformat()
+                ])
+                existing.commit()
+                existing.close()
+                status["opened_count"] += 1
+                status["opened"].append({
+                    "ticker": ticker,
+                    "trade_id": trade_id,
+                    "buy_price": buy_price,
+                    "invested_amount": round(invested_amount, 4),
+                    "nn_confidence": nn_confidence,
+                })
+            except Exception as insert_error:
+                existing.close()
+                status["skipped_count"] += 1
+                status["skipped"].append({"ticker": ticker, "reason": str(insert_error)})
+                log.error(f"NN open execution failed for {ticker}: {insert_error}")
+
+        status["success_at"] = current_time_cst().isoformat()
+        if status["opened_count"] > 0:
+            status["last_error"] = None
+        log.info(
+            f"NN open execution {trigger}: opened {status['opened_count']}, "
+            f"skipped {status['skipped_count']}, cached {status['cached_pick_count']}"
+        )
+        return record_nn_open_execution_status(status)
+    except Exception as error:
+        status["last_error"] = str(error)
+        log.error(f"NN open execution {trigger} failed: {error}")
+        return record_nn_open_execution_status(status)
+
+def monitor_nn_open_positions():
+    """Update and settle open NN positions using the NN portfolio ledger."""
+    database = get_database()
+    open_positions = [dict(t) for t in database.execute(
+        "SELECT * FROM nn_virtual_trades WHERE outcome='open'"
+    ).fetchall()]
+    database.close()
+
+    if not open_positions:
+        return
+
+    tickers = list(set(position["ticker"] for position in open_positions))
+    current_prices = fetch_current_prices(tickers)
+    now = current_time_cst()
+    today = now.strftime("%Y-%m-%d")
+    database = get_database()
+    updated_count = 0
+    closed_count = 0
+
+    for position in open_positions:
+        ticker = position["ticker"]
+        raw = current_prices.get(ticker)
+        if not raw:
+            continue
+        price = raw["price"] if isinstance(raw, dict) else float(raw)
+        day_change_pct = raw.get("day_change_pct", 0) if isinstance(raw, dict) else 0
+        buy_price = float(position["buy_price"] or price)
+        invested = float(position["invested_amount"] or DEFAULT_INVESTMENT)
+        pnl_percent = (price - buy_price) / buy_price * 100
+        if position["direction"] == "short":
+            pnl_percent = -pnl_percent
+        pnl_dollars = invested * (pnl_percent / 100)
+        current_value = invested + pnl_dollars
+        high_pct = max(position.get("intraday_high_pct") or 0, pnl_percent)
+        low_pct = min(position.get("intraday_low_pct") or 0, pnl_percent)
+
+        dyn_conf = position.get("dynamic_confidence") or position.get("nn_confidence") or position.get("confidence") or 0
+        dyn_est = position.get("dynamic_estimate") or position.get("expected_move") or 0
+        signal_scores_json = position.get("signal_scores") or json.dumps({"scores": {}, "fired": [], "values": {}})
+        conf_count = position.get("confluence_count") or 0
+        conf_methods = position.get("confluence_methods") or "[]"
+
+        try:
+            price_data_for_dynamic = {ticker: {
+                "price": price,
+                "previous_close": raw.get("previous_close", buy_price) if isinstance(raw, dict) else buy_price,
+                "open": raw.get("open", price) if isinstance(raw, dict) else price,
+                "high": raw.get("high", price) if isinstance(raw, dict) else price,
+                "low": raw.get("low", price) if isinstance(raw, dict) else price,
+                "volume": raw.get("volume", 0) if isinstance(raw, dict) else 0,
+                "average_volume": raw.get("average_volume", 1) if isinstance(raw, dict) else 1,
+                "volume_ratio": raw.get("volume_ratio", 1.0) if isinstance(raw, dict) else 1.0,
+                "gap_percent": raw.get("gap_percent", 0) if isinstance(raw, dict) else 0,
+                "day_change_percent": day_change_pct,
+            }}
+            weights = get_signal_weights()
+            earnings = check_upcoming_earnings([ticker])
+            rsi_val = calculate_rsi_batch([ticker], price_data=price_data_for_dynamic).get(ticker, 50.0)
+            sig_scores, fired, sig_values = compute_signal_scores(
+                ticker, price_data_for_dynamic[ticker], rsi_val, earnings, weights, position["direction"]
+            )
+            signal_scores_json = json.dumps({"scores": sig_scores, "fired": fired, "values": sig_values})
+            synthetic = {
+                **position,
+                "signal_scores": signal_scores_json,
+                "lock_in_confidence": position.get("lock_in_confidence") or position.get("nn_confidence") or 0,
+                "expected_move": position.get("expected_move") or 0,
+                "day_change_percent": day_change_pct,
+            }
+            dyn_conf = nn_score_ticker(synthetic, position["direction"])
+            dyn_est = estimate_overnight_move(price_data_for_dynamic[ticker], dyn_conf, ticker in earnings)
+            confluence = calculate_method_confluence(ticker, price_data_for_dynamic)
+            conf_count = confluence["count"]
+            conf_methods = json.dumps(confluence["methods"])
+        except Exception as dynamic_error:
+            log.debug(f"NN dynamic update skipped for {ticker}: {dynamic_error}")
+
+        database.execute("""
+            UPDATE nn_virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?,
+            dynamic_confidence=?, dynamic_estimate=?, confluence_count=?, confluence_methods=?,
+            signal_scores=?, last_price_updated=?, day_change_percent=?
+            WHERE id=?
+        """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2),
+              dyn_conf, round(float(dyn_est or 0), 1), conf_count, conf_methods,
+              signal_scores_json, now.isoformat(), day_change_pct, position["id"]])
+        updated_count += 1
+
+        if not is_market_open():
+            continue
+
+        is_sell_day = position["buy_date"] < today
+        if is_sell_day and now.hour >= 8 and now.hour < 15:
+            should_sell, reason, sentiment = evaluate_sell_decision(position, price)
+            if should_sell:
+                net_pnl = pnl_dollars - FEE_PER_TRADE
+                outcome = "hit" if pnl_percent >= MIN_EXPECTED_MOVE else ("partial" if pnl_percent > 0 else "miss")
+                database.execute("""
+                    UPDATE nn_virtual_trades SET
+                        sell_date=?, sell_time=?, sell_price=?, current_value=?,
+                        actual_move=?, gross_pnl=?, net_pnl=?, outcome=?, sell_reason=?
+                    WHERE id=?
+                """, [today, now.strftime("%H:%M:%S"), price,
+                      round(current_value, 4), round(pnl_percent, 2),
+                      round(pnl_dollars, 4), round(net_pnl, 4),
+                      outcome, reason, position["id"]])
+                closed_count += 1
+                log.info(f"NN CLOSED {ticker} | {reason} | {pnl_percent:+.1f}% | ${pnl_dollars:+.2f}")
+
+    database.commit()
+    database.close()
+    log.info(f"Monitored {updated_count} NN positions, closed {closed_count}")
+
 def monitor_open_positions():
     """
     5-minute monitoring cycle for candidates and open positions.
@@ -3839,6 +4163,59 @@ def force_close_previous_session():
     log.info(f"Force-closed {closed_count} positions at 2:45 PM CST")
 
 # ── SELF-AUDIT ENGINE ─────────────────────────────────────────────────────────
+def force_close_nn_previous_session():
+    """Force-close previous-session NN positions without touching the main queue."""
+    now = current_time_cst()
+    if now.weekday() >= 5:
+        log.info("force_close_nn_previous_session: skipping weekend")
+        return
+
+    today = now.strftime("%Y-%m-%d")
+    database = get_database()
+    previous_session_positions = [dict(t) for t in database.execute(
+        "SELECT * FROM nn_virtual_trades WHERE outcome='open' AND buy_date < ?", [today]
+    ).fetchall()]
+    database.close()
+
+    if not previous_session_positions:
+        log.info("No NN positions to force-close")
+        return
+
+    tickers = list(set(position["ticker"] for position in previous_session_positions))
+    current_prices = fetch_current_prices(tickers)
+    random.shuffle(previous_session_positions)
+
+    database = get_database()
+    closed_count = 0
+
+    for position in previous_session_positions:
+        ticker = position["ticker"]
+        raw = current_prices.get(ticker)
+        price = raw["price"] if isinstance(raw, dict) else (raw or position.get("buy_price", 0))
+        buy_price = float(position["buy_price"] or price)
+        invested = float(position["invested_amount"] or DEFAULT_INVESTMENT)
+        pnl_percent = (price - buy_price) / buy_price * 100
+        if position["direction"] == "short":
+            pnl_percent = -pnl_percent
+        pnl_dollars = invested * (pnl_percent / 100)
+        net_pnl = pnl_dollars - FEE_PER_TRADE
+        ending_value = invested + pnl_dollars
+        outcome = "hit" if pnl_percent >= MIN_EXPECTED_MOVE else ("partial" if pnl_percent > 0 else "miss")
+
+        database.execute("""
+            UPDATE nn_virtual_trades SET
+                sell_date=?, sell_time=?, sell_price=?, current_value=?,
+                actual_move=?, gross_pnl=?, net_pnl=?, outcome=?, sell_reason=?
+            WHERE id=?
+        """, [today, "14:45:00", price, round(ending_value, 4),
+              round(pnl_percent, 2), round(pnl_dollars, 4), round(net_pnl, 4),
+              outcome, "forced_close", position["id"]])
+        closed_count += 1
+
+    database.commit()
+    database.close()
+    log.info(f"Force-closed {closed_count} NN positions at 2:45 PM CST")
+
 def run_self_audit():
     """Call Claude API to analyze prediction history and update signal weights."""
     log.info("Running self-audit...")
@@ -3971,9 +4348,11 @@ def run_scheduler():
 
     # 8:45 AM CST = 13:45 UTC — Execute positions at market open + 15 min
     schedule.every().day.at("13:45").do(execute_opening_positions)
+    schedule.every().day.at("13:45").do(execute_nn_opening_positions)
 
     # 2:45 PM CST = 19:45 UTC — Force-close previous session positions
     schedule.every().day.at("19:45").do(force_close_previous_session)
+    schedule.every().day.at("19:45").do(force_close_nn_previous_session)
 
     # 3:00 PM CST = 20:00 UTC — Market close scan
     schedule.every().day.at("20:00").do(lambda: run_comprehensive_scan(scan_type="market_close"))
@@ -4036,6 +4415,7 @@ def run_scheduler():
         if is_active and current_time - last_monitor_time >= dynamic_interval:
             try:
                 monitor_open_positions()
+                monitor_nn_open_positions()
                 last_monitor_time = current_time
             except Exception as error:
                 log.error(f"Monitor error: {error}")
@@ -5643,6 +6023,32 @@ def api_nn_scan_now():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
+@app.route("/api/nn-open-now", methods=["POST"])
+def api_nn_open_now():
+    """Manual recovery/testing endpoint for NN open execution."""
+    try:
+        result = execute_nn_opening_positions(trigger="manual_recovery", buy_time="08:45:00")
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/nn-open-execution-status")
+def api_nn_open_execution_status():
+    """Return the latest NN open execution diagnostic payload."""
+    try:
+        return jsonify(get_app_state_json("last_nn_open_execution", {}) or {})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/nn-force-close-now", methods=["POST"])
+def api_nn_force_close_now():
+    """Manual endpoint to force-close previous-session NN positions."""
+    try:
+        force_close_nn_previous_session()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route("/api/nn-debug")
 def api_nn_debug():
     """Diagnose NN state — torch install, weights, training readiness."""
@@ -5744,6 +6150,8 @@ def api_nn_stats():
             "win_rate": round(hits / resolved * 100, 1) if resolved else None,
             "total_gross_pnl": round(total_pnl, 2),
             "open_positions": open_count,
+            "portfolio_value": round(get_nn_portfolio_value(), 2),
+            "next_investment_amount": round(get_nn_investment_amount(), 2),
         })
     except Exception as e:
         return jsonify({"resolved": 0, "hits": 0, "misses": 0, "win_rate": None})
@@ -5807,6 +6215,7 @@ def api_personal_trades_add():
             body.get("source_portfolio", "brain"),
             now.isoformat(), now.isoformat()
         ])
+        db.commit()
         db.close()
         log.info(f"Personal trade added: {ticker} from {body.get('source_portfolio', 'brain')}")
         return jsonify({"success": True, "id": trade_id})
@@ -5988,7 +6397,46 @@ def backfill_missed_closes():
     except Exception as e:
         log.error(f"Startup backfill failed: {e}")
 
+def backfill_nn_missed_closes():
+    """Settle NN positions left open from previous sessions after restarts."""
+    try:
+        now = current_time_cst()
+        today = now.strftime("%Y-%m-%d")
+        db = get_database()
+        stuck = [dict(t) for t in db.execute(
+            "SELECT * FROM nn_virtual_trades WHERE outcome='open' AND buy_date < ?", [today]
+        ).fetchall()]
+        if not stuck:
+            db.close()
+            log.info("NN startup backfill: no stuck positions found")
+            return
+        log.info(f"NN startup backfill: closing {len(stuck)} stuck positions from previous sessions")
+        closed_count = 0
+        for position in stuck:
+            invested = position["invested_amount"] or DEFAULT_INVESTMENT
+            ending_value = position["current_value"] or invested
+            pnl_dollars = ending_value - invested
+            pnl_percent = (pnl_dollars / invested) * 100 if invested else 0
+            net_pnl = pnl_dollars - FEE_PER_TRADE
+            outcome = "hit" if pnl_percent >= MIN_EXPECTED_MOVE else ("partial" if pnl_percent > 0 else "miss")
+            db.execute("""
+                UPDATE nn_virtual_trades SET
+                    sell_date=?, sell_time=?, sell_price=?, current_value=?,
+                    actual_move=?, gross_pnl=?, net_pnl=?, outcome=?, sell_reason=?
+                WHERE id=?
+            """, [position["buy_date"], "14:45:00", position["buy_price"],
+                  round(ending_value, 4), round(pnl_percent, 2),
+                  round(pnl_dollars, 4), round(net_pnl, 4),
+                  outcome, "forced_close", position["id"]])
+            closed_count += 1
+        db.commit()
+        db.close()
+        log.info(f"NN startup backfill: settled {closed_count} positions")
+    except Exception as e:
+        log.error(f"NN startup backfill failed: {e}")
+
 backfill_missed_closes()
+backfill_nn_missed_closes()
 threading.Thread(target=run_scheduler, daemon=True).start()
 threading.Thread(target=keep_server_alive, daemon=True).start()
 log.info("Brain v4 initialized — full trading engine with self-regulating queue system + SwingDeskNet NN")
