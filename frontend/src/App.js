@@ -345,7 +345,7 @@ function refreshThemeTokens(key) {
   CARD_BORDER_LONG = _theme.CARD_BORDER_LONG; CARD_BORDER_SHORT = _theme.CARD_BORDER_SHORT;
 }
 
-const CARD_METRIC_GRID = "0.95fr 0.72fr 1.05fr 0.92fr 1.05fr";
+const CARD_METRIC_GRID = "0.95fr 0.72fr 1.05fr 0.72fr 0.95fr";
 const CARD_GRID_GAP = "8px";
 const CARD_PAD_L = "15px";
 const CARD_PAD_R = "12px";
@@ -399,7 +399,7 @@ function CardMetricGrid({ children, style = {} }) {
   );
 }
 
-function JournalButton({ state, onClick }) {
+function JournalButton({ state, onClick, compact = false }) {
   return (
     <button onClick={onClick} style={{
       background: state === "added" ? BLUE + "22" : state === "error" ? RED + "18" : "transparent",
@@ -410,12 +410,14 @@ function JournalButton({ state, onClick }) {
       fontWeight: 700,
       letterSpacing: 0.5,
       lineHeight: 1,
-      padding: "4px 7px",
+      minWidth: compact ? 34 : 64,
+      textAlign: "center",
+      padding: compact ? "4px 6px" : "4px 7px",
       cursor: "pointer",
       flexShrink: 0,
       transition: "all 0.2s",
     }}>
-      {state === "added" ? "ADDED" : state === "error" ? "ERR" : "JOURNAL"}
+      {state === "added" ? "ADDED" : state === "error" ? "ERR" : compact ? "ADD" : "JOURNAL"}
     </button>
   );
 }
@@ -435,12 +437,20 @@ function StaleBadge({ staleTime }) {
       whiteSpace: "nowrap",
       flexShrink: 0,
     }}>
-      scanned {staleTime}
+      scan {staleTime}
     </span>
   );
 }
 
-function CardActionRow({ statusLabel, statusPhrase, statusColor, staleTime, journal, tags, borderColor }) {
+function TagSlot({ children, width = 30 }) {
+  return (
+    <div style={{ width, display: "flex", justifyContent: "center", alignItems: "center", flexShrink: 0 }}>
+      {children}
+    </div>
+  );
+}
+
+function CardActionRow({ statusLabel, statusPhrase, statusColor, staleTime, actions, borderColor }) {
   return (
     <div style={{
       display: "grid",
@@ -457,13 +467,8 @@ function CardActionRow({ statusLabel, statusPhrase, statusColor, staleTime, jour
           <StaleBadge staleTime={staleTime} />
         </span>
       </div>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-        <div style={{ width: SPINE_VALUE_W, display: "flex", justifyContent: "flex-start", flexShrink: 0 }}>
-          {journal}
-        </div>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-start", gap: 3, minWidth: 0, overflow: "hidden" }}>
-          {tags}
-        </div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 4, minWidth: 0, overflow: "hidden" }}>
+        {actions}
       </div>
     </div>
   );
@@ -638,8 +643,9 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
       {/* Action row: status/staleness left of spine, journal/tags right of spine */}
       <CardActionRow
         borderColor={BORDER}
-        journal={onAddToPersonal && (
-          <JournalButton
+        actions={<>
+          {onAddToPersonal && <JournalButton
+            compact
             state={journalAdded}
             onClick={(e) => {
               e.stopPropagation();
@@ -648,19 +654,19 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
                 setTimeout(() => setJournalAdded(false), 1500);
               });
             }}
-          />
-        )}
-        tags={<>
-          <div style={{ width: 28, display: "flex", justifyContent: "center", flexShrink: 0 }}>
+          />}
+          <TagSlot>
             {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 ? (
               <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a" }}>52W</span>
             ) : null}
-          </div>
-          <div style={{ width: 28, display: "flex", justifyContent: "center", flexShrink: 0 }}>
+          </TagSlot>
+          <TagSlot>
+          </TagSlot>
+          <TagSlot>
             {pick.confluence_count > 0 ? (
               <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center" }}>{pick.confluence_count}/10</span>
             ) : null}
-          </div>
+          </TagSlot>
         </>}
       />
       {expanded && (
@@ -905,8 +911,9 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
         statusColor={sentiment.color}
         staleTime={isStale ? staleTime : null}
         borderColor={rulingColor}
-        journal={onAddToPersonal && (
-          <JournalButton
+        actions={<>
+          {onAddToPersonal && <JournalButton
+            compact
             state={journalAdded}
             onClick={(e) => {
               e.stopPropagation();
@@ -915,24 +922,22 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
                 setTimeout(() => setJournalAdded(false), 1500);
               });
             }}
-          />
-        )}
-        tags={<>
-          <div style={{ width: 28, display: "flex", justifyContent: "center", flexShrink: 0 }}>
+          />}
+          <TagSlot>
             {trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7 ? (
               <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a" }}>52W</span>
             ) : null}
-          </div>
-          <div style={{ width: 28, display: "flex", justifyContent: "center", flexShrink: 0 }}>
+          </TagSlot>
+          <TagSlot>
             {trade.signal_fired?.length > 0 ? (
               <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: BLUE, letterSpacing: .3, padding: "1px 4px", background: "#0a1020", borderRadius: 3, border: "1px solid #1a2a40", textAlign: "center" }}>{trade.signal_fired.length}/9</span>
             ) : null}
-          </div>
-          <div style={{ width: 28, display: "flex", justifyContent: "center", flexShrink: 0 }}>
+          </TagSlot>
+          <TagSlot>
             {trade.confluence_count > 0 ? (
               <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center" }}>{trade.confluence_count}/10</span>
             ) : null}
-          </div>
+          </TagSlot>
           {(sentiment.label === "CUT" || trade.outcome === "sold" || trade.outcome === "force_closed") && (
             <button onClick={(e) => { e.stopPropagation(); onDone && onDone(cardKey); }}
               style={{ background: "#222", border: `1px solid ${CARD_BORDER_LONG === "#1a3a4a" ? BLUE + "66" : "#444"}`, borderRadius: 4, color: "#ccc", fontSize: 9, fontWeight: 700, letterSpacing: 0.5, padding: "2px 8px", cursor: "pointer" }}>
@@ -2148,7 +2153,7 @@ export default function App() {
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center" }}>Day %</div>
                     <SpineCell><div style={{ width: SPINE_VALUE_W, fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center", whiteSpace: "nowrap" }}>Open P&L</div></SpineCell>
-                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right", paddingRight: 0 }}>+$</div>
+                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right", paddingRight: 6 }}>+$</div>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right" }}>Conf</div>
                   </CardMetricGrid>
                 )}
@@ -2260,7 +2265,7 @@ export default function App() {
                 </div>
               ) : (
                 <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 20, textAlign: "center", fontSize: 12, color: T3 }}>
-                  Neural network is training. Picks will appear after first nightly audit.
+                  No neural picks are currently cached above threshold.
                 </div>
               )}
             </div>
@@ -2277,7 +2282,7 @@ export default function App() {
               {personalTrades.length === 0 ? (
                 <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 24, textAlign: "center" }}>
                   <div style={{ fontSize: 13, color: T2, marginBottom: 6 }}>No personal positions yet.</div>
-                  <div style={{ fontSize: 11, color: T3 }}>Tap "Add to 📝" on any Brain or Neural stock card.</div>
+                  <div style={{ fontSize: 11, color: T3 }}>Tap ADD on any Brain or Neural stock card.</div>
                 </div>
               ) : (
                 <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
