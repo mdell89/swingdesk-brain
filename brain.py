@@ -6360,6 +6360,80 @@ def api_suspect_startup_closed():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/repair-consumed-accidental-queue", methods=["POST"])
+def api_repair_consumed_accidental_queue():
+    """
+    Normalize trades that consumed queue entries created by the accidental
+    startup close before those source positions were restored.
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        source_buy_date = body.get("source_buy_date")
+        consumer_buy_date = body.get("consumer_buy_date") or current_time_cst().strftime("%Y-%m-%d")
+        if not source_buy_date:
+            return jsonify({"success": False, "error": "source_buy_date required"}), 400
+
+        db = get_database()
+        bad_rows = [dict(row) for row in db.execute("""
+            SELECT tq.id AS queue_id,
+                   tq.amount AS queue_amount,
+                   tq.source_trade_id,
+                   tq.consumed_by_trade_id,
+                   vt.ticker,
+                   vt.invested_amount,
+                   vt.current_value
+            FROM trade_queue tq
+            JOIN virtual_trades vt ON vt.id = tq.consumed_by_trade_id
+            WHERE tq.consumed=1
+              AND tq.source_trade_id IN (
+                  SELECT id FROM virtual_trades
+                  WHERE buy_date=?
+                    AND outcome='open'
+                    AND sell_date IS NULL
+                    AND sell_reason IS NULL
+              )
+              AND vt.buy_date=?
+              AND vt.outcome='open'
+        """, [source_buy_date, consumer_buy_date]).fetchall()]
+
+        fallback_amount = round(get_dynamic_fallback_amount(), 4)
+        repaired = []
+        for row in bad_rows:
+            old_invested = float(row["invested_amount"] or DEFAULT_INVESTMENT)
+            old_current = float(row["current_value"] or old_invested)
+            value_ratio = old_current / old_invested if old_invested else 1.0
+            new_current = round(fallback_amount * value_ratio, 4)
+            db.execute("""
+                UPDATE virtual_trades
+                SET invested_amount=?, current_value=?, queue_position=NULL
+                WHERE id=?
+            """, [fallback_amount, new_current, row["consumed_by_trade_id"]])
+            repaired.append({
+                **row,
+                "new_invested_amount": fallback_amount,
+                "new_current_value": new_current,
+            })
+
+        if bad_rows:
+            placeholders = ",".join("?" for _ in bad_rows)
+            db.execute(
+                f"DELETE FROM trade_queue WHERE id IN ({placeholders})",
+                [row["queue_id"] for row in bad_rows]
+            )
+        db.commit()
+        db.close()
+        return jsonify({
+            "success": True,
+            "source_buy_date": source_buy_date,
+            "consumer_buy_date": consumer_buy_date,
+            "repaired": len(repaired),
+            "fallback_amount": fallback_amount,
+            "trades": repaired,
+        })
+    except Exception as e:
+        log.error(f"repair consumed accidental queue failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route("/api/nn-debug")
 def api_nn_debug():
     """Diagnose NN state — torch install, weights, training readiness."""
