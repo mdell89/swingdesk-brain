@@ -165,6 +165,8 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
+_monitor_singleflight_lock = threading.Lock()
+
 # ── NEURAL NETWORK ────────────────────────────────────────────────────────────
 # SwingDeskNet: feedforward NN for overnight swing trade prediction
 # Input: ~46 features (9 signal scores + raw values + metadata + news sentiment)
@@ -486,7 +488,8 @@ def is_weekday():
 def is_market_open():
     """Returns True during regular market hours (8:30 AM - 3:00 PM CST)."""
     now = current_time_cst()
-    return now.weekday() < 5 and 8 <= now.hour < 15
+    minute_of_day = now.hour * 60 + now.minute
+    return now.weekday() < 5 and (8 * 60 + 30) <= minute_of_day < (15 * 60)
 
 def minutes_until_forced_close():
     """Returns minutes remaining until the 2:45 PM CST forced close."""
@@ -3152,14 +3155,14 @@ def send_close_notification(ticker, pnl_dollar, pnl_pct, close_reason, close_tim
 
 def is_extended_hours():
     """
-    Returns True if current CST time is in pre-market (4:00-9:30 AM) or
-    post-market (4:00-8:00 PM) session. Used to decide whether to fetch
+    Returns True if current CST time is in pre-market (4:00-8:30 AM) or
+    post-market (3:00-7:00 PM) session. Used to decide whether to fetch
     live extended-hours prices via fast_info instead of daily OHLCV close.
     """
     now = current_time_cst()
-    hour = now.hour + now.minute / 60
-    is_premarket  = 4.0 <= hour < 9.5
-    is_postmarket = 16.0 <= hour < 20.0
+    minute_of_day = now.hour * 60 + now.minute
+    is_premarket  = (4 * 60) <= minute_of_day < (8 * 60 + 30)
+    is_postmarket = (15 * 60) <= minute_of_day < (19 * 60)
     return is_premarket or is_postmarket, is_premarket
 
 
@@ -4781,6 +4784,11 @@ def _monitor_open_positions_impl():
 def monitor_open_positions():
     """Run the open-position monitor with watchdog cleanup around the hot path."""
     started_at = current_time_cst().isoformat()
+    if not _monitor_singleflight_lock.acquire(blocking=False):
+        event_id = begin_scan_event("open_position_monitor", job_type="monitor", tickers_attempted=0)
+        finish_scan_event(event_id, status="skipped", error="monitor already running")
+        log.info("monitor_open_positions skipped - previous monitor pass still running")
+        return {"success": False, "skipped": True, "reason": "monitor already running"}
     try:
         mark_stalled_scan_events(max_age_minutes=10)
         return _monitor_open_positions_impl()
@@ -4790,6 +4798,7 @@ def monitor_open_positions():
         raise
     finally:
         mark_stalled_scan_events(max_age_minutes=10)
+        _monitor_singleflight_lock.release()
 
 def force_close_previous_session():
     """
@@ -5121,10 +5130,10 @@ def run_scheduler():
         dynamic_interval = 150 if is_regular else 300  # 150s = 2.5 min, 300s = 5 min
 
         if is_active and current_time - last_monitor_time >= dynamic_interval:
+            last_monitor_time = current_time
             try:
                 monitor_open_positions()
                 monitor_nn_open_positions()
-                last_monitor_time = current_time
             except Exception as error:
                 log.error(f"Monitor error: {error}")
 
@@ -5738,6 +5747,7 @@ def api_intraday_pnl():
 
 @app.route("/api/scan-history")
 def api_scan_history():
+    mark_stalled_scan_events(max_age_minutes=10)
     database = get_database()
     rows = [dict(r) for r in database.execute("""
         SELECT id,
