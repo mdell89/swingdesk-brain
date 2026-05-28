@@ -399,6 +399,49 @@ function CardMetricGrid({ children, style = {} }) {
   );
 }
 
+const COMPANY_PROFILES = {
+  AMD: ["Advanced Micro Devices, Inc.", "Designs CPUs, GPUs, and adaptive chips for PCs, data centers, gaming, and AI."],
+  APH: ["Amphenol Corporation", "Makes electronic connectors, sensors, antennas, and cable systems for industrial and tech markets."],
+  APP: ["AppLovin Corporation", "Runs mobile app advertising and monetization software for game and app developers."],
+  AZO: ["AutoZone, Inc.", "Sells automotive replacement parts, tools, and accessories through retail stores."],
+  BB: ["BlackBerry Limited", "Provides cybersecurity, endpoint management, and embedded software for connected devices."],
+  CHPT: ["ChargePoint Holdings, Inc.", "Operates electric vehicle charging networks and charging-management software."],
+  DELL: ["Dell Technologies Inc.", "Builds PCs, servers, storage, and enterprise infrastructure systems."],
+  EL: ["The Estee Lauder Companies Inc.", "Sells prestige skin care, makeup, fragrance, and hair care products globally."],
+  F: ["Ford Motor Company", "Manufactures trucks, SUVs, commercial vehicles, EVs, and automotive financing services."],
+  FSLR: ["First Solar, Inc.", "Manufactures thin-film solar modules and provides utility-scale solar technology."],
+  GNRC: ["Generac Holdings Inc.", "Makes backup generators, energy storage, and power-management products."],
+  MDB: ["MongoDB, Inc.", "Provides document database software and cloud data platform services."],
+  MU: ["Micron Technology, Inc.", "Makes memory and storage chips used in data centers, PCs, phones, and autos."],
+  NOK: ["Nokia Oyj", "Provides telecom network equipment, software, and services for carriers and enterprises."],
+  NUE: ["Nucor Corporation", "Produces steel, steel products, and raw materials through mini-mill operations."],
+  ON: ["ON Semiconductor Corporation", "Makes power and sensing chips for automotive, industrial, and energy markets."],
+  PENN: ["PENN Entertainment, Inc.", "Operates casinos, online sports betting, and digital gaming brands."],
+  PLUG: ["Plug Power Inc.", "Develops hydrogen fuel cell systems, electrolyzers, and green hydrogen infrastructure."],
+  QS: ["QuantumScape Corporation", "Develops solid-state lithium-metal battery technology for electric vehicles."],
+  RGTI: ["Rigetti Computing, Inc.", "Builds quantum computing processors, systems, and cloud-accessible quantum services."],
+  RIOT: ["Riot Platforms, Inc.", "Operates Bitcoin mining and digital infrastructure facilities."],
+  ROST: ["Ross Stores, Inc.", "Operates off-price apparel and home fashion retail stores."],
+  SMCI: ["Super Micro Computer, Inc.", "Builds high-performance servers and AI infrastructure systems for data centers."],
+  SOFI: ["SoFi Technologies, Inc.", "Provides digital banking, lending, investing, and financial technology services."],
+  SPCE: ["Virgin Galactic Holdings, Inc.", "Develops commercial spaceflight experiences and aerospace systems."],
+  SPOT: ["Spotify Technology S.A.", "Operates a global audio streaming platform for music, podcasts, and audiobooks."],
+  STEM: ["Stem, Inc.", "Provides AI-driven clean energy storage software and battery management systems."],
+  TSCO: ["Tractor Supply Company", "Runs rural lifestyle retail stores for farm, ranch, pet, and home needs."],
+  TTWO: ["Take-Two Interactive Software, Inc.", "Publishes interactive entertainment through labels including Rockstar and 2K."],
+  UPST: ["Upstart Holdings, Inc.", "Operates an AI lending platform connecting borrowers with bank and credit partners."],
+  WDAY: ["Workday, Inc.", "Provides cloud software for human capital management, finance, and planning."],
+  WDC: ["Western Digital Corporation", "Makes data storage devices and flash memory products for consumer and enterprise markets."],
+};
+
+function getCompanyContext(item = {}) {
+  const ticker = (item.ticker || "").toUpperCase();
+  const profile = COMPANY_PROFILES[ticker];
+  const name = item.company_name || item.full_name || item.name || profile?.[0] || ticker;
+  const description = item.company_description || item.description || profile?.[1] || "Company profile unavailable.";
+  return { name, description };
+}
+
 function JournalButton({ state, onClick, compact = false }) {
   return (
     <button onClick={onClick} style={{
@@ -813,9 +856,11 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
   const frozenConfidence = Number(trade.confidence) || 0;
   const dynamicConfidence = Number(trade.dynamic_confidence) || frozenConfidence;
   const dynamicEstimate = Number(trade.dynamic_estimate) || frozenTarget;
+  const currentPrice = trade.current_value && investedAmount > 0 ? (trade.current_value / investedAmount) * buyPrice : null;
   const lockInConfidence = Number(trade.lock_in_confidence) || frozenConfidence;
   const confDelta = dynamicConfidence - lockInConfidence;
   const confDeltaColor = confDelta > 0 ? GREEN : confDelta < 0 ? RED : T3;
+  const companyContext = getCompanyContext(trade);
 
   // Safe parse — confluence_methods may arrive as JSON string from DB
   const confluenceMethods = Array.isArray(trade.confluence_methods)
@@ -941,18 +986,21 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
       {/* ── Expanded detail — 2-column grid ── */}
       {expanded && (
         <div style={{ padding: "4px 12px 0", borderTop: `1px solid ${rulingColor}` }}>
+          <div style={{ padding: "6px 0 7px", borderBottom: `1px solid ${rulingColor}`, marginBottom: 5 }}>
+            <div style={{ fontSize: 10, color: T1, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{companyContext.name}</div>
+            <div style={{ fontSize: 9, color: T3, marginTop: 2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{companyContext.description}</div>
+          </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 12px" }}>
             {[
-              ["Entry price", `$${buyPrice.toFixed(2)}`],
-              ["Current price", (() => { const cp = trade.current_value && investedAmount > 0 ? (trade.current_value / investedAmount) * buyPrice : null; return cp ? `$${cp.toFixed(2)}` : "—"; })()],
+              ["Position size", `$${currentValue.toFixed(2)}`],
               ["Sector", trade.sector],
-              ["Opened", formatDate(trade.buy_date)],
               ["Held", `${daysHeld(trade.buy_date)}d`],
-              trade.current_rsi != null ? ["RSI", trade.current_rsi] : null,
-              trade.current_volume_ratio != null ? ["Volume ratio", `${trade.current_volume_ratio}x`] : null,
+              ["Opened", formatDate(trade.buy_date)],
+              ["Entry price", `$${buyPrice.toFixed(2)}`],
+              ["Current price", currentPrice ? `$${currentPrice.toFixed(2)}` : "—"],
               ["Entry estimate", `+${frozenTarget.toFixed(1)}%`],
-              ["Entry confidence", `${frozenConfidence}%`],
               ["Current estimate", `+${dynamicEstimate.toFixed(1)}%`],
+              ["Entry confidence", `${frozenConfidence}%`],
               ["Current confidence", `${dynamicConfidence}%`],
             ].filter(Boolean).map(([label, value]) => (
               <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: `1px solid ${rulingColor}` }}>
@@ -1498,8 +1546,12 @@ export default function App() {
     { id: "smart",      label: "Smart"      },
     { id: "gain",       label: "% Gain"     },
     { id: "loss",       label: "% Loss"     },
-    { id: "conf_hi",    label: "Conf ↑"     },
-    { id: "conf_lo",    label: "Conf ↓"     },
+    { id: "conf_hi",    label: "Entry conf ↑" },
+    { id: "conf_lo",    label: "Entry conf ↓" },
+    { id: "curr_conf_hi", label: "Current conf ↑" },
+    { id: "curr_conf_lo", label: "Current conf ↓" },
+    { id: "conf_drift_lo", label: "Conf drift ↑" },
+    { id: "conf_drift_hi", label: "Conf drift ↓" },
     { id: "method_hi",  label: "Methods ↑"  },
     { id: "method_lo",  label: "Methods ↓"  },
     { id: "oldest",     label: "Oldest"     },
@@ -1511,6 +1563,7 @@ export default function App() {
   const [hiddenRunners, setHiddenRunners] = useState({});
   const [buyListExpanded, setBuyListExpanded] = useState(false);
   const [sellListExpanded, setSellListExpanded] = useState(false);
+  const [openDayFilter, setOpenDayFilter] = useState("all");
   const [dismissedPostClose, setDismissedPostClose] = useState({});
 
   const [perfTimeframe, setPerfTimeframe] = useState("M");
@@ -1815,8 +1868,6 @@ export default function App() {
   const sellTodayPositions = isWeekendNow ? openLongPositions : openLongPositions.filter(t => t.buy_date < today);
   // Holding = current session positions (opened today)
   const holdingPositions = openLongPositions.filter(t => t.buy_date === today);
-  // Keep for legacy compat
-  const longSellList = sellTodayPositions;
   const shortCoverList = isWeekendNow ? [] : openPositions.filter(t => t.buy_date < today && t.outcome === "open" && t.direction === "short");
 
   // Recently closed = closed positions not yet dismissed, within 30 days
@@ -1837,13 +1888,21 @@ export default function App() {
     return 1;
   }
 
+  const entryConfidence = trade => Number(trade.lock_in_confidence ?? trade.confidence ?? 0);
+  const currentConfidence = trade => Number(trade.dynamic_confidence ?? trade.confidence ?? 0);
+  const confidenceDrift = trade => Math.abs(entryConfidence(trade) - currentConfidence(trade));
+
   function sortPositions(positions) {
     const arr = [...positions];
     switch (sortMode) {
       case "gain":      return arr.sort((a, b) => (b.current_pnl_percent || 0) - (a.current_pnl_percent || 0));
       case "loss":      return arr.sort((a, b) => (a.current_pnl_percent || 0) - (b.current_pnl_percent || 0));
-      case "conf_hi":   return arr.sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
-      case "conf_lo":   return arr.sort((a, b) => (a.confidence || 0) - (b.confidence || 0));
+      case "conf_hi":   return arr.sort((a, b) => entryConfidence(b) - entryConfidence(a));
+      case "conf_lo":   return arr.sort((a, b) => entryConfidence(a) - entryConfidence(b));
+      case "curr_conf_hi": return arr.sort((a, b) => currentConfidence(b) - currentConfidence(a));
+      case "curr_conf_lo": return arr.sort((a, b) => currentConfidence(a) - currentConfidence(b));
+      case "conf_drift_lo": return arr.sort((a, b) => confidenceDrift(a) - confidenceDrift(b));
+      case "conf_drift_hi": return arr.sort((a, b) => confidenceDrift(b) - confidenceDrift(a));
       case "method_hi": return arr.sort((a, b) => (b.confluence_count || 0) - (a.confluence_count || 0));
       case "method_lo": return arr.sort((a, b) => (a.confluence_count || 0) - (b.confluence_count || 0));
       case "oldest":    return arr.sort((a, b) => (a.buy_date || "").localeCompare(b.buy_date || ""));
@@ -1851,7 +1910,7 @@ export default function App() {
       default:          return arr.sort((a, b) => {
         const ap = getSentimentPriority(a), bp = getSentimentPriority(b);
         if (ap !== bp) return ap - bp;
-        const confDiff = (b.confidence || 0) - (a.confidence || 0);
+        const confDiff = currentConfidence(b) - currentConfidence(a);
         if (confDiff !== 0) return confDiff;
         return (b.current_pnl_percent || 0) - (a.current_pnl_percent || 0);
       });
@@ -1862,9 +1921,15 @@ export default function App() {
   const sortedHolding = sortPositions(holdingPositions);
   const sortedLongPositions = sortPositions(openLongPositions);
   const sortedShortPositions = sortPositions(openShortPositions);
+  const openFilteredPositions = openDayFilter === "day2"
+    ? sellTodayPositions
+    : openDayFilter === "day1"
+      ? holdingPositions
+      : openLongPositions;
+  const sortedOpenFilteredPositions = sortPositions(openFilteredPositions);
 
   const buyVisible = buyListExpanded ? allBuyPicks : allBuyPicks.slice(0, 20);
-  const sellVisible = sellListExpanded ? longSellList : longSellList.slice(0, 20);
+  const sellVisible = sellListExpanded ? sortedOpenFilteredPositions : sortedOpenFilteredPositions.slice(0, 20);
 
   // Live P&L from open positions
   const livePnl = openPositions.reduce((total, trade) => {
@@ -2228,8 +2293,31 @@ export default function App() {
                   </div>
                 )}
 
+                {openLongPositions.length > 0 && (
+                  <div style={{ display: "flex", gap: 4, marginBottom: 7 }}>
+                    {[
+                      ["all", `All (${openLongPositions.length})`],
+                      ["day2", `Day 2 (${sellTodayPositions.length})`],
+                      ["day1", `Day 1 (${holdingPositions.length})`],
+                    ].map(([id, label]) => (
+                      <button key={id} onClick={() => setOpenDayFilter(id)} style={{
+                        flex: 1,
+                        padding: "5px 0",
+                        borderRadius: 5,
+                        border: `1px solid ${openDayFilter === id ? GREEN + "55" : BORDER}`,
+                        background: openDayFilter === id ? GREEN + "12" : "transparent",
+                        color: openDayFilter === id ? GREEN : T3,
+                        fontSize: 9,
+                        fontWeight: 700,
+                        letterSpacing: .3,
+                        cursor: "pointer",
+                      }}>{label}</button>
+                    ))}
+                  </div>
+                )}
+
                 {/* ── Column header (shared for both sections) ── */}
-                {(sellTodayPositions.length > 0 || holdingPositions.length > 0) && (
+                {openLongPositions.length > 0 && (
                   <CardMetricGrid style={{ padding: `0 ${CARD_PAD_R} 5px ${CARD_PAD_L}` }}>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "left" }}>Day %</div>
@@ -2239,8 +2327,28 @@ export default function App() {
                   </CardMetricGrid>
                 )}
 
+                {openLongPositions.length > 0 && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 12 }}>
+                    {sellVisible.map(trade => (
+                      <PositionCard key={trade.id} trade={trade} isLong={true}
+                        expanded={expandedCards[trade.id || trade.ticker]}
+                        isDone={doneCuts[trade.id || trade.ticker] === "done"}
+                        isClosed={doneCuts[trade.id || trade.ticker] === "closed"}
+                        pdtRemaining={pdtRemaining}
+                        themeKey={themeKey}
+                        onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
+                        onDone={key => { setDoneCuts(prev => ({ ...prev, [key]: "done" })); setExpandedCards(prev => ({ ...prev, [key]: false })); }}
+                        onView={key => setDoneCuts(prev => ({ ...prev, [key]: "open" }))}
+                        onClose={key => setDoneCuts(prev => ({ ...prev, [key]: "closed" }))}
+                        onAddToPersonal={trade => handleAddToPersonal(trade, "brain")}
+                      />
+                    ))}
+                    <ExpandButton isExpanded={sellListExpanded} onToggle={() => setSellListExpanded(e => !e)} totalCount={openFilteredPositions.length} label="positions" />
+                  </div>
+                )}
+
                 {/* ── Sell Today ── */}
-                {sellTodayPositions.length > 0 && (
+                {false && sellTodayPositions.length > 0 && (
                   <div style={{ marginBottom: 12 }}>
                     <div style={{ fontSize: 9, color: AMBER, fontWeight: 700, textTransform: "uppercase", letterSpacing: .8, padding: "4px 0 6px" }}>
                       Sell Today ({sellTodayPositions.length})
@@ -2265,7 +2373,7 @@ export default function App() {
                 )}
 
                 {/* ── Holding ── */}
-                {holdingPositions.length > 0 && (
+                {false && holdingPositions.length > 0 && (
                   <div style={{ marginBottom: 12 }}>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 700, textTransform: "uppercase", letterSpacing: .8, padding: "4px 0 6px" }}>
                       Holding ({holdingPositions.length})
