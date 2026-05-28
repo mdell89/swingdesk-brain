@@ -4851,22 +4851,32 @@ def api_performance_history():
         ORDER BY pc.check_time ASC
     """).fetchall()
 
+    first_trade_row = database.execute("""
+        SELECT MIN(first_date) AS first_date FROM (
+            SELECT MIN(buy_date) AS first_date FROM virtual_trades WHERE buy_date IS NOT NULL
+            UNION ALL
+            SELECT MIN(sell_date) AS first_date FROM virtual_trades WHERE sell_date IS NOT NULL
+            UNION ALL
+            SELECT MIN(substr(check_time, 1, 10)) AS first_date FROM position_checks WHERE check_time IS NOT NULL
+        )
+    """).fetchone()
+
     database.close()
 
     # ── Build settled balance timeline ────────────────────────────────────────
     running_balance = 1000.0
     history = []
 
-    # Seed point — always use last trading weekday date so the frontend
-    # baseline lookup (which filters for weekdays only) can always find it.
-    # Using utcnow()-1 breaks on weekends when "yesterday" is Saturday.
+    # Seed point: anchor the account at the first real day this ledger has data.
+    # A moving "yesterday" seed makes W/M charts understate young portfolios.
     def last_trading_weekday():
         d = datetime.utcnow() - timedelta(days=1)
         # Walk back until we hit a weekday (Mon=0 ... Fri=4)
         while d.weekday() >= 5:
             d -= timedelta(days=1)
         return d
-    seed_day = last_trading_weekday()
+    first_trade_date = first_trade_row["first_date"] if first_trade_row else None
+    seed_day = datetime.fromisoformat(first_trade_date) if first_trade_date else last_trading_weekday()
     seed_ts = int(seed_day.replace(hour=9, minute=0, second=0).timestamp() * 1000)
     history.append({
         "date": seed_day.strftime("%Y-%m-%d"),
@@ -4886,7 +4896,7 @@ def api_performance_history():
             "virtual": round(running_balance, 2),
             "daily_pnl": round(float(row["daily_pnl"] or 0), 4),
             "trades": row["trade_count"],
-            "ts": int(datetime.fromisoformat(row["date"]).timestamp() * 1000),
+            "ts": int(datetime.fromisoformat(row["date"]).replace(hour=16, minute=0, second=0).timestamp() * 1000),
         })
 
     # ── Overlay position check snapshots as intraday points ───────────────────
@@ -6372,6 +6382,80 @@ def api_nn_stats():
         })
     except Exception as e:
         return jsonify({"resolved": 0, "hits": 0, "misses": 0, "win_rate": None})
+
+@app.route("/api/nn-perf-history")
+def api_nn_performance_history():
+    """Return Neural portfolio equity curve from its independent trade ledger."""
+    try:
+        database = get_database()
+        daily_results = database.execute("""
+            SELECT sell_date AS date,
+                   SUM(COALESCE(net_pnl, gross_pnl, 0)) AS daily_pnl,
+                   COUNT(*) AS trade_count
+            FROM nn_virtual_trades
+            WHERE outcome != 'open' AND sell_date IS NOT NULL
+            GROUP BY sell_date
+            ORDER BY sell_date ASC
+        """).fetchall()
+        first_trade_row = database.execute("""
+            SELECT MIN(first_date) AS first_date FROM (
+                SELECT MIN(buy_date) AS first_date FROM nn_virtual_trades WHERE buy_date IS NOT NULL
+                UNION ALL
+                SELECT MIN(sell_date) AS first_date FROM nn_virtual_trades WHERE sell_date IS NOT NULL
+            )
+        """).fetchone()
+        open_rows = database.execute(
+            "SELECT invested_amount, current_value FROM nn_virtual_trades WHERE outcome='open'"
+        ).fetchall()
+        database.close()
+
+        first_trade_date = first_trade_row["first_date"] if first_trade_row else None
+        if first_trade_date:
+            seed_day = datetime.fromisoformat(first_trade_date)
+        else:
+            seed_day = current_time_cst()
+        seed_ts = int(seed_day.replace(hour=9, minute=0, second=0).timestamp() * 1000)
+        running_balance = STARTING_PORTFOLIO_VALUE
+        history = [{
+            "date": seed_day.strftime("%Y-%m-%d"),
+            "virtual": round(STARTING_PORTFOLIO_VALUE, 2),
+            "daily_pnl": 0,
+            "trades": 0,
+            "ts": seed_ts,
+            "seed": True,
+        }]
+
+        for row in daily_results:
+            running_balance += float(row["daily_pnl"] or 0)
+            history.append({
+                "date": row["date"],
+                "virtual": round(running_balance, 2),
+                "daily_pnl": round(float(row["daily_pnl"] or 0), 4),
+                "trades": row["trade_count"],
+                "ts": int(datetime.fromisoformat(row["date"]).replace(hour=16, minute=0, second=0).timestamp() * 1000),
+            })
+
+        live_pnl = sum(
+            float(row["current_value"] or row["invested_amount"] or DEFAULT_INVESTMENT)
+            - float(row["invested_amount"] or DEFAULT_INVESTMENT)
+            for row in open_rows
+        )
+        if open_rows:
+            now_cst = current_time_cst()
+            history.append({
+                "date": now_cst.strftime("%Y-%m-%d"),
+                "virtual": round(running_balance + live_pnl, 2),
+                "daily_pnl": round(live_pnl, 4),
+                "trades": 0,
+                "ts": int(now_cst.timestamp() * 1000),
+                "intraday": True,
+                "live": True,
+            })
+        history.sort(key=lambda point: point["ts"])
+        return jsonify(history)
+    except Exception as e:
+        log.warning(f"nn perf history failed: {e}")
+        return jsonify([])
 
 @app.route("/api/nn-all-closed")
 def api_nn_all_closed():

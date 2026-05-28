@@ -467,39 +467,50 @@ function CardActionRow({ statusLabel, statusPhrase, statusColor, staleTime, acti
 }
 
 // ─── MINI CHART ───────────────────────────────────────────────────────────────
+const TIMEFRAME_DAYS = { D: 1, W: 7, M: 30, "3M": 90, Y: 365, ALL: 9999 };
+
+function filterPerfHistoryForTimeframe(data, timeframe, lastTradingDate) {
+  if (!data || !data.length) return [];
+  if (timeframe === "D") {
+    const sorted = [...data].sort((a, b) => b.ts - a.ts);
+    const latestTradingPoint = sorted.find(p => {
+      const d = new Date(p.ts);
+      return d.getDay() >= 1 && d.getDay() <= 5;
+    });
+    if (!latestTradingPoint) return data.slice(-20);
+    const latestDay = latestTradingPoint.date || lastTradingDate;
+    const dayPoints = data.filter(p => p.date === latestDay);
+
+    if (dayPoints.length < 2) {
+      const priorPoints = sorted.filter(p => p.date < latestDay && new Date(p.ts).getDay() >= 1 && new Date(p.ts).getDay() <= 5);
+      if (priorPoints.length > 0) {
+        const priorDay = priorPoints[0].date;
+        const priorDayPoints = data.filter(p => p.date === priorDay);
+        const anchor = priorDayPoints[priorDayPoints.length - 1];
+        return anchor ? [anchor, ...dayPoints] : (dayPoints.length ? dayPoints : data.slice(-20));
+      }
+      return dayPoints.length ? dayPoints : data.slice(-20);
+    }
+    return dayPoints;
+  }
+
+  const sorted = [...data].sort((a, b) => a.ts - b.ts);
+  const cutoffDays = TIMEFRAME_DAYS[timeframe] || 30;
+  if (timeframe === "ALL") return sorted;
+  const firstTs = sorted[0]?.ts || Date.now();
+  const fullHistoryDays = (Date.now() - firstTs) / 86400000;
+  if (fullHistoryDays <= cutoffDays) return sorted;
+  const filtered = sorted.filter(point => point.ts >= Date.now() - cutoffDays * 86400000);
+  return filtered.length > 0 ? filtered : sorted.filter(p => p.date === lastTradingDate);
+}
+
 function MiniChart({ data, timeframe, feeAdjusted = false }) {
   const WIDTH = 360, HEIGHT = 90, PAD_TOP = 6, PAD_BOTTOM = 16, PAD_LEFT = 2, PAD_RIGHT = 2;
   const [hoveredPoint, setHoveredPoint] = useState(null);
 
   const filteredData = useMemo(() => {
     if (!data || !data.length) return [];
-    if (timeframe === "D") {
-      const sorted = [...data].sort((a, b) => b.ts - a.ts);
-      const latestTradingPoint = sorted.find(p => {
-        const d = new Date(p.ts);
-        return d.getDay() >= 1 && d.getDay() <= 5;
-      });
-      if (!latestTradingPoint) return data.slice(-20);
-      const latestDay = latestTradingPoint.date;
-      const dayPoints = data.filter(p => p.date === latestDay);
-
-      // If only 1 point for latest trading day (weekend, early session),
-      // prepend last point of prior trading day as baseline anchor so
-      // the 1D chart shows movement vs yesterday's close, not a flat line.
-      if (dayPoints.length < 2) {
-        const priorPoints = sorted.filter(p => p.date < latestDay && new Date(p.ts).getDay() >= 1 && new Date(p.ts).getDay() <= 5);
-        if (priorPoints.length > 0) {
-          const priorDay = priorPoints[0].date;
-          const priorDayPoints = data.filter(p => p.date === priorDay);
-          const anchor = priorDayPoints[priorDayPoints.length - 1];
-          return anchor ? [anchor, ...dayPoints] : (dayPoints.length ? dayPoints : data.slice(-20));
-        }
-        return dayPoints.length ? dayPoints : data.slice(-20);
-      }
-      return dayPoints;
-    }
-    const cutoffDays = { W: 7, M: 30, "3M": 90, Y: 365, ALL: 9999 }[timeframe] || 30;
-    return data.filter(point => point.ts >= Date.now() - cutoffDays * 86400000);
+    return filterPerfHistoryForTimeframe(data, timeframe);
   }, [data, timeframe]);
 
   if (filteredData.length < 2) return (
@@ -1470,6 +1481,8 @@ export default function App() {
   const [nnPositions, setNnPositions] = useState([]);
   const [nnPicks, setNnPicks] = useState({ recommended_longs: [], recommended_shorts: [] });
   const [nnStats, setNnStats] = useState(null);
+  const [nnPerfHistory, setNnPerfHistory] = useState([]);
+  const [nnPerfTimeframe, setNnPerfTimeframe] = useState("M");
   const [nnAction, setNnAction] = useState(null);
   const [nnScanStatus, setNnScanStatus] = useState(null);
   const [personalForm, setPersonalForm] = useState({
@@ -1536,14 +1549,16 @@ export default function App() {
   };
 
   const refreshNeuralPortfolio = async () => {
-    const [nnPicksData, nnPositionsData, nnStatsData] = await Promise.all([
+    const [nnPicksData, nnPositionsData, nnStatsData, nnPerfData] = await Promise.all([
       apiFetch("/nn-picks").catch(() => ({ recommended_longs: [], recommended_shorts: [] })),
       apiFetch("/nn-positions").catch(() => []),
       apiFetch("/nn-stats").catch(() => null),
+      apiFetch("/nn-perf-history").catch(() => []),
     ]);
     setNnPicks(nnPicksData || { recommended_longs: [], recommended_shorts: [] });
     setNnPositions(nnPositionsData || []);
     setNnStats(nnStatsData);
+    setNnPerfHistory(nnPerfData || []);
   };
 
   const runNeuralAction = async (kind) => {
@@ -1626,7 +1641,7 @@ export default function App() {
 
         // Fire all requests in parallel
         const [picksData, positions, statsData, runnersData, perfData, closedData,
-               nnPicksData, nnPositionsData, nnStatsData, personalData] = await Promise.all([
+               nnPicksData, nnPositionsData, nnStatsData, nnPerfData, personalData] = await Promise.all([
           apiFetch("/picks").catch(() => ({ longs: [], shorts: [] })),
           apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
           apiFetch("/stats").catch(() => ({})),
@@ -1636,6 +1651,7 @@ export default function App() {
           apiFetch("/nn-picks").catch(() => ({ recommended_longs: [], recommended_shorts: [] })),
           apiFetch("/nn-positions").catch(() => []),
           apiFetch("/nn-stats").catch(() => null),
+          apiFetch("/nn-perf-history").catch(() => []),
           apiFetch("/personal-trades").catch(() => []),
         ]);
 
@@ -1660,6 +1676,7 @@ export default function App() {
         setNnPicks(nnPicksData || { recommended_longs: [], recommended_shorts: [] });
         setNnPositions(nnPositionsData || []);
         setNnStats(nnStatsData);
+        setNnPerfHistory(nnPerfData || []);
         setPersonalTrades(personalData || []);
 
         setLoadStatus("Ready"); setLoadProgress(100);
@@ -1683,11 +1700,13 @@ export default function App() {
       ? closedHistory.filter(p => !p.seed)[closedHistory.filter(p => !p.seed).length - 1].virtual
       : 1000.0;
 
-    // Seed point — always $1000, 30 days ago, marked as seed
-    const seedPoint = {
-      date: new Date(Date.now() - 86400000 * 30).toISOString().split("T")[0],
+    const backendSeed = closedHistory.find(p => p.seed);
+    const earliestTs = allPoints.length ? Math.min(...allPoints.map(p => p.ts || Date.now())) : Date.now();
+    const seedTs = backendSeed?.ts || earliestTs;
+    const seedPoint = backendSeed || {
+      date: new Date(seedTs).toISOString().split("T")[0],
       virtual: 1000.0,
-      ts: Date.now() - 86400000 * 30,
+      ts: seedTs,
       seed: true,
     };
 
@@ -1743,7 +1762,7 @@ export default function App() {
     const interval = setInterval(async () => {
       try {
         const [positions, perfData, closedData, statsData,
-               nnPicksData, nnPositionsData, nnStatsData] = await Promise.all([
+               nnPicksData, nnPositionsData, nnStatsData, nnPerfData] = await Promise.all([
           apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
           apiFetch("/perf-history").catch(() => []),
           apiFetch("/today-closed").catch(() => []),
@@ -1751,6 +1770,7 @@ export default function App() {
           apiFetch("/nn-picks").catch(() => ({ recommended_longs: [], recommended_shorts: [] })),
           apiFetch("/nn-positions").catch(() => []),
           apiFetch("/nn-stats").catch(() => null),
+          apiFetch("/nn-perf-history").catch(() => []),
         ]);
         setOpenPositions(positions);
         setTodayClosed(closedData || []);
@@ -1758,6 +1778,7 @@ export default function App() {
         setNnPicks(nnPicksData || { recommended_longs: [], recommended_shorts: [] });
         setNnPositions(nnPositionsData || []);
         setNnStats(nnStatsData);
+        setNnPerfHistory(nnPerfData || []);
         buildPerfHistory(perfData, positions);
       } catch {}
     }, 2.5 * 60 * 1000);
@@ -1870,9 +1891,7 @@ export default function App() {
 
   const perfFiltered = useMemo(() => {
     if (!perfHistory.length) return [];
-    const cutoffDays = { D: 1, W: 7, M: 30, "3M": 90, Y: 365, ALL: 9999 }[perfTimeframe] || 30;
-    const filtered = perfHistory.filter(point => point.ts >= Date.now() - cutoffDays * 86400000);
-    return filtered.length > 0 ? filtered : perfHistory.filter(p => p.date === lastTradingDate);
+    return filterPerfHistoryForTimeframe(perfHistory, perfTimeframe, lastTradingDate);
   }, [perfHistory, perfTimeframe, lastTradingDate]);
 
   // settledBalance: always use the last non-intraday point from FULL history
@@ -1886,7 +1905,7 @@ export default function App() {
   // perfFirst: baseline for percent gain calculation
   // 1D → yesterday's last settled balance (what we started today with)
   // ALL → always $1000 seed
-  // other timeframes → first point in filtered window
+  // other timeframes → first point in the same window used by the chart
   const seedPoint = perfHistory.find(p => p.seed);
   const perfFirst = (() => {
     if (perfTimeframe === "ALL") return seedPoint?.virtual || 1000;
@@ -2296,6 +2315,48 @@ export default function App() {
                   </button>
                 </div>
               </div>
+
+              {(() => {
+                const nnFiltered = filterPerfHistoryForTimeframe(nnPerfHistory, nnPerfTimeframe);
+                const nnLast = nnStats?.portfolio_value != null
+                  ? Number(nnStats.portfolio_value)
+                  : (nnFiltered[nnFiltered.length - 1]?.virtual || 1000);
+                const nnFirst = nnPerfTimeframe === "D"
+                  ? (nnFiltered[0]?.virtual || nnLast)
+                  : (nnFiltered[0]?.virtual || 1000);
+                const nnChange = round2(nnLast - nnFirst);
+                const nnPercent = nnFirst > 0 ? (nnChange / nnFirst * 100) : 0;
+                const nnUp = nnChange >= 0;
+                return (
+                  <div style={{ marginBottom: 12 }}>
+                    <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 5 }}>
+                      <div>
+                        <div style={{ fontSize: 24, fontWeight: 700, color: T1, fontFamily: "'DM Mono',monospace", lineHeight: 1 }}>
+                          ${nnLast.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+                          <span style={{ fontSize: 12, fontWeight: 700, color: nnUp ? GREEN : RED }}>{nnUp ? "↑" : "↓"} {Math.abs(nnPercent).toFixed(2)}%</span>
+                          <span style={{ fontSize: 11, color: T3 }}>{nnUp ? "+" : ""}${nnChange.toFixed(2)}</span>
+                        </div>
+                      </div>
+                      <div style={{ textAlign: "right", fontSize: 9, color: T3 }}>
+                        Neural P&L
+                        <div style={{ color: "#a78bfa", fontWeight: 800, fontFamily: "'DM Mono',monospace", fontSize: 12, marginTop: 2 }}>
+                          {nnStats?.resolved ?? 0} closed
+                        </div>
+                      </div>
+                    </div>
+                    <MiniChart data={nnPerfHistory} timeframe={nnPerfTimeframe} />
+                    <div style={{ display: "flex", justifyContent: "center", gap: 4, marginTop: 8 }}>
+                      {["D", "W", "M", "3M", "Y", "ALL"].map(tf => (
+                        <button key={tf} onClick={() => setNnPerfTimeframe(tf)} style={{ padding: "5px 12px", borderRadius: 20, fontSize: 11, fontWeight: 500, border: "none", cursor: "pointer", background: nnPerfTimeframe === tf ? "#1e1e24" : BG, color: nnPerfTimeframe === tf ? T1 : T3 }}>
+                          {tf === "D" ? "1D" : tf === "W" ? "1W" : tf === "M" ? "1M" : tf === "Y" ? "1Y" : tf}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
 
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 12 }}>
                 {[
