@@ -178,6 +178,8 @@ NN_HIDDEN2     = 16
 NN_DROPOUT     = 0.3
 NN_CONFIDENCE_FLOOR = 65  # Same floor as crude algo
 NN_MODEL_KEY   = "nn_model_weights"  # app_state key for persisted weights
+NN_SCAN_STATUS_KEY = "nn_scan_status"
+_nn_scan_thread_lock = threading.Lock()
 
 class SwingDeskNet(nn.Module):
     """
@@ -1193,6 +1195,59 @@ def record_nn_open_execution_status(status):
     payload.setdefault("attempted_at", current_time_cst().isoformat())
     set_app_state("last_nn_open_execution", json.dumps(payload))
     return payload
+
+def record_nn_scan_status(**updates):
+    """Persist lightweight NN scan status for non-blocking UI actions."""
+    current = get_app_state_json(NN_SCAN_STATUS_KEY, {}) or {}
+    current.update(updates)
+    current["updated_at"] = current_time_cst().isoformat()
+    set_app_state(NN_SCAN_STATUS_KEY, json.dumps(current))
+    return current
+
+def start_nn_scan_background(scan_type="manual"):
+    """
+    Start a neural scan in the background and return immediately.
+    Prevents the UI from hanging on a full-universe scan.
+    """
+    with _nn_scan_thread_lock:
+        current = get_app_state_json(NN_SCAN_STATUS_KEY, {}) or {}
+        if current.get("status") == "running":
+            return current
+
+        record_nn_scan_status(
+            status="running",
+            scan_type=scan_type,
+            started_at=current_time_cst().isoformat(),
+            finished_at=None,
+            total_scanned=0,
+            qualified=0,
+            picks=0,
+            error=None,
+        )
+
+        def worker():
+            try:
+                result = run_nn_scan(scan_type=scan_type)
+                record_nn_scan_status(
+                    status="complete",
+                    scan_type=scan_type,
+                    finished_at=current_time_cst().isoformat(),
+                    total_scanned=result.get("total_universe_scanned", result.get("total_scanned", 0)),
+                    qualified=result.get("qualified_count", result.get("total_scanned", 0)),
+                    picks=len(result.get("recommended_longs", []) or []),
+                    error=None,
+                )
+            except Exception as exc:
+                log.error(f"Background NN scan failed: {exc}")
+                record_nn_scan_status(
+                    status="error",
+                    scan_type=scan_type,
+                    finished_at=current_time_cst().isoformat(),
+                    error=str(exc),
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+        return get_app_state_json(NN_SCAN_STATUS_KEY, {}) or {}
 
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 TWELVE_DATA_BASE = "https://api.twelvedata.com"
@@ -3162,9 +3217,11 @@ def run_nn_scan(scan_type="scheduled"):
                 pass
 
         scored = []
+        scanned_count = 0
         for ticker in universe:
             if ticker not in price_data:
                 continue
+            scanned_count += 1
             stock_data = price_data[ticker]
             rsi = rsi_values.get(ticker, 50.0)
             earnings = earnings_soon.get(ticker, 99) if isinstance(earnings_soon, dict) else 99
@@ -3232,6 +3289,8 @@ def run_nn_scan(scan_type="scheduled"):
             "recommended_longs": top_picks,
             "recommended_shorts": [],
             "total_scanned": len(scored),
+            "qualified_count": len(scored),
+            "total_universe_scanned": scanned_count,
         }
 
         db = get_database()
@@ -6016,12 +6075,20 @@ def api_nn_train_now():
 
 @app.route("/api/nn-scan-now", methods=["POST"])
 def api_nn_scan_now():
-    """Manually trigger NN scan. Returns picks."""
+    """Manually trigger NN scan in the background. Returns immediately."""
     try:
-        result = run_nn_scan(scan_type="manual")
-        return jsonify({"success": True, "total_scanned": result.get("total_scanned", 0), "picks": len(result.get("recommended_longs", []))})
+        status = start_nn_scan_background(scan_type="manual")
+        return jsonify({"success": True, "started": status.get("status") == "running", "status": status})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/nn-scan-status")
+def api_nn_scan_status():
+    """Return latest background NN scan status."""
+    try:
+        return jsonify(get_app_state_json(NN_SCAN_STATUS_KEY, {}) or {})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 @app.route("/api/nn-open-now", methods=["POST"])
 def api_nn_open_now():

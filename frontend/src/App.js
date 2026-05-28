@@ -1470,6 +1470,13 @@ export default function App() {
   const [nnPicks, setNnPicks] = useState({ recommended_longs: [], recommended_shorts: [] });
   const [nnStats, setNnStats] = useState(null);
   const [nnAction, setNnAction] = useState(null);
+  const [nnScanStatus, setNnScanStatus] = useState(null);
+  const [personalForm, setPersonalForm] = useState({
+    ticker: "",
+    buy_price: "",
+    invested_amount: "",
+    direction: "long",
+  });
   const [personalTrades, setPersonalTrades] = useState([]);
   const [addingToPersonal, setAddingToPersonal] = useState({});
   const [sortMode, setSortMode] = useState("smart");
@@ -1542,10 +1549,36 @@ export default function App() {
     if (nnAction) return;
     setNnAction(kind);
     try {
-      await apiFetch(kind === "scan" ? "/nn-scan-now" : "/nn-open-now", { method: "POST" });
+      const result = await apiFetch(kind === "scan" ? "/nn-scan-now" : "/nn-open-now", { method: "POST" });
+      if (kind === "scan") setNnScanStatus(result.status || { status: "running" });
       await refreshNeuralPortfolio();
     } catch {}
     setNnAction(null);
+  };
+
+  const addManualPersonalTrade = async () => {
+    const ticker = personalForm.ticker.trim().toUpperCase();
+    if (!ticker) return;
+    const buyPrice = Number(personalForm.buy_price || 0);
+    const invested = Number(personalForm.invested_amount || 10);
+    try {
+      const result = await apiFetch("/personal-trades/add", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ticker,
+          direction: personalForm.direction || "long",
+          buy_price: buyPrice,
+          invested_amount: invested,
+          source_portfolio: "manual",
+        }),
+      });
+      if (result.success) {
+        const fresh = await apiFetch("/personal-trades").catch(() => []);
+        setPersonalTrades(fresh);
+        setPersonalForm({ ticker: "", buy_price: "", invested_amount: "", direction: "long" });
+      }
+    } catch {}
   };
 
   const recoverMissedOpen = async () => {
@@ -1728,6 +1761,22 @@ export default function App() {
   }, []);
 
   // ── Computed values ──
+  useEffect(() => {
+    if (nnScanStatus?.status !== "running") return;
+    const interval = setInterval(async () => {
+      try {
+        const status = await apiFetch("/nn-scan-status");
+        setNnScanStatus(status);
+        if (status.status && status.status !== "running") {
+          await refreshNeuralPortfolio();
+        }
+      } catch {
+        setNnScanStatus(prev => ({ ...(prev || {}), status: "error", error: "status unavailable" }));
+      }
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [nnScanStatus?.status]);
+
   const openTickers = new Set(openPositions.filter(t => t.outcome === "open").map(t => t.ticker));
   const allBuyPicks = picks.longs.filter(pick => !openTickers.has(pick.ticker));
   const allShortPicks = picks.shorts.filter(pick => !openTickers.has(pick.ticker));
@@ -2260,6 +2309,13 @@ export default function App() {
                   </div>
                 ))}
               </div>
+              {nnScanStatus && (
+                <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "7px 10px", marginBottom: 12, fontSize: 10, color: T3 }}>
+                  NN scan: <span style={{ color: nnScanStatus.status === "error" ? RED : nnScanStatus.status === "running" ? AMBER : GREEN, fontWeight: 700 }}>{nnScanStatus.status || "unknown"}</span>
+                  {nnScanStatus.status === "complete" && ` · ${nnScanStatus.picks || 0} picks · ${nnScanStatus.qualified || 0} qualified`}
+                  {nnScanStatus.error && ` · ${nnScanStatus.error}`}
+                </div>
+              )}
 
               {/* NN Open Positions */}
               {nnPositions.filter(t => t.outcome === "open").length > 0 && (
@@ -2306,6 +2362,21 @@ export default function App() {
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
                 <div style={{ fontSize: 10, color: AMBER, fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>Personal Portfolio</div>
                 <div style={{ fontSize: 9, color: T3 }}>Add positions from Brain or Neural tabs</div>
+              </div>
+
+              <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 10, marginBottom: 12 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
+                  <input value={personalForm.ticker} onChange={e => setPersonalForm(prev => ({ ...prev, ticker: e.target.value.toUpperCase() }))}
+                    placeholder="Ticker" style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: 6, color: T1, fontSize: 12, padding: "8px 9px", textTransform: "uppercase" }} />
+                  <input value={personalForm.buy_price} onChange={e => setPersonalForm(prev => ({ ...prev, buy_price: e.target.value }))}
+                    placeholder="Entry price" inputMode="decimal" style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: 6, color: T1, fontSize: 12, padding: "8px 9px" }} />
+                  <input value={personalForm.invested_amount} onChange={e => setPersonalForm(prev => ({ ...prev, invested_amount: e.target.value }))}
+                    placeholder="$ invested" inputMode="decimal" style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: 6, color: T1, fontSize: 12, padding: "8px 9px" }} />
+                  <button onClick={addManualPersonalTrade}
+                    style={{ background: AMBER + "18", border: `1px solid ${AMBER}66`, borderRadius: 6, color: AMBER, fontSize: 11, fontWeight: 800, letterSpacing: .5, padding: "8px 9px", cursor: "pointer" }}>
+                    ADD MANUAL
+                  </button>
+                </div>
               </div>
 
               {personalTrades.length === 0 ? (
