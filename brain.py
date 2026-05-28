@@ -960,6 +960,13 @@ def initialize_database():
         "news_sentiment_score REAL",
         "news_article_count INTEGER DEFAULT 0",
         "broke_52w_high_days_ago INTEGER",
+        "entry_price_source TEXT",
+        "entry_integrity_status TEXT",
+        "entry_integrity_note TEXT",
+        "pct_change_prev_close REAL",
+        "pct_change_premarket REAL",
+        "pct_change_regular_open REAL",
+        "pct_change_entry REAL",
     ]:
         try:
             column_name = column_definition.split()[0]
@@ -1114,6 +1121,37 @@ def finish_scan_event(event_id, status="success", tickers_updated=0, picks_count
     database.commit()
     database.close()
 
+def mark_stalled_scan_events(max_age_minutes=10):
+    """Mark old running scan/monitor rows as stalled so freshness is never ambiguous."""
+    cutoff = (current_time_cst() - timedelta(minutes=max_age_minutes)).isoformat()
+    database = get_database()
+    database.execute("""
+        UPDATE scan_events
+        SET status='stalled',
+            finished_at=COALESCE(finished_at, ?),
+            error=COALESCE(error, 'watchdog marked event stalled')
+        WHERE status='running' AND started_at < ?
+    """, [current_time_cst().isoformat(), cutoff])
+    changed = database.total_changes
+    database.commit()
+    database.close()
+    return changed
+
+def mark_running_events_error(job_type, started_after, error):
+    """Mark running events from the current job as errored after an exception."""
+    database = get_database()
+    database.execute("""
+        UPDATE scan_events
+        SET status='error',
+            finished_at=COALESCE(finished_at, ?),
+            error=?
+        WHERE status='running' AND job_type=? AND started_at >= ?
+    """, [current_time_cst().isoformat(), str(error)[:500], job_type, started_after])
+    changed = database.total_changes
+    database.commit()
+    database.close()
+    return changed
+
 def record_provider_health(provider, ok, failure_type=None, error=None, cooldown_minutes=0):
     """Track provider reliability so noisy APIs can cool down or be benched."""
     now = current_time_cst()
@@ -1151,6 +1189,19 @@ def record_provider_health(provider, ok, failure_type=None, error=None, cooldown
                 last_error=?
             WHERE provider=?
         """, [status, now.isoformat(), cooldown_until, str(error or failure_type or "unknown")[:300], provider])
+        row = database.execute(
+            "SELECT success_count, failure_count, rate_limit_count, timeout_count FROM provider_health WHERE provider=?",
+            [provider]
+        ).fetchone()
+        if row:
+            successes = int(row["success_count"] or 0)
+            failures = int(row["failure_count"] or 0)
+            total = successes + failures
+            failure_rate = failures / max(total, 1)
+            if failures >= 20 and failure_rate >= 0.7:
+                database.execute("UPDATE provider_health SET status='benched', cooldown_until=NULL WHERE provider=?", [provider])
+            elif failures >= 8 and failure_rate >= 0.5 and status != "cooldown":
+                database.execute("UPDATE provider_health SET status='degraded' WHERE provider=?", [provider])
     database.commit()
     database.close()
 
@@ -1498,6 +1549,41 @@ def _normalize_quote(price, previous_close=None, open_price=None, high=None, low
         "day_change_percent": (price - prev) / max(prev, 0.01) * 100,
         "source": source,
     }
+
+def pct_from_baseline(price, baseline):
+    """Return percent change from a baseline, or None when the baseline is unusable."""
+    try:
+        price = float(price)
+        baseline = float(baseline)
+        if baseline <= 0:
+            return None
+        return (price - baseline) / baseline * 100
+    except Exception:
+        return None
+
+def build_entry_integrity(position, price_data):
+    """Lightweight audit comparing stored entry against quote context."""
+    buy_price = float(position.get("buy_price") or 0)
+    prev_close = price_data.get("previous_close")
+    regular_open = price_data.get("open")
+    if buy_price <= 0:
+        return "bad", "Entry price missing or zero"
+
+    checks = []
+    for label, baseline in (("prev close", prev_close), ("regular open", regular_open)):
+        pct = pct_from_baseline(buy_price, baseline)
+        if pct is not None:
+            checks.append((label, pct))
+
+    if not checks:
+        return "unknown", "No quote baseline available for entry audit"
+
+    largest = max(checks, key=lambda item: abs(item[1]))
+    if abs(largest[1]) >= 8:
+        return "review", f"Entry is {largest[1]:+.1f}% vs {largest[0]}"
+    if abs(largest[1]) >= 4:
+        return "watch", f"Entry is {largest[1]:+.1f}% vs {largest[0]}"
+    return "ok", "Entry is within expected quote context"
 
 def _provider_quote(provider, ticker):
     """Fetch one quote and classify failures for the fallback router."""
@@ -3428,6 +3514,9 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
             "vol_ratio": round(stock_data.get("volume_ratio", 1), 2),
             "overnight_gap_pct": round(stock_data.get("gap_percent", 0), 2),
             "day_change_pct": round(stock_data.get("day_change_percent", 0), 2),
+            "pct_change_prev_close": round(pct_from_baseline(stock_data["price"], stock_data.get("previous_close")) or 0, 2),
+            "pct_change_premarket": None,
+            "pct_change_regular_open": round(pct_from_baseline(stock_data["price"], stock_data.get("open")) or 0, 2),
             "earnings_soon": has_earnings,
             "long_conf": long_confidence,
             "long_move": long_move,
@@ -4298,6 +4387,10 @@ def monitor_nn_open_positions():
         if position["direction"] == "short":
             pnl_percent = -pnl_percent
         pnl_dollars = invested * (pnl_percent / 100)
+        pct_prev_close = pct_from_baseline(price, price_data.get("previous_close"))
+        pct_regular_open = pct_from_baseline(price, price_data.get("open"))
+        pct_entry = pnl_percent
+        entry_integrity_status, entry_integrity_note = build_entry_integrity(position, price_data)
         current_value = invested + pnl_dollars
         high_pct = max(position.get("intraday_high_pct") or 0, pnl_percent)
         low_pct = min(position.get("intraday_low_pct") or 0, pnl_percent)
@@ -4378,7 +4471,7 @@ def monitor_nn_open_positions():
     database.close()
     log.info(f"Monitored {updated_count} NN positions, closed {closed_count}")
 
-def monitor_open_positions():
+def _monitor_open_positions_impl():
     """
     5-minute monitoring cycle for candidates and open positions.
     
@@ -4547,18 +4640,36 @@ def monitor_open_positions():
             database.execute("""
                 UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?,
                 dynamic_confidence=?, dynamic_estimate=?, confluence_count=?, confluence_methods=?,
-                signal_scores=?, last_price_updated=?, day_change_percent=?
+                signal_scores=?, last_price_updated=?, day_change_percent=?,
+                pct_change_prev_close=?, pct_change_regular_open=?, pct_change_entry=?,
+                entry_price_source=COALESCE(entry_price_source, ?),
+                entry_integrity_status=?, entry_integrity_note=?
                 WHERE id=?
             """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2),
                   dyn_conf, round(dyn_est, 1), conf_count, conf_methods,
-                  _signal_scores_json, now.isoformat(), day_change_pct, position["id"]])
+                  _signal_scores_json, now.isoformat(), day_change_pct,
+                  round(pct_prev_close, 4) if pct_prev_close is not None else None,
+                  round(pct_regular_open, 4) if pct_regular_open is not None else None,
+                  round(pct_entry, 4),
+                  price_data.get("source", "unknown"),
+                  entry_integrity_status, entry_integrity_note,
+                  position["id"]])
         except:
             database.execute("""
                 UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?,
-                last_price_updated=?, day_change_percent=?
+                last_price_updated=?, day_change_percent=?,
+                pct_change_prev_close=?, pct_change_regular_open=?, pct_change_entry=?,
+                entry_price_source=COALESCE(entry_price_source, ?),
+                entry_integrity_status=?, entry_integrity_note=?
                 WHERE id=?
             """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2),
-                  now.isoformat(), day_change_pct, position["id"]])
+                  now.isoformat(), day_change_pct,
+                  round(pct_prev_close, 4) if pct_prev_close is not None else None,
+                  round(pct_regular_open, 4) if pct_regular_open is not None else None,
+                  round(pct_entry, 4),
+                  price_data.get("source", "unknown"),
+                  entry_integrity_status, entry_integrity_note,
+                  position["id"]])
 
         # Refresh news for open positions — once per monitor cycle, rate-limited
         # Only refresh if news is stale (>30 min old) to stay within Alpha Vantage limits
@@ -4666,6 +4777,19 @@ def monitor_open_positions():
         "provider_summary": get_app_state_json("last_price_provider_summary", {}) or {},
     }))
     log.info(f"Monitored {len(open_positions)} positions + {len(monitored_candidates)} candidates")
+
+def monitor_open_positions():
+    """Run the open-position monitor with watchdog cleanup around the hot path."""
+    started_at = current_time_cst().isoformat()
+    try:
+        mark_stalled_scan_events(max_age_minutes=10)
+        return _monitor_open_positions_impl()
+    except Exception as exc:
+        mark_running_events_error("monitor", started_at, exc)
+        log.error(f"monitor_open_positions failed: {exc}")
+        raise
+    finally:
+        mark_stalled_scan_events(max_age_minutes=10)
 
 def force_close_previous_session():
     """
@@ -5149,6 +5273,71 @@ def api_monitor_open_now():
         log.error(f"Manual monitor-open-now failed: {error}")
         return jsonify({"success": False, "error": str(error)}), 500
 
+@app.route("/api/freshness-repair-now", methods=["POST"])
+def api_freshness_repair_now():
+    """Self-heal stale freshness state: stall old events, refresh open positions, optionally scan."""
+    try:
+        body = request.get_json(silent=True) or {}
+        run_scan = bool(body.get("run_scan", False))
+        repaired = {
+            "stalled_events_marked": mark_stalled_scan_events(max_age_minutes=10),
+            "monitor_ran": False,
+            "scan_ran": False,
+            "errors": [],
+        }
+
+        database = get_database()
+        stale_open_count = database.execute("""
+            SELECT COUNT(*) as n
+            FROM virtual_trades
+            WHERE outcome='open'
+              AND (last_price_updated IS NULL OR last_price_updated < ?)
+        """, [(current_time_cst() - timedelta(minutes=7)).isoformat()]).fetchone()["n"]
+        database.close()
+
+        if stale_open_count:
+            try:
+                monitor_open_positions()
+                repaired["monitor_ran"] = True
+            except Exception as exc:
+                repaired["errors"].append(f"monitor: {exc}")
+
+        if run_scan:
+            try:
+                run_comprehensive_scan(scan_type="freshness_repair")
+                repaired["scan_ran"] = True
+            except Exception as exc:
+                repaired["errors"].append(f"scan: {exc}")
+
+        status_code = 200 if not repaired["errors"] else 500
+        return jsonify({"success": not repaired["errors"], **repaired}), status_code
+    except Exception as error:
+        log.error(f"freshness repair failed: {error}")
+        return jsonify({"success": False, "error": str(error)}), 500
+
+@app.route("/api/ui-preferences", methods=["GET", "POST"])
+def api_ui_preferences():
+    """Persist UI display preferences server-side instead of browser localStorage."""
+    defaults = {
+        "pick_percent_mode": "PM",
+        "open_percent_mode": "RO",
+    }
+    allowed = {
+        "pick_percent_mode": {"PC", "PM", "RO"},
+        "open_percent_mode": {"PC", "PM", "RO", "EN"},
+    }
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        current = get_app_state_json("ui_preferences", defaults) or defaults
+        updated = {**defaults, **current}
+        for key, valid_values in allowed.items():
+            value = str(body.get(key, updated.get(key, defaults[key]))).upper()
+            if value in valid_values:
+                updated[key] = value
+        set_app_state("ui_preferences", json.dumps(updated))
+        return jsonify(updated)
+    return jsonify({**defaults, **(get_app_state_json("ui_preferences", {}) or {})})
+
 @app.route("/api/weights")
 def api_weights():
     return jsonify(get_signal_weights())
@@ -5587,6 +5776,7 @@ def api_scan_history():
 @app.route("/api/freshness-status")
 def api_freshness_status():
     """Explain whether scans, monitor checks, and provider data are fresh enough to trust."""
+    mark_stalled_scan_events(max_age_minutes=10)
     now = current_time_cst()
 
     def parse_dt(value):
@@ -5652,6 +5842,8 @@ def api_freshness_status():
     return jsonify({
         "now_cst": now.isoformat(),
         "decision_status": decision_status,
+        "repair_recommended": bool(warnings),
+        "repair_endpoint": "/api/freshness-repair-now",
         "warnings": warnings,
         "last_comprehensive_scan": comprehensive or ({"scan_time": legacy_scan_time, "status": "legacy"} if legacy_scan_time else None),
         "last_comprehensive_age_minutes": comprehensive_age,
