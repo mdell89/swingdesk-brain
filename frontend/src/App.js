@@ -2310,8 +2310,8 @@ export default function App() {
                 <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>SwingDeskNet — Neural Brain</div>
                 <div style={{ display: "flex", gap: 6 }}>
                   <button onClick={() => runNeuralAction("open")} disabled={!!nnAction}
-                    style={{ background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 5, color: GREEN, fontSize: 9, fontWeight: 700, letterSpacing: .4, padding: "4px 8px", cursor: nnAction ? "default" : "pointer", opacity: nnAction ? .55 : 1 }}>
-                    {nnAction === "open" ? "..." : "OPEN"}
+                    style={{ background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 5, color: T3, fontSize: 8, fontWeight: 700, letterSpacing: .4, padding: "4px 7px", cursor: nnAction ? "default" : "pointer", opacity: nnAction ? .55 : .75 }}>
+                    {nnAction === "open" ? "..." : "RECOVER"}
                   </button>
                 </div>
               </div>
@@ -2420,21 +2420,21 @@ export default function App() {
           {/* ── PERSONAL PORTFOLIO ── */}
           {portfolioTab === "personal" && (
             <div style={{ padding: "10px 16px 0" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 10 }}>
                 <div style={{ fontSize: 10, color: AMBER, fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>Personal Portfolio</div>
-                <div style={{ fontSize: 9, color: T3 }}>Add positions from Brain or Neural tabs</div>
+                <div style={{ fontSize: 9, color: T3, textAlign: "right", lineHeight: 1.2 }}>Add positions from Brain or Neural tabs</div>
               </div>
 
               <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 10, marginBottom: 12 }}>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
                   <input value={personalForm.ticker} onChange={e => setPersonalForm(prev => ({ ...prev, ticker: e.target.value.toUpperCase() }))}
-                    placeholder="Ticker" style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: 6, color: T1, fontSize: 12, padding: "8px 9px", textTransform: "uppercase" }} />
+                    placeholder="Ticker" style={{ minWidth: 0, width: "100%", background: BG, border: `1px solid ${BORDER}`, borderRadius: 6, color: T1, fontSize: 12, padding: "8px 9px", textTransform: "uppercase" }} />
                   <input value={personalForm.buy_price} onChange={e => setPersonalForm(prev => ({ ...prev, buy_price: e.target.value }))}
-                    placeholder="Entry price" inputMode="decimal" style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: 6, color: T1, fontSize: 12, padding: "8px 9px" }} />
+                    placeholder="Entry price" inputMode="decimal" style={{ minWidth: 0, width: "100%", background: BG, border: `1px solid ${BORDER}`, borderRadius: 6, color: T1, fontSize: 12, padding: "8px 9px" }} />
                   <input value={personalForm.invested_amount} onChange={e => setPersonalForm(prev => ({ ...prev, invested_amount: e.target.value }))}
-                    placeholder="$ invested" inputMode="decimal" style={{ background: BG, border: `1px solid ${BORDER}`, borderRadius: 6, color: T1, fontSize: 12, padding: "8px 9px" }} />
+                    placeholder="$ invested" inputMode="decimal" style={{ minWidth: 0, width: "100%", background: BG, border: `1px solid ${BORDER}`, borderRadius: 6, color: T1, fontSize: 12, padding: "8px 9px" }} />
                   <button onClick={addManualPersonalTrade}
-                    style={{ background: AMBER + "18", border: `1px solid ${AMBER}66`, borderRadius: 6, color: AMBER, fontSize: 11, fontWeight: 800, letterSpacing: .5, padding: "8px 9px", cursor: "pointer" }}>
+                    style={{ minWidth: 0, width: "100%", background: AMBER + "18", border: `1px solid ${AMBER}66`, borderRadius: 6, color: AMBER, fontSize: 11, fontWeight: 800, letterSpacing: .5, padding: "8px 9px", cursor: "pointer", whiteSpace: "nowrap" }}>
                     ADD MANUAL
                   </button>
                 </div>
@@ -2451,16 +2451,16 @@ export default function App() {
                     const pnl = trade.pnl_percent || 0;
                     const pnlColor = pnl >= 0 ? GREEN : RED;
                     return (
-                      <div key={trade.id} style={{ display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", padding: "11px 14px", background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, borderLeft: `3px solid ${AMBER}` }}>
-                        <div>
-                          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <div key={trade.id} style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr) auto", gap: 8, alignItems: "center", padding: "11px 14px", background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, borderLeft: `3px solid ${AMBER}` }}>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
                             <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 14, fontWeight: 600, color: T1 }}>{trade.ticker}</span>
-                            <span style={{ fontSize: 8, color: AMBER, fontWeight: 700, letterSpacing: .3 }}>PERSONAL</span>
-                            {trade.source_portfolio && <span style={{ fontSize: 8, color: T3 }}>via {trade.source_portfolio}</span>}
+                            <span style={{ fontSize: 8, color: AMBER, fontWeight: 700, letterSpacing: .3, flexShrink: 0 }}>PERSONAL</span>
+                            {trade.source_portfolio && <span style={{ fontSize: 8, color: T3, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>via {trade.source_portfolio}</span>}
                           </div>
                           <div style={{ fontSize: 9, color: T3, marginTop: 2 }}>{trade.buy_date} · {trade.sector || "—"}</div>
                         </div>
-                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
                           <div style={{ textAlign: "right" }}>
                             <div style={{ fontSize: 13, fontWeight: 700, color: pnlColor, fontFamily: "'DM Mono',monospace" }}>{pnl >= 0 ? "+" : ""}{pnl.toFixed(1)}%</div>
                             <div style={{ fontSize: 9, color: T3, marginTop: 1 }}>${Number(trade.buy_price || 0).toFixed(2)} entry</div>

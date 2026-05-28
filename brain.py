@@ -6148,7 +6148,7 @@ def api_all_closed():
     try:
         database = get_database()
         closed = [dict(t) for t in database.execute("""
-            SELECT ticker, name, direction, buy_date, sell_date, buy_price, sell_price,
+            SELECT ticker, ticker AS name, direction, buy_date, sell_date, buy_price, sell_price,
                    actual_move, gross_pnl, net_pnl, outcome, sell_reason,
                    lock_in_confidence, confidence, expected_move, sector
             FROM virtual_trades
@@ -6255,6 +6255,110 @@ def api_nn_force_close_now():
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/repair-accidental-startup-close", methods=["POST"])
+def api_repair_accidental_startup_close():
+    """
+    Reopen positions that startup backfill incorrectly settled before the
+    valid 2:45 PM CST force-close window.
+
+    Targets the bad signature from the bug only:
+    - row still has status='open'
+    - outcome was changed away from open
+    - sell_reason is forced_close
+    - sell_date was set to buy_date by startup backfill
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        repair_date = body.get("buy_date")
+        if not repair_date:
+            last_execution = get_app_state_json("last_open_execution", {}) or {}
+            opened = last_execution.get("opened") or []
+            if opened:
+                first_trade_id = opened[0].get("trade_id", "")
+                parts = first_trade_id.split("_")
+                if len(parts) >= 3:
+                    repair_date = parts[1]
+        if not repair_date:
+            return jsonify({"success": False, "error": "buy_date required"}), 400
+
+        db = get_database()
+        suspect_rows = [dict(row) for row in db.execute("""
+            SELECT id, ticker, outcome, gross_pnl
+            FROM virtual_trades
+            WHERE buy_date=?
+              AND status='open'
+              AND outcome!='open'
+              AND sell_reason='forced_close'
+              AND sell_date=buy_date
+        """, [repair_date]).fetchall()]
+
+        if not suspect_rows:
+            db.close()
+            return jsonify({"success": True, "restored": 0, "buy_date": repair_date, "removed_queue_entries": 0, "trades": []})
+
+        trade_ids = [row["id"] for row in suspect_rows]
+        placeholders = ",".join("?" for _ in trade_ids)
+        removed_queue_entries = db.execute(
+            f"DELETE FROM trade_queue WHERE consumed=0 AND source_trade_id IN ({placeholders})",
+            trade_ids
+        ).rowcount
+
+        db.execute(f"""
+            UPDATE virtual_trades
+            SET outcome='open',
+                status='open',
+                sell_date=NULL,
+                sell_time=NULL,
+                sell_price=NULL,
+                actual_move=NULL,
+                gross_pnl=NULL,
+                net_pnl=NULL,
+                sell_reason=NULL
+            WHERE id IN ({placeholders})
+        """, trade_ids)
+
+        for trade in suspect_rows:
+            parts = trade["id"].split("_")
+            if len(parts) >= 4:
+                prediction_id = f"{parts[0]}_{parts[1]}_{parts[2]}"
+                db.execute(
+                    "UPDATE predictions SET outcome='pending', actual_move=NULL, resolved_at=NULL WHERE id=?",
+                    [prediction_id]
+                )
+
+        db.commit()
+        db.close()
+        return jsonify({
+            "success": True,
+            "buy_date": repair_date,
+            "restored": len(suspect_rows),
+            "removed_queue_entries": removed_queue_entries,
+            "trades": suspect_rows,
+        })
+    except Exception as e:
+        log.error(f"repair accidental startup close failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/suspect-startup-closed")
+def api_suspect_startup_closed():
+    """Return positions matching the accidental-startup-close signature."""
+    try:
+        db = get_database()
+        rows = [dict(row) for row in db.execute("""
+            SELECT id, ticker, buy_date, outcome, status, sell_date, sell_time,
+                   sell_reason, current_value, invested_amount
+            FROM virtual_trades
+            WHERE status='open'
+              AND outcome!='open'
+              AND sell_reason='forced_close'
+              AND sell_date=buy_date
+            ORDER BY buy_date DESC, ticker ASC
+        """).fetchall()]
+        db.close()
+        return jsonify(rows)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/nn-debug")
 def api_nn_debug():
@@ -6499,6 +6603,7 @@ def api_personal_trades_add():
         trade_id = f"personal_{ticker}_{now.strftime('%Y%m%d%H%M%S')}"
         buy_price = float(body.get("buy_price", 0))
         invested = float(body.get("invested_amount", 10))
+        sector = body.get("sector") or get_sector(ticker)
         db = get_database()
         db.execute("""
             INSERT OR REPLACE INTO personal_trades
@@ -6510,7 +6615,7 @@ def api_personal_trades_add():
             body.get("direction", "long"),
             now.strftime("%Y-%m-%d"),
             buy_price, invested, invested,
-            body.get("sector", get_sector(ticker)),
+            sector,
             body.get("notes", ""),
             "manual",
             body.get("source_portfolio", "brain"),
@@ -6534,6 +6639,7 @@ def api_personal_trades_remove():
             return jsonify({"error": "id required"}), 400
         db = get_database()
         db.execute("DELETE FROM personal_trades WHERE id=?", [trade_id])
+        db.commit()
         db.close()
         return jsonify({"success": True})
     except Exception as e:
@@ -6654,6 +6760,9 @@ def backfill_missed_closes():
     """
     try:
         now = current_time_cst()
+        if now.weekday() >= 5 or (now.hour < 14 or (now.hour == 14 and now.minute < 45)):
+            log.info("Startup backfill: skipping before the 2:45 PM CST force-close window")
+            return
         today = now.strftime("%Y-%m-%d")
         db = get_database()
         stuck = [dict(t) for t in db.execute(
@@ -6702,6 +6811,9 @@ def backfill_nn_missed_closes():
     """Settle NN positions left open from previous sessions after restarts."""
     try:
         now = current_time_cst()
+        if now.weekday() >= 5 or (now.hour < 14 or (now.hour == 14 and now.minute < 45)):
+            log.info("NN startup backfill: skipping before the 2:45 PM CST force-close window")
+            return
         today = now.strftime("%Y-%m-%d")
         db = get_database()
         stuck = [dict(t) for t in db.execute(
