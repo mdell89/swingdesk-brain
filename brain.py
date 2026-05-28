@@ -1146,10 +1146,15 @@ def get_queue_status():
     recent = [dict(row) for row in database.execute(
         "SELECT amount, source_trade_id, created_at, consumed FROM trade_queue ORDER BY id DESC LIMIT 20"
     ).fetchall()]
+    next_amount = database.execute(
+        "SELECT id, amount FROM trade_queue WHERE consumed = 0 ORDER BY id ASC LIMIT 1"
+    ).fetchone()
     database.close()
     return {
         "available_count": available["count"],
         "available_total": round(available["total"], 2),
+        "next_amount": round(next_amount["amount"], 2) if next_amount else None,
+        "next_queue_id": next_amount["id"] if next_amount else None,
         "total_ever_queued": total_ever["count"],
         "default_fallback": get_dynamic_fallback_amount(),
         "recent_entries": recent,
@@ -2954,9 +2959,14 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
     # This prevents DB lock conflicts between scan writes and monitor writes
     try:
         _db = get_database()
-        open_tickers = set(r["ticker"] for r in _db.execute(
-            "SELECT ticker FROM virtual_trades WHERE outcome='open'"
-        ).fetchall())
+        open_tickers = set()
+        for table in ("virtual_trades", "nn_virtual_trades", "personal_trades"):
+            try:
+                open_tickers.update(r["ticker"] for r in _db.execute(
+                    f"SELECT ticker FROM {table} WHERE outcome='open'"
+                ).fetchall())
+            except Exception:
+                pass
         _db.close()
         universe = [t for t in universe if t not in open_tickers]
     except Exception as e:
@@ -3001,9 +3011,14 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
 
     # Prevent simultaneous long and short on the same ticker
     database = get_database()
-    open_trades = database.execute(
-        "SELECT ticker, direction FROM virtual_trades WHERE outcome='open'"
-    ).fetchall()
+    open_trades = []
+    for table in ("virtual_trades", "nn_virtual_trades", "personal_trades"):
+        try:
+            open_trades.extend(database.execute(
+                f"SELECT ticker, direction FROM {table} WHERE outcome='open'"
+            ).fetchall())
+        except Exception:
+            pass
     database.close()
     open_long_tickers = set(t["ticker"] for t in open_trades if t["direction"] == "long")
     open_short_tickers = set(t["ticker"] for t in open_trades if t["direction"] == "short")
@@ -3113,6 +3128,13 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
         "generated_at": current_time_cst().isoformat(),
         "scan_type": scan_type,
     }
+    nn_scan_result = build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soon, scan_type)
+    scan_result["nn_picks"] = {
+        "picks": nn_scan_result.get("picks", len(nn_scan_result.get("recommended_longs", []) or [])),
+        "qualified_count": nn_scan_result.get("qualified_count", 0),
+        "source": nn_scan_result.get("source", "shared_comprehensive_scan"),
+        "error": nn_scan_result.get("error"),
+    }
 
     # Cache picks and log scan
     database = get_database()
@@ -3178,6 +3200,112 @@ def get_cached_picks():
     return None
 
 # ── NEURAL NETWORK SCAN ──────────────────────────────────────────────────────
+def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soon, scan_type="shared"):
+    """
+    Score NN picks from the already-built comprehensive scan snapshot.
+    This avoids a second universe fetch and keeps crude + NN on the same data.
+    """
+    try:
+        _nn_model.eval()
+        db = get_database()
+        open_tickers = set()
+        for table in ("virtual_trades", "nn_virtual_trades"):
+            try:
+                rows = db.execute(f"SELECT ticker FROM {table} WHERE outcome='open'").fetchall()
+                open_tickers.update(r["ticker"] for r in rows)
+            except Exception:
+                pass
+        db.close()
+
+        weights = get_signal_weights()
+        scored = []
+        for base in scored_stocks:
+            ticker = base.get("ticker")
+            if not ticker or ticker in open_tickers or ticker not in price_data:
+                continue
+
+            stock_data = price_data[ticker]
+            rsi = rsi_values.get(ticker, base.get("rsi", 50.0))
+            earnings = earnings_soon.get(ticker, 99) if isinstance(earnings_soon, dict) else 99
+            if earnings <= 1:
+                continue
+
+            sig_scores, fired, sig_values = compute_signal_scores(
+                ticker, price_data, rsi, earnings_soon, weights, "long"
+            )
+            synthetic = {
+                "ticker": ticker,
+                "direction": "long",
+                "sector": base.get("sector") or get_sector(ticker),
+                "signal_scores": json.dumps({"scores": sig_scores, "fired": fired, "values": sig_values}),
+                "lock_in_confidence": base.get("long_conf") or 0,
+                "expected_move": base.get("long_move") or 0,
+                "day_change_percent": base.get("day_change_pct", stock_data.get("day_change_percent", 0)),
+                "broke_52w_high_days_ago": stock_data.get("broke_52w_high_days_ago"),
+                "weekend_hold": 0,
+                "news_sentiment_score": stock_data.get("news_sentiment_score", 0),
+                "news_article_count": stock_data.get("news_article_count", 0),
+            }
+
+            nn_conf = nn_score_ticker(synthetic, "long")
+            if nn_conf < NN_CONFIDENCE_FLOOR:
+                continue
+
+            scored.append({
+                **base,
+                "long_conf": nn_conf,
+                "long_reasoning": f"NN confidence {nn_conf}% from shared scan",
+                "crude_conf": base.get("long_conf"),
+                "nn_score": nn_conf,
+            })
+
+        scored.sort(key=lambda x: x["long_conf"], reverse=True)
+        top_picks = scored[:MAX_LONG_PICKS]
+        result = {
+            "scan_type": f"nn_shared_{scan_type}",
+            "scan_time": current_time_cst().isoformat(),
+            "recommended_longs": top_picks,
+            "recommended_shorts": [],
+            "total_scanned": len(scored_stocks),
+            "qualified_count": len(scored),
+            "picks": len(top_picks),
+            "source": "shared_comprehensive_scan",
+            "message": "No NN picks qualified above threshold" if not top_picks else None,
+        }
+
+        db = get_database()
+        db.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_nn_picks',?)", [json.dumps(result)])
+        db.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_nn_picks_time',?)", [current_time_cst().isoformat()])
+        db.close()
+        record_nn_scan_status(
+            status="complete",
+            scan_type=f"shared_{scan_type}",
+            finished_at=current_time_cst().isoformat(),
+            total_scanned=len(scored_stocks),
+            qualified=len(scored),
+            picks=len(top_picks),
+            error=None,
+        )
+        log.info(f"Shared NN scoring: {len(top_picks)} picks, {len(scored)} qualified from {len(scored_stocks)} scanned")
+        return result
+    except Exception as e:
+        log.error(f"Shared NN scoring failed: {e}")
+        record_nn_scan_status(
+            status="error",
+            scan_type=f"shared_{scan_type}",
+            finished_at=current_time_cst().isoformat(),
+            error=str(e),
+        )
+        return {
+            "recommended_longs": [],
+            "recommended_shorts": [],
+            "total_scanned": len(scored_stocks or []),
+            "qualified_count": 0,
+            "picks": 0,
+            "source": "shared_comprehensive_scan",
+            "error": str(e),
+        }
+
 def run_nn_scan(scan_type="scheduled"):
     """
     Run a full scan of the ticker universe using SwingDeskNet instead of
@@ -4441,7 +4569,7 @@ def run_scheduler():
                 log.error(f"NN training failed: {nn_err}")
     schedule.every().day.at("23:55").do(run_audit_if_weekday)
 
-    # NN scan runs every 30 min alongside crude algo scan
+    # NN scoring now runs from each comprehensive scan snapshot.
     for hour, minute, label in [
         (9,"00","4:00am"),(9,30,"4:30am"),(10,"00","5:00am"),(10,30,"5:30am"),
         (11,"00","6:00am"),(11,30,"6:30am"),(12,"00","7:00am"),(12,30,"7:30am"),
@@ -4453,9 +4581,11 @@ def run_scheduler():
         (23,"00","6:00pm"),(23,30,"6:30pm"),(0,"00","7:00pm"),(0,30,"7:30pm"),
     ]:
         time_str = f"{hour:02d}:{minute:02d}" if isinstance(minute, int) else f"{hour:02d}:{minute}"
-        schedule.every().day.at(time_str).do(lambda st=label: run_nn_scan(scan_type=st))
+        # NN scoring now runs from the comprehensive scan snapshot.
+        # Keep manual /api/nn-scan-now for debugging, but do not schedule a second universe fetch.
+        pass
 
-    log.info("Scheduler started — comprehensive scans every 30min, position monitoring 2.5min regular/5min extended, NN scan every 30min")
+    log.info("Scheduler started — comprehensive shared scans every 30min, position monitoring 2.5min regular/5min extended")
 
     # Dynamic monitoring loop — 2.5 min during regular hours, 5 min during pre/post market
     last_monitor_time = 0
@@ -6172,12 +6302,32 @@ def api_nn_picks():
     try:
         db = get_database()
         row = db.execute("SELECT value FROM app_state WHERE key='cached_nn_picks'").fetchone()
+        cache_time = db.execute("SELECT value FROM app_state WHERE key='cached_nn_picks_time'").fetchone()
         db.close()
         if row:
-            return jsonify(json.loads(row["value"]))
-        return jsonify({"recommended_longs": [], "recommended_shorts": [], "total_scanned": 0})
+            result = json.loads(row["value"])
+            result["cache_time"] = cache_time["value"] if cache_time else result.get("scan_time")
+            result["status"] = "ok"
+            if not result.get("recommended_longs"):
+                result["message"] = result.get("message") or "No NN picks qualified above threshold"
+            return jsonify(result)
+        return jsonify({
+            "recommended_longs": [],
+            "recommended_shorts": [],
+            "total_scanned": 0,
+            "qualified_count": 0,
+            "status": "no_cache",
+            "message": "No shared NN scan has been cached yet",
+        })
     except Exception as e:
-        return jsonify({"recommended_longs": [], "recommended_shorts": [], "total_scanned": 0})
+        return jsonify({
+            "recommended_longs": [],
+            "recommended_shorts": [],
+            "total_scanned": 0,
+            "qualified_count": 0,
+            "status": "error",
+            "message": str(e),
+        })
 
 @app.route("/api/nn-positions")
 def api_nn_positions():

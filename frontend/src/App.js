@@ -1465,6 +1465,7 @@ export default function App() {
   const [longSub, setLongSub] = useState("buy");
   const [closedTab, setClosedTab] = useState("all");
   const [analyticsPage, setAnalyticsPage] = useState("performance"); // performance | closed
+  const [scanHistory, setScanHistory] = useState([]);
   const [portfolioTab, setPortfolioTab] = useState("brain"); // brain | neural | personal
   const [nnPositions, setNnPositions] = useState([]);
   const [nnPicks, setNnPicks] = useState({ recommended_longs: [], recommended_shorts: [] });
@@ -1732,7 +1733,10 @@ export default function App() {
       setTabLoading(true);
       apiFetch("/predictions").then(data => { setPredictions(data); setTabLoading(false); }).catch(() => setTabLoading(false));
     }
-  }, [tab, loaded]);
+    if (tab === "virtual" && analyticsPage === "scan" && scanHistory.length === 0) {
+      apiFetch("/scan-history").then(data => setScanHistory(data || [])).catch(() => {});
+    }
+  }, [tab, loaded, analyticsPage]);
 
   // ── 5-minute refresh ──
   useEffect(() => {
@@ -2286,10 +2290,6 @@ export default function App() {
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
                 <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>SwingDeskNet — Neural Brain</div>
                 <div style={{ display: "flex", gap: 6 }}>
-                  <button onClick={() => runNeuralAction("scan")} disabled={!!nnAction}
-                    style={{ background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 5, color: "#a78bfa", fontSize: 9, fontWeight: 700, letterSpacing: .4, padding: "4px 8px", cursor: nnAction ? "default" : "pointer", opacity: nnAction ? .55 : 1 }}>
-                    {nnAction === "scan" ? "..." : "SCAN"}
-                  </button>
                   <button onClick={() => runNeuralAction("open")} disabled={!!nnAction}
                     style={{ background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 5, color: GREEN, fontSize: 9, fontWeight: 700, letterSpacing: .4, padding: "4px 8px", cursor: nnAction ? "default" : "pointer", opacity: nnAction ? .55 : 1 }}>
                     {nnAction === "open" ? "..." : "OPEN"}
@@ -2350,7 +2350,7 @@ export default function App() {
                 </div>
               ) : (
                 <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 20, textAlign: "center", fontSize: 12, color: T3 }}>
-                  No neural picks are currently cached above threshold.
+                  {nnPicks.message || "No neural picks are currently cached above threshold."}
                 </div>
               )}
             </div>
@@ -2429,7 +2429,7 @@ export default function App() {
 
           {/* ── Analytics internal nav: Performance | Closed Trades ── */}
           <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
-            {[["performance", "Performance"], ["closed", "Closed Trades"]].map(([id, label]) => (
+            {[["performance", "Performance"], ["closed", "Closed Trades"], ["scan", "Scan Log"]].map(([id, label]) => (
               <button key={id} onClick={() => setAnalyticsPage(id)} style={{
                 flex: 1, padding: "8px 0", border: `1px solid ${analyticsPage === id ? BLUE + "66" : BORDER}`,
                 borderRadius: 8, background: analyticsPage === id ? BLUE + "18" : "transparent",
@@ -2647,17 +2647,44 @@ export default function App() {
             );
           })()}
 
+          {analyticsPage === "scan" && (
+            <div style={{ marginTop: 16 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8, marginBottom: 10 }}>Scan log</div>
+              {scanHistory.length === 0 ? (
+                <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 20, fontSize: 12, color: T3, textAlign: "center" }}>
+                  No scan history yet.
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  {scanHistory.map(row => {
+                    const d = row.scan_time ? new Date(row.scan_time) : null;
+                    const label = d && !isNaN(d) ? d.toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : row.scan_time;
+                    return (
+                      <div key={row.id} style={{ display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", padding: "10px 14px", background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10 }}>
+                        <div>
+                          <div style={{ fontSize: 12, color: T1, fontWeight: 700 }}>{row.scan_type || "scan"}</div>
+                          <div style={{ fontSize: 9, color: T3, marginTop: 2 }}>{label}</div>
+                        </div>
+                        <div style={{ fontSize: 12, color: BLUE, fontWeight: 800, fontFamily: "'DM Mono',monospace" }}>{row.ticker_count || 0}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
           {analyticsPage === "performance" && (<>
           {queueStatus && (
             <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "12px 14px", marginTop: 16 }}>
               <div style={{ fontSize: 10, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, marginBottom: 8 }}>Trade queue</div>
               <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                <span style={{ fontSize: 11, color: T2 }}>Available amounts</span>
+                <span style={{ fontSize: 11, color: T2 }}>In queue</span>
                 <span style={{ fontSize: 11, color: T1 }}>{queueStatus.available_count}</span>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                <span style={{ fontSize: 11, color: T2 }}>Total queued</span>
-                <span style={{ fontSize: 11, color: T1, fontFamily: "'DM Mono',monospace" }}>${queueStatus.available_total?.toFixed(2)}</span>
+                <span style={{ fontSize: 11, color: T2 }}>Next amount</span>
+                <span style={{ fontSize: 11, color: T1, fontFamily: "'DM Mono',monospace" }}>{queueStatus.next_amount != null ? `$${queueStatus.next_amount.toFixed(2)}` : "fallback"}</span>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between" }}>
                 <span style={{ fontSize: 11, color: T2 }}>Fallback <span style={{ fontSize: 9, color: T3 }}>(1% of portfolio)</span></span>
