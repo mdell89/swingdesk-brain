@@ -1244,6 +1244,23 @@ def consume_queue_amount(queue_id, consuming_trade_id):
 
 QUEUE_MAX_ENTRIES = 100  # Sanity cap — normal operation stays well below this
 
+def add_to_queue_on_connection(database, amount, source_trade_id):
+    """
+    Add a queue entry using an existing write connection.
+    This avoids opening a second SQLite writer while a close transaction is active.
+    """
+    current_count = database.execute(
+        "SELECT COUNT(*) as count FROM trade_queue WHERE consumed = 0"
+    ).fetchone()["count"]
+
+    if current_count < QUEUE_MAX_ENTRIES:
+        database.execute(
+            "INSERT INTO trade_queue (amount, source_trade_id, created_at) VALUES (?, ?, ?)",
+            [round(amount, 4), source_trade_id, current_time_cst().isoformat()]
+        )
+    else:
+        log.warning(f"Queue cap reached ({QUEUE_MAX_ENTRIES}) - skipping entry for {source_trade_id}")
+
 def add_to_queue(amount, source_trade_id):
     """
     Add a completed trade's ending value to the back of the queue.
@@ -4612,7 +4629,7 @@ def monitor_open_positions():
                       f"{ticker}_{position['buy_date']}_{position['direction']}"])
 
                 # Add ending value to trade queue for compounding
-                add_to_queue(current_value, position["id"])
+                add_to_queue_on_connection(database, current_value, position["id"])
 
                 # Send SMS notification
                 if reason == "cut_loss" and is_day_trade:
@@ -4714,7 +4731,7 @@ def force_close_previous_session():
               f"{ticker}_{position['buy_date']}_{position['direction']}"])
 
         # Add ending value to queue — this is where compounding happens
-        add_to_queue(ending_value, position["id"])
+        add_to_queue_on_connection(database, ending_value, position["id"])
         closed_count += 1
 
         # Send SMS notification
@@ -5121,6 +5138,16 @@ def api_picks_fresh():
         return jsonify(run_comprehensive_scan(scan_type="manual_fresh"))
     except Exception as error:
         return jsonify({"error": str(error)}), 500
+
+@app.route("/api/monitor-open-now", methods=["POST"])
+def api_monitor_open_now():
+    """Force one open-position monitor pass for freshness diagnostics."""
+    try:
+        monitor_open_positions()
+        return jsonify({"success": True, "ran_at": current_time_cst().isoformat()})
+    except Exception as error:
+        log.error(f"Manual monitor-open-now failed: {error}")
+        return jsonify({"success": False, "error": str(error)}), 500
 
 @app.route("/api/weights")
 def api_weights():
@@ -5584,7 +5611,7 @@ def api_freshness_status():
     """).fetchone()
     last_monitor = database.execute("""
         SELECT * FROM scan_events
-        WHERE job_type='monitor'
+        WHERE job_type='monitor' AND status IN ('success','degraded','error')
         ORDER BY started_at DESC LIMIT 1
     """).fetchone()
     stale_positions = [dict(r) for r in database.execute("""
@@ -6613,7 +6640,7 @@ def api_force_close_now():
                 WHERE id=?
             """, [outcome, round(pnl_percent, 2), now.isoformat(),
                   "{}_{}_{}" .format(position["ticker"], position["buy_date"], position["direction"])])
-            add_to_queue(ending_value, position["id"])
+            add_to_queue_on_connection(db, ending_value, position["id"])
             results.append({"ticker": position["ticker"], "outcome": outcome, "pnl_percent": round(pnl_percent, 2)})
         db.commit()
         db.close()
