@@ -223,8 +223,8 @@ function getSentimentLabel(pnlPercent, frozenTarget, sentimentIcon, pdtRemaining
     return { label: "WEAK", phrase: "⚠ 3/3 day trades used", color: "#60a5fa", priority: 2 };
   }
 
-  // WEAK · cut threshold not met — negative but not yet in cut territory
-  return { label: "WEAK", phrase: "cut threshold not met", color: "#60a5fa", priority: 2 };
+  // WEAK · standing by — negative but not yet in cut territory
+  return { label: "WEAK", phrase: "standing by", color: "#60a5fa", priority: 2 };
 }
 
 function relativeTime(dateStr, tsSeconds) {
@@ -442,14 +442,6 @@ function StaleBadge({ staleTime }) {
   );
 }
 
-function TagSlot({ children, width = 30 }) {
-  return (
-    <div style={{ width, display: "flex", justifyContent: "center", alignItems: "center", flexShrink: 0 }}>
-      {children}
-    </div>
-  );
-}
-
 function CardActionRow({ statusLabel, statusPhrase, statusColor, staleTime, actions, borderColor }) {
   return (
     <div style={{
@@ -467,7 +459,7 @@ function CardActionRow({ statusLabel, statusPhrase, statusColor, staleTime, acti
           <StaleBadge staleTime={staleTime} />
         </span>
       </div>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 4, minWidth: 0, overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 5, minWidth: 0, overflow: "hidden" }}>
         {actions}
       </div>
     </div>
@@ -644,6 +636,12 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
       <CardActionRow
         borderColor={BORDER}
         actions={<>
+          {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 && (
+            <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
+          )}
+          {pick.confluence_count > 0 && (
+            <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center", flexShrink: 0 }}>{pick.confluence_count}/10</span>
+          )}
           {onAddToPersonal && <JournalButton
             compact
             state={journalAdded}
@@ -655,18 +653,6 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
               });
             }}
           />}
-          <TagSlot>
-            {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 ? (
-              <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a" }}>52W</span>
-            ) : null}
-          </TagSlot>
-          <TagSlot>
-          </TagSlot>
-          <TagSlot>
-            {pick.confluence_count > 0 ? (
-              <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center" }}>{pick.confluence_count}/10</span>
-            ) : null}
-          </TagSlot>
         </>}
       />
       {expanded && (
@@ -890,7 +876,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
         <SpineCell>
           <SpinePercent value={pnlPercent} color={pnlColor} fontSize={12} />
         </SpineCell>
-        <div style={{ fontSize: 13, fontWeight: 700, color: pnlColor, fontFamily: "'DM Mono',monospace", textAlign: "right", paddingRight: 6 }}>{pnlDollars >= 0 ? "+" : "-"}${Math.abs(pnlDollars).toFixed(2)}</div>
+        <div style={{ fontSize: 13, fontWeight: 700, color: pnlColor, fontFamily: "'DM Mono',monospace", textAlign: "right", paddingRight: 6, whiteSpace: "nowrap" }}>{pnlDollars >= 0 ? "+" : "-"}${Math.abs(pnlDollars).toFixed(2)}</div>
         <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center", alignSelf: "center" }}>
           {confDelta === 0 ? (
             <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 13, fontWeight: 700, color: confidenceColor(lockInConfidence, themeKey), lineHeight: 1 }}>{lockInConfidence}%</div>
@@ -912,6 +898,21 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
         staleTime={isStale ? staleTime : null}
         borderColor={rulingColor}
         actions={<>
+          {trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7 && (
+            <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
+          )}
+          {trade.confluence_count > 0 && (
+            <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center", flexShrink: 0 }}>{trade.confluence_count}/10</span>
+          )}
+          {trade.signal_fired?.length > 0 && (
+            <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: BLUE, letterSpacing: .3, padding: "1px 4px", background: "#0a1020", borderRadius: 3, border: "1px solid #1a2a40", textAlign: "center", flexShrink: 0 }}>{trade.signal_fired.length}/9</span>
+          )}
+          {(sentiment.label === "CUT" || trade.outcome === "sold" || trade.outcome === "force_closed") && (
+            <button onClick={(e) => { e.stopPropagation(); onDone && onDone(cardKey); }}
+              style={{ background: "#222", border: `1px solid ${CARD_BORDER_LONG === "#1a3a4a" ? BLUE + "66" : "#444"}`, borderRadius: 4, color: "#ccc", fontSize: 9, fontWeight: 700, letterSpacing: 0.5, padding: "2px 8px", cursor: "pointer", flexShrink: 0 }}>
+              DONE
+            </button>
+          )}
           {onAddToPersonal && <JournalButton
             compact
             state={journalAdded}
@@ -923,27 +924,6 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
               });
             }}
           />}
-          <TagSlot>
-            {trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7 ? (
-              <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a" }}>52W</span>
-            ) : null}
-          </TagSlot>
-          <TagSlot>
-            {trade.signal_fired?.length > 0 ? (
-              <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: BLUE, letterSpacing: .3, padding: "1px 4px", background: "#0a1020", borderRadius: 3, border: "1px solid #1a2a40", textAlign: "center" }}>{trade.signal_fired.length}/9</span>
-            ) : null}
-          </TagSlot>
-          <TagSlot>
-            {trade.confluence_count > 0 ? (
-              <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center" }}>{trade.confluence_count}/10</span>
-            ) : null}
-          </TagSlot>
-          {(sentiment.label === "CUT" || trade.outcome === "sold" || trade.outcome === "force_closed") && (
-            <button onClick={(e) => { e.stopPropagation(); onDone && onDone(cardKey); }}
-              style={{ background: "#222", border: `1px solid ${CARD_BORDER_LONG === "#1a3a4a" ? BLUE + "66" : "#444"}`, borderRadius: 4, color: "#ccc", fontSize: 9, fontWeight: 700, letterSpacing: 0.5, padding: "2px 8px", cursor: "pointer" }}>
-              DONE
-            </button>
-          )}
         </>}
       />
 
@@ -1862,7 +1842,7 @@ export default function App() {
         @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
         .fadeIn{animation:fadeUp .2s ease}
         @keyframes tagGlow{0%{box-shadow:none;opacity:1}50%{box-shadow:0 0 4px 1px currentColor;opacity:0.85}100%{box-shadow:none;opacity:1}}
-        .tag-glow{animation:tagGlow 0.9s ease-in-out 0.15s}
+        .tag-glow{animation:tagGlow 0.9s ease-in-out 0.3s}
       `}</style>
 
       <TickerBanner openPositions={openPositions} />
@@ -2151,7 +2131,7 @@ export default function App() {
                 {(sellTodayPositions.length > 0 || holdingPositions.length > 0) && (
                   <CardMetricGrid style={{ padding: `0 ${CARD_PAD_R} 5px ${CARD_PAD_L}` }}>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
-                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center" }}>Day %</div>
+                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "left" }}>Day %</div>
                     <SpineCell><div style={{ width: SPINE_VALUE_W, fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center", whiteSpace: "nowrap" }}>Open P&L</div></SpineCell>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right", paddingRight: 6 }}>+$</div>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right" }}>Conf</div>
