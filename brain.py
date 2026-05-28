@@ -728,6 +728,34 @@ def initialize_database():
             picks_json TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS scan_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_type TEXT NOT NULL,
+            job_type TEXT DEFAULT 'scan',
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            status TEXT DEFAULT 'running',
+            tickers_attempted INTEGER DEFAULT 0,
+            tickers_updated INTEGER DEFAULT 0,
+            picks_count INTEGER DEFAULT 0,
+            provider_summary TEXT DEFAULT '{}',
+            error TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS provider_health (
+            provider TEXT PRIMARY KEY,
+            status TEXT DEFAULT 'active',
+            success_count INTEGER DEFAULT 0,
+            failure_count INTEGER DEFAULT 0,
+            rate_limit_count INTEGER DEFAULT 0,
+            timeout_count INTEGER DEFAULT 0,
+            missing_count INTEGER DEFAULT 0,
+            last_success_at TEXT,
+            last_failure_at TEXT,
+            cooldown_until TEXT,
+            last_error TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS position_checks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             position_id TEXT NOT NULL,
@@ -1053,6 +1081,106 @@ def get_app_state_json(key, default=None):
     except Exception:
         return default
 
+def begin_scan_event(scan_type, job_type="scan", tickers_attempted=0):
+    """Create a durable scan/monitor event row and return its id."""
+    database = get_database()
+    cursor = database.execute("""
+        INSERT INTO scan_events (scan_type, job_type, started_at, status, tickers_attempted)
+        VALUES (?, ?, ?, 'running', ?)
+    """, [scan_type, job_type, current_time_cst().isoformat(), int(tickers_attempted or 0)])
+    database.commit()
+    event_id = cursor.lastrowid
+    database.close()
+    return event_id
+
+def finish_scan_event(event_id, status="success", tickers_updated=0, picks_count=0, provider_summary=None, error=None):
+    """Mark a scan/monitor event as complete."""
+    if not event_id:
+        return
+    database = get_database()
+    database.execute("""
+        UPDATE scan_events
+        SET finished_at=?, status=?, tickers_updated=?, picks_count=?, provider_summary=?, error=?
+        WHERE id=?
+    """, [
+        current_time_cst().isoformat(),
+        status,
+        int(tickers_updated or 0),
+        int(picks_count or 0),
+        json.dumps(provider_summary or {}),
+        str(error)[:500] if error else None,
+        event_id,
+    ])
+    database.commit()
+    database.close()
+
+def record_provider_health(provider, ok, failure_type=None, error=None, cooldown_minutes=0):
+    """Track provider reliability so noisy APIs can cool down or be benched."""
+    now = current_time_cst()
+    cooldown_until = (now + timedelta(minutes=cooldown_minutes)).isoformat() if cooldown_minutes else None
+    database = get_database()
+    database.execute("""
+        INSERT OR IGNORE INTO provider_health (provider, status)
+        VALUES (?, 'active')
+    """, [provider])
+    if ok:
+        database.execute("""
+            UPDATE provider_health
+            SET status=CASE WHEN status IN ('cooldown','degraded') THEN 'active' ELSE status END,
+                success_count=success_count+1,
+                last_success_at=?,
+                last_error=NULL,
+                cooldown_until=NULL
+            WHERE provider=?
+        """, [now.isoformat(), provider])
+    else:
+        field = {
+            "rate_limit": "rate_limit_count",
+            "timeout": "timeout_count",
+            "missing": "missing_count",
+        }.get(failure_type)
+        if field:
+            database.execute(f"UPDATE provider_health SET {field}={field}+1 WHERE provider=?", [provider])
+        status = "cooldown" if cooldown_minutes else "degraded"
+        database.execute("""
+            UPDATE provider_health
+            SET status=?,
+                failure_count=failure_count+1,
+                last_failure_at=?,
+                cooldown_until=COALESCE(?, cooldown_until),
+                last_error=?
+            WHERE provider=?
+        """, [status, now.isoformat(), cooldown_until, str(error or failure_type or "unknown")[:300], provider])
+    database.commit()
+    database.close()
+
+def get_provider_health_map():
+    """Return current provider health rows keyed by provider name."""
+    try:
+        database = get_database()
+        rows = [dict(r) for r in database.execute("SELECT * FROM provider_health").fetchall()]
+        database.close()
+        return {r["provider"]: r for r in rows}
+    except Exception:
+        return {}
+
+def provider_is_available(provider, health=None):
+    """Skip providers that are disabled, retired, or still cooling down."""
+    health = health or get_provider_health_map()
+    row = health.get(provider)
+    if not row:
+        return True
+    if row.get("status") in ("disabled", "retired", "benched"):
+        return False
+    cooldown = row.get("cooldown_until")
+    if cooldown:
+        try:
+            if datetime.fromisoformat(cooldown) > current_time_cst():
+                return False
+        except Exception:
+            return True
+    return True
+
 def record_open_execution_status(status):
     """Persist the latest open-position execution diagnostic payload."""
     payload = {
@@ -1258,6 +1386,209 @@ TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 TWELVE_DATA_BASE = "https://api.twelvedata.com"
 FINNHUB_KEY = os.getenv("FINNHUB_KEY")
 FINNHUB_BASE = "https://finnhub.io/api/v1"
+QUOTE_CACHE_SECONDS = int(os.getenv("QUOTE_CACHE_SECONDS", "90"))
+PROVIDER_CHAIN = [p.strip() for p in os.getenv(
+    "PRICE_PROVIDER_CHAIN",
+    "finnhub,alpha_vantage,twelve_data"
+).split(",") if p.strip()]
+
+class ProviderCycle:
+    """Per-job provider memory so a global failure is not retried for every ticker."""
+    def __init__(self, purpose="quote", max_layers=3):
+        self.purpose = purpose
+        self.max_layers = max_layers
+        self.unhealthy = set()
+        self.attempts = {}
+        self.successes = {}
+        self.failures = {}
+        self.errors = {}
+
+    def record(self, provider, ok, failure_type=None, error=None, global_failure=False):
+        self.attempts[provider] = self.attempts.get(provider, 0) + 1
+        if ok:
+            self.successes[provider] = self.successes.get(provider, 0) + 1
+        else:
+            self.failures[provider] = self.failures.get(provider, 0) + 1
+            if error:
+                self.errors[provider] = str(error)[:160]
+            if global_failure:
+                self.unhealthy.add(provider)
+        record_provider_health(
+            provider,
+            ok,
+            failure_type=failure_type,
+            error=error,
+            cooldown_minutes=15 if failure_type == "rate_limit" else (5 if global_failure else 0),
+        )
+
+    def summary(self):
+        return {
+            "purpose": self.purpose,
+            "attempts": self.attempts,
+            "successes": self.successes,
+            "failures": self.failures,
+            "errors": self.errors,
+            "unhealthy_this_cycle": sorted(self.unhealthy),
+        }
+
+def _read_quote_cache(ticker, max_age_seconds=QUOTE_CACHE_SECONDS):
+    try:
+        database = get_database()
+        row = database.execute("SELECT value FROM app_state WHERE key=?", [f"quote_cache_{ticker}"]).fetchone()
+        database.close()
+        if not row:
+            return None
+        cached = json.loads(row["value"])
+        fetched_at = datetime.fromisoformat(cached.get("fetched_at"))
+        if (current_time_cst() - fetched_at).total_seconds() > max_age_seconds:
+            return None
+        data = cached.get("data") or {}
+        data["source"] = f"{data.get('source', 'cache')}_cache"
+        data["cached_at"] = cached.get("fetched_at")
+        return data
+    except Exception:
+        return None
+
+def _write_quote_cache(ticker, data):
+    try:
+        database = get_database()
+        database.execute(
+            "INSERT OR REPLACE INTO app_state VALUES (?,?)",
+            [f"quote_cache_{ticker}", json.dumps({"fetched_at": current_time_cst().isoformat(), "data": data})]
+        )
+        database.commit()
+        database.close()
+    except Exception:
+        pass
+
+def _normalize_quote(price, previous_close=None, open_price=None, high=None, low=None, source="unknown"):
+    price = float(price)
+    prev = float(previous_close if previous_close not in (None, 0) else price)
+    open_value = float(open_price if open_price not in (None, 0) else price)
+    high_value = float(high if high not in (None, 0) else price)
+    low_value = float(low if low not in (None, 0) else price)
+    return {
+        "price": price,
+        "open": open_value,
+        "previous_close": prev,
+        "high": high_value,
+        "low": low_value,
+        "volume": 0,
+        "average_volume": 1,
+        "volume_ratio": 1.0,
+        "gap_percent": (open_value - prev) / max(prev, 0.01) * 100,
+        "day_change_pct": (price - prev) / max(prev, 0.01) * 100,
+        "day_change_percent": (price - prev) / max(prev, 0.01) * 100,
+        "source": source,
+    }
+
+def _provider_quote(provider, ticker):
+    """Fetch one quote and classify failures for the fallback router."""
+    try:
+        import urllib.parse
+        import urllib.request
+        provider = provider.lower()
+        if provider == "finnhub":
+            if not FINNHUB_KEY:
+                return None, "disabled", "missing FINNHUB_KEY", True
+            url = f"{FINNHUB_BASE}/quote?symbol={ticker}&token={FINNHUB_KEY}"
+            with urllib.request.urlopen(url, timeout=8) as resp:
+                data = json.loads(resp.read())
+            if data.get("error"):
+                failure = "rate_limit" if "limit" in str(data.get("error")).lower() else "bad_response"
+                return None, failure, data.get("error"), failure != "bad_response"
+            price = data.get("c", 0)
+            if not price:
+                return None, "missing", "no current price", False
+            return _normalize_quote(
+                price,
+                previous_close=data.get("pc", price),
+                open_price=data.get("o", price),
+                high=data.get("h", price),
+                low=data.get("l", price),
+                source="finnhub",
+            ), None, None, False
+
+        if provider == "alpha_vantage":
+            if not ALPHA_VANTAGE_KEY:
+                return None, "disabled", "missing ALPHA_VANTAGE_KEY", True
+            params = urllib.parse.urlencode({
+                "function": "GLOBAL_QUOTE",
+                "symbol": ticker,
+                "apikey": ALPHA_VANTAGE_KEY,
+            })
+            with urllib.request.urlopen(f"https://www.alphavantage.co/query?{params}", timeout=12) as resp:
+                data = json.loads(resp.read())
+            note = data.get("Note") or data.get("Information")
+            if note:
+                failure = "rate_limit" if "rate" in str(note).lower() or "standard api call" in str(note).lower() else "bad_response"
+                return None, failure, note, True
+            quote = data.get("Global Quote") or {}
+            price = quote.get("05. price")
+            if not price:
+                return None, "missing", "no global quote", False
+            prev = quote.get("08. previous close") or price
+            open_value = quote.get("02. open") or price
+            high = quote.get("03. high") or price
+            low = quote.get("04. low") or price
+            return _normalize_quote(price, prev, open_value, high, low, "alpha_vantage"), None, None, False
+
+        if provider == "twelve_data":
+            if not TWELVE_DATA_KEY:
+                return None, "disabled", "missing TWELVE_DATA_KEY", True
+            params = urllib.parse.urlencode({"symbol": ticker, "apikey": TWELVE_DATA_KEY})
+            with urllib.request.urlopen(f"{TWELVE_DATA_BASE}/quote?{params}", timeout=12) as resp:
+                data = json.loads(resp.read())
+            if data.get("status") == "error":
+                msg = data.get("message", "twelve data error")
+                failure = "rate_limit" if "limit" in msg.lower() else "bad_response"
+                return None, failure, msg, failure != "bad_response"
+            price = data.get("close") or data.get("price")
+            if not price:
+                return None, "missing", "no quote price", False
+            return _normalize_quote(
+                price,
+                previous_close=data.get("previous_close") or data.get("close"),
+                open_price=data.get("open") or price,
+                high=data.get("high") or price,
+                low=data.get("low") or price,
+                source="twelve_data",
+            ), None, None, False
+    except TimeoutError as exc:
+        return None, "timeout", str(exc), True
+    except Exception as exc:
+        error_text = str(exc)
+        failure = "timeout" if "timed out" in error_text.lower() else "network"
+        return None, failure, error_text, failure == "timeout"
+    return None, "disabled", f"unknown provider {provider}", True
+
+def fetch_quote_with_fallback(ticker, cycle=None, use_cache=True):
+    """
+    Frugal quote router: cache first, then ranked providers with per-cycle
+    provider health memory. Fallback is ticker-level unless the provider has
+    a global failure such as auth/rate-limit/timeout.
+    """
+    if use_cache:
+        cached = _read_quote_cache(ticker)
+        if cached:
+            return cached
+
+    cycle = cycle or ProviderCycle("quote")
+    health = get_provider_health_map()
+    layers_used = 0
+    for provider in PROVIDER_CHAIN:
+        if layers_used >= cycle.max_layers:
+            break
+        if provider in cycle.unhealthy or not provider_is_available(provider, health):
+            continue
+        layers_used += 1
+        quote, failure_type, error, global_failure = _provider_quote(provider, ticker)
+        if quote:
+            cycle.record(provider, True)
+            _write_quote_cache(ticker, quote)
+            return quote
+        cycle.record(provider, False, failure_type=failure_type, error=error, global_failure=global_failure)
+    return None
 
 def fetch_finnhub_quote(ticker):
     """
@@ -1563,8 +1894,9 @@ def fetch_price_data(tickers):
     if to_refresh:
         log.info(f"Refreshing {len(to_refresh)} tickers from Finnhub...")
         RATE_DELAY = 1.1
+        cycle = ProviderCycle("comprehensive_quote")
         for ticker in to_refresh:
-            quote = fetch_finnhub_quote(ticker)
+            quote = fetch_quote_with_fallback(ticker, cycle=cycle, use_cache=False)
             if quote:
                 results[ticker] = quote
                 # Fetch candle history for fresh tickers
@@ -1587,6 +1919,7 @@ def fetch_price_data(tickers):
                 except:
                     pass
                 time.sleep(RATE_DELAY)
+        set_app_state("last_price_provider_summary", json.dumps(cycle.summary()))
 
     log.info(f"fetch_price_data complete: {len(results)}/{len(tickers)} tickers")
     return results
@@ -1620,6 +1953,8 @@ def fetch_current_prices(tickers, pin_to_845=False):
     if not tickers:
         return {}
 
+    cycle = ProviderCycle("entry_pin" if pin_to_845 else "current_prices")
+
     if pin_to_845:
         results = {}
         target = current_time_cst().replace(hour=8, minute=45, second=0, microsecond=0)
@@ -1628,13 +1963,26 @@ def fetch_current_prices(tickers, pin_to_845=False):
             if pinned:
                 results[ticker] = {"price": pinned["price"], "day_change_pct": 0, "source": pinned["source"]}
             else:
-                quote = fetch_finnhub_quote(ticker)
+                quote = fetch_quote_with_fallback(ticker, cycle=cycle, use_cache=False)
                 if quote:
-                    results[ticker] = {"price": quote["open"], "day_change_pct": 0, "source": "finnhub_day_open_fallback"}
+                    results[ticker] = {
+                        "price": quote.get("open", quote["price"]),
+                        "day_change_pct": 0,
+                        "source": f"{quote.get('source', 'provider')}_day_open_fallback",
+                    }
             time.sleep(1.1)
+        set_app_state("last_price_provider_summary", json.dumps(cycle.summary()))
         return results
 
-    return fetch_twelve_data_live(tickers)
+    results = {}
+    for ticker in tickers:
+        quote = fetch_quote_with_fallback(ticker, cycle=cycle, use_cache=True)
+        if quote:
+            results[ticker] = quote
+        time.sleep(0.15 if "cache" in str((quote or {}).get("source", "")) else 1.05)
+    set_app_state("last_price_provider_summary", json.dumps(cycle.summary()))
+    log.info(f"Price fallback router: {len(results)}/{len(tickers)} tickers | {cycle.summary()}")
+    return results
 
 def calculate_rsi_batch(tickers, period=14, price_data=None):
     """
@@ -2725,11 +3073,12 @@ def enrich_with_live_prices(tickers, price_data):
     log.info(f"Extended hours active — enriching {len(tickers)} tickers with live prices ({'pre' if in_premarket else 'post'}-market)")
 
     enriched = 0
+    cycle = ProviderCycle("extended_hours_enrich")
     for ticker in tickers:
         if ticker not in price_data:
             continue
         try:
-            quote = fetch_finnhub_quote(ticker)
+            quote = fetch_quote_with_fallback(ticker, cycle=cycle, use_cache=True)
             if not quote or quote["price"] <= 0:
                 time.sleep(1.1)
                 continue
@@ -2745,11 +3094,12 @@ def enrich_with_live_prices(tickers, price_data):
             else:
                 new_change = (live_price - today_close) / max(today_close, 0.01) * 100
                 data["day_change_percent"] = round(new_change, 4)
-            data["live_price_source"] = "finnhub"
+            data["live_price_source"] = quote.get("source", "provider")
             enriched += 1
             time.sleep(1.1)
         except:
             pass
+    set_app_state("last_price_provider_summary", json.dumps(cycle.summary()))
 
     log.info(f"Live price enrichment complete — {enriched}/{len(tickers)} tickers enriched")
 
@@ -2973,6 +3323,7 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
         log.warning(f"Could not exclude open tickers from scan: {e}")
 
     log.info(f"Comprehensive scan: {len(universe)} tickers ({scan_type}, {len(open_tickers) if 'open_tickers' in dir() else 0} open positions excluded)...")
+    scan_event_id = begin_scan_event(scan_type, job_type="comprehensive", tickers_attempted=len(universe))
 
     # Ensure SPY is always fetched — needed for relative strength calculations
     universe_with_spy = list(dict.fromkeys(universe + ["SPY"]))
@@ -3088,9 +3439,7 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
 
     if queue_is_locked and scan_type not in ("manual", "manual_fresh"):
         log.info(f"Queue locked — scan completed but no new picks added ({scan_type})")
-        return {"longs": [], "shorts": [], "queue_locked": True,
-                "total_scanned": len(scored_stocks), "scan_type": scan_type,
-                "generated_at": current_time_cst().isoformat()}
+        pass
 
     # Filter by confidence floor — longs only.
     # Shorts are disabled: current signals (RSI momentum, volume surge, gap probability)
@@ -3127,6 +3476,8 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
         "total_scanned": len(scored_stocks),
         "generated_at": current_time_cst().isoformat(),
         "scan_type": scan_type,
+        "queue_locked": bool(queue_is_locked),
+        "execution_locked": bool(queue_is_locked),
     }
     nn_scan_result = build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soon, scan_type)
     scan_result["nn_picks"] = {
@@ -3183,6 +3534,13 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
 
     database.commit()
     database.close()
+    finish_scan_event(
+        scan_event_id,
+        status="success",
+        tickers_updated=len(price_data),
+        picks_count=len(scan_result["longs"]) + len(scan_result["shorts"]),
+        provider_summary=get_app_state_json("last_price_provider_summary", {}) or {},
+    )
     log.info(f"Scan complete: {len(recommended_longs)} longs, {len(recommended_shorts)} shorts from {len(scored_stocks)} scanned")
     return scan_result
 
@@ -4039,6 +4397,7 @@ def monitor_open_positions():
     if not all_tickers:
         return
 
+    monitor_event_id = begin_scan_event("open_position_monitor", job_type="monitor", tickers_attempted=len(all_tickers))
     current_prices = fetch_current_prices(all_tickers)
     now = current_time_cst()
     today = now.strftime("%Y-%m-%d")
@@ -4059,6 +4418,10 @@ def monitor_open_positions():
     for position in open_positions:
         ticker = position["ticker"]
         if ticker not in current_prices:
+            database.execute("""
+                INSERT INTO position_checks (position_id, check_time, price, pnl_percent, sentiment, ticker)
+                VALUES (?,?,?,?,?,?)
+            """, [position["id"], now.isoformat(), None, None, "stale: no fresh provider price", ticker])
             continue
 
         price_data = current_prices[ticker]
@@ -4270,6 +4633,21 @@ def monitor_open_positions():
 
     database.commit()
     database.close()
+    finish_scan_event(
+        monitor_event_id,
+        status="success" if current_prices else "degraded",
+        tickers_updated=len(current_prices),
+        provider_summary=get_app_state_json("last_price_provider_summary", {}) or {},
+        error=None if current_prices else "no current prices returned",
+    )
+    set_app_state("last_open_position_monitor", json.dumps({
+        "checked_at": now.isoformat(),
+        "tickers_attempted": len(all_tickers),
+        "tickers_updated": len(current_prices),
+        "open_positions": len(open_positions),
+        "candidates": len(monitored_candidates),
+        "provider_summary": get_app_state_json("last_price_provider_summary", {}) or {},
+    }))
     log.info(f"Monitored {len(open_positions)} positions + {len(monitored_candidates)} candidates")
 
 def force_close_previous_session():
@@ -5145,11 +5523,117 @@ def api_intraday_pnl():
 @app.route("/api/scan-history")
 def api_scan_history():
     database = get_database()
-    rows = [dict(r) for r in database.execute(
-        "SELECT id, scan_time, scan_type, ticker_count FROM scan_cache ORDER BY scan_time DESC LIMIT 50"
-    ).fetchall()]
+    rows = [dict(r) for r in database.execute("""
+        SELECT id,
+               COALESCE(finished_at, started_at) AS scan_time,
+               scan_type,
+               job_type,
+               status,
+               tickers_attempted AS ticker_count,
+               tickers_updated,
+               picks_count,
+               provider_summary,
+               error
+        FROM scan_events
+        ORDER BY started_at DESC
+        LIMIT 75
+    """).fetchall()]
+    if not rows:
+        rows = [dict(r) for r in database.execute("""
+            SELECT id,
+                   scan_time,
+                   scan_type,
+                   'legacy' AS job_type,
+                   'success' AS status,
+                   ticker_count,
+                   ticker_count AS tickers_updated,
+                   0 AS picks_count,
+                   '{}' AS provider_summary,
+                   NULL AS error
+            FROM scan_cache
+            ORDER BY scan_time DESC
+            LIMIT 50
+        """).fetchall()]
     database.close()
     return jsonify(rows)
+
+@app.route("/api/freshness-status")
+def api_freshness_status():
+    """Explain whether scans, monitor checks, and provider data are fresh enough to trust."""
+    now = current_time_cst()
+
+    def parse_dt(value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except Exception:
+            return None
+
+    def age_minutes(value):
+        parsed = parse_dt(value)
+        if not parsed:
+            return None
+        return round((now - parsed).total_seconds() / 60, 1)
+
+    database = get_database()
+    last_comprehensive = database.execute("""
+        SELECT * FROM scan_events
+        WHERE job_type='comprehensive' AND status IN ('success','degraded')
+        ORDER BY started_at DESC LIMIT 1
+    """).fetchone()
+    last_monitor = database.execute("""
+        SELECT * FROM scan_events
+        WHERE job_type='monitor'
+        ORDER BY started_at DESC LIMIT 1
+    """).fetchone()
+    stale_positions = [dict(r) for r in database.execute("""
+        SELECT id, ticker, last_price_updated
+        FROM virtual_trades
+        WHERE outcome='open'
+          AND (last_price_updated IS NULL OR last_price_updated < ?)
+        ORDER BY ticker
+    """, [(now - timedelta(minutes=10)).isoformat()]).fetchall()]
+    provider_rows = [dict(r) for r in database.execute("SELECT * FROM provider_health ORDER BY provider").fetchall()]
+    legacy_scan = database.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
+    database.close()
+
+    comprehensive = dict(last_comprehensive) if last_comprehensive else None
+    monitor = dict(last_monitor) if last_monitor else None
+    legacy_scan_time = legacy_scan["value"] if legacy_scan else None
+    comprehensive_age = age_minutes(comprehensive.get("finished_at") or comprehensive.get("started_at")) if comprehensive else age_minutes(legacy_scan_time)
+    monitor_age = age_minutes(monitor.get("finished_at") or monitor.get("started_at")) if monitor else None
+
+    warnings = []
+    if comprehensive_age is None:
+        warnings.append("No comprehensive scan has been logged.")
+    elif comprehensive_age > 45:
+        warnings.append(f"Comprehensive scan is stale ({comprehensive_age} min old).")
+    if monitor_age is None:
+        warnings.append("No open-position monitor pass has been logged.")
+    elif is_market_open() and monitor_age > 7:
+        warnings.append(f"Open-position monitor is stale ({monitor_age} min old).")
+    if stale_positions:
+        warnings.append(f"{len(stale_positions)} open positions have stale price updates.")
+
+    decision_status = "safe"
+    if warnings:
+        decision_status = "degraded"
+    if is_market_open() and (monitor_age is None or monitor_age > 15):
+        decision_status = "unsafe_stale"
+
+    return jsonify({
+        "now_cst": now.isoformat(),
+        "decision_status": decision_status,
+        "warnings": warnings,
+        "last_comprehensive_scan": comprehensive or ({"scan_time": legacy_scan_time, "status": "legacy"} if legacy_scan_time else None),
+        "last_comprehensive_age_minutes": comprehensive_age,
+        "last_open_position_monitor": monitor,
+        "last_monitor_age_minutes": monitor_age,
+        "stale_open_positions": stale_positions,
+        "provider_health": provider_rows,
+        "last_provider_summary": get_app_state_json("last_price_provider_summary", {}) or {},
+    })
 
 @app.route("/api/open-positions-dynamic")
 def api_open_positions_dynamic():

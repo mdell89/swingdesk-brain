@@ -2297,8 +2297,8 @@ export default function App() {
                   <div style={{ display: "flex", gap: 4, marginBottom: 7 }}>
                     {[
                       ["all", `All (${openLongPositions.length})`],
-                      ["day2", `Day 2 (${sellTodayPositions.length})`],
-                      ["day1", `Day 1 (${holdingPositions.length})`],
+                      ["day1", `Fresh (${holdingPositions.length})`],
+                      ["day2", `Carry (${sellTodayPositions.length})`],
                     ].map(([id, label]) => (
                       <button key={id} onClick={() => setOpenDayFilter(id)} style={{
                         flex: 1,
@@ -2831,10 +2831,10 @@ export default function App() {
                     return (
                       <div key={row.id} style={{ display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", padding: "10px 14px", background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10 }}>
                         <div>
-                          <div style={{ fontSize: 12, color: T1, fontWeight: 700 }}>{row.scan_type || "scan"}</div>
-                          <div style={{ fontSize: 9, color: T3, marginTop: 2 }}>{label}</div>
+                          <div style={{ fontSize: 12, color: T1, fontWeight: 700 }}>{row.scan_type || "scan"} <span style={{ color: row.status === "success" ? GREEN : row.status === "degraded" ? AMBER : RED, fontSize: 9 }}>{row.status || ""}</span></div>
+                          <div style={{ fontSize: 9, color: T3, marginTop: 2 }}>{label}{row.job_type ? ` · ${row.job_type}` : ""}{row.error ? ` · ${row.error}` : ""}</div>
                         </div>
-                        <div style={{ fontSize: 12, color: BLUE, fontWeight: 800, fontFamily: "'DM Mono',monospace" }}>{row.ticker_count || 0}</div>
+                        <div style={{ fontSize: 12, color: BLUE, fontWeight: 800, fontFamily: "'DM Mono',monospace" }}>{row.tickers_updated ?? row.ticker_count ?? 0}/{row.ticker_count || 0}</div>
                       </div>
                     );
                   })}
