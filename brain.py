@@ -2193,6 +2193,143 @@ def select_variant_picks(picks, selection_mode):
         return picks[:3]
     return picks
 
+def cache_age_minutes(timestamp):
+    parsed = _parse_iso(timestamp)
+    if not parsed:
+        return None
+    return round((current_time_cst() - parsed).total_seconds() / 60, 1)
+
+def variant_cache_snapshot(database, require_fresh=True, max_age_minutes=180):
+    """Load the shared Vector/Nova cache pair and reject stale or incomplete manual runs."""
+    status_row = database.execute("SELECT value FROM app_state WHERE key=?", [NN_SCAN_STATUS_KEY]).fetchone()
+    scan_status = json.loads(status_row["value"]) if status_row and status_row["value"] else {}
+    if scan_status.get("status") in ("queued", "running"):
+        return None, {
+            "success": False,
+            "refused": True,
+            "reason": "shared_scan_running",
+            "message": "Shared scan is still running; wait for /api/nn-scan-status to complete before running universes.",
+            "scan_status": scan_status,
+        }
+
+    vector_cached = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
+    nova_cached = database.execute("SELECT value FROM app_state WHERE key='cached_nn_picks'").fetchone()
+    vector_time_row = database.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
+    nova_time_row = database.execute("SELECT value FROM app_state WHERE key='cached_nn_picks_time'").fetchone()
+    if not vector_cached or not nova_cached:
+        return None, {
+            "success": False,
+            "refused": True,
+            "reason": "missing_shared_cache",
+            "message": "Both Vector and Nova caches are required so universes use one shared snapshot.",
+            "vector_cached": bool(vector_cached),
+            "nova_cached": bool(nova_cached),
+        }
+
+    vector_payload = json.loads(vector_cached["value"]) if vector_cached else {}
+    nova_payload = json.loads(nova_cached["value"]) if nova_cached else {}
+    vector_time = vector_time_row["value"] if vector_time_row else vector_payload.get("generated_at")
+    nova_time = nova_time_row["value"] if nova_time_row else nova_payload.get("scan_time")
+    vector_age = cache_age_minutes(vector_time)
+    nova_age = cache_age_minutes(nova_time)
+    if require_fresh and (
+        vector_age is None or nova_age is None or
+        vector_age > max_age_minutes or nova_age > max_age_minutes
+    ):
+        return None, {
+            "success": False,
+            "refused": True,
+            "reason": "stale_shared_cache",
+            "message": "Shared scan cache is stale; trigger /api/shared-scan-now before opening universe trades.",
+            "vector_cache_time": vector_time,
+            "nova_cache_time": nova_time,
+            "vector_cache_age_minutes": vector_age,
+            "nova_cache_age_minutes": nova_age,
+        }
+    vector_dt = _parse_iso(vector_time)
+    nova_dt = _parse_iso(nova_time)
+    cache_gap = None
+    if vector_dt and nova_dt:
+        cache_gap = round(abs((vector_dt - nova_dt).total_seconds()) / 60, 1)
+    if require_fresh and (cache_gap is None or cache_gap > 15):
+        return None, {
+            "success": False,
+            "refused": True,
+            "reason": "cache_pair_mismatch",
+            "message": "Vector and Nova caches are not from the same shared scan window.",
+            "vector_cache_time": vector_time,
+            "nova_cache_time": nova_time,
+            "cache_gap_minutes": cache_gap,
+        }
+
+    return {
+        "vector_payload": vector_payload,
+        "nova_payload": nova_payload,
+        "vector_cache_time": vector_time,
+        "nova_cache_time": nova_time,
+        "vector_cache_age_minutes": vector_age,
+        "nova_cache_age_minutes": nova_age,
+        "cache_gap_minutes": cache_gap,
+        "scan_status": scan_status,
+    }, None
+
+def variant_strategy_matches(strategy, pick):
+    """Lightweight bullish filters so universes do not all consume the same pick stream."""
+    strategy = (strategy or "SwingDesk").lower()
+    day_change = float(pick.get("day_change_pct") or pick.get("pct_change_prev_close") or 0)
+    regular_open_change = float(pick.get("pct_change_regular_open") or 0)
+    gap = float(pick.get("overnight_gap_pct") or pick.get("gap_percent") or 0)
+    volume = float(pick.get("vol_ratio") or pick.get("volume_ratio") or 1)
+    rsi = float(pick.get("rsi") or 50)
+    confidence, expected_move = pick_confidence_and_move(pick, "Vector")
+    confluence = int(pick.get("confluence_count") or 0)
+    methods = pick.get("confluence_methods") or []
+    if not isinstance(methods, list):
+        methods = []
+    method_text = " ".join(str(m).lower() for m in methods)
+
+    if strategy == "swingdesk":
+        return confidence >= 65 and expected_move >= 3
+    if strategy == "bullish mean reversion":
+        return day_change < 0 and regular_open_change > -4 and 35 <= rsi <= 55 and confidence >= 58
+    if strategy == "darvas":
+        return (confluence >= 1 or "52" in method_text or "breakout" in method_text) and day_change > 1.5 and volume >= 1.0
+    if strategy == "gap & go":
+        return gap >= 2.5 and day_change > 2 and volume >= 1.1
+    if strategy == "vwap reclaim":
+        scores = pick.get("signal_scores_for_observation") or pick.get("signal_scores") or {}
+        if isinstance(scores, str):
+            try:
+                scores = json.loads(scores)
+            except Exception:
+                scores = {}
+        return float(scores.get("vwap_reclaim") or 0) >= 0.65 or "vwap" in method_text
+    if strategy == "donchian":
+        return day_change > 2 and confluence >= 1 and confidence >= 62
+    if strategy == "inside day":
+        return abs(gap) <= 4 and day_change > 0.5 and volume >= 0.8 and 45 <= rsi <= 65
+    if strategy == "nr7":
+        return volume <= 1.4 and abs(gap) <= 5 and day_change > 0
+    if strategy == "bull flag":
+        return day_change > 1 and regular_open_change > -2 and 45 <= rsi <= 70 and confidence >= 62
+    if strategy == "pocket pivot":
+        return volume >= 1.4 and day_change > 0.5 and confidence >= 60
+    if strategy == "s&r breakout":
+        return confluence >= 1 and day_change > 1 and confidence >= 60
+    if strategy == "vol squeeze breakout":
+        scores = pick.get("signal_scores_for_observation") or pick.get("signal_scores") or {}
+        if isinstance(scores, str):
+            try:
+                scores = json.loads(scores)
+            except Exception:
+                scores = {}
+        return float(scores.get("volatility_squeeze") or 0) >= 0.5 and day_change > 1
+    return confidence >= 65
+
+def filter_variant_strategy_picks(picks, variant):
+    filtered = [p for p in picks if variant_strategy_matches(variant.get("strategy"), p)]
+    return filtered
+
 def pick_confidence_and_move(pick, brain="Vector"):
     confidence = pick.get("long_conf") or pick.get("confidence") or pick.get("nn_score") or 0
     expected_move = pick.get("long_move") or pick.get("expected_move") or 0
@@ -4289,10 +4426,6 @@ def evaluate_sell_decision(trade, current_price, rsi=None, volume_ratio=None):
     if trade["direction"] == "long" and rsi and rsi > 80 and pnl_percent > 3:
         return True, "rsi_exhaustion", f"Exiting — RSI {rsi:.0f} exhausted at {pnl_percent:+.1f}%"
 
-    # ── TIME PRESSURE — Clock running out, take what you have ──
-    if remaining_minutes < 30 and pnl_percent > 0.5:
-        return True, "time_pressure", f"Closing — {remaining_minutes}min left at {pnl_percent:+.1f}%"
-
     # ── HOLD — Various sentiments based on current P&L ──
     if pnl_percent >= 5:
         sentiment = f"Holding — on track at {pnl_percent:+.1f}%"
@@ -4610,24 +4743,34 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None):
         "skipped_count": 0,
         "opened": [],
         "skipped": [],
+        "variant_summaries": [],
         "errors": [],
     }
     today = current_time_cst().strftime("%Y-%m-%d")
     buy_time = buy_time or current_time_cst().strftime("%H:%M:%S")
     database = get_database()
     try:
-        vector_cached = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
-        nova_cached = database.execute("SELECT value FROM app_state WHERE key='cached_nn_picks'").fetchone()
-        if not vector_cached and not nova_cached:
-            status["success"] = False
-            status["errors"].append("No cached Vector or Nova picks available")
+        snapshot, refusal = variant_cache_snapshot(database, require_fresh=True)
+        if refusal:
+            status.update(refusal)
+            database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_variant_run', ?)", [json.dumps(status)])
+            database.commit()
             return status
 
-        vector_payload = json.loads(vector_cached["value"]) if vector_cached else {}
-        nova_payload = json.loads(nova_cached["value"]) if nova_cached else {}
+        vector_payload = snapshot["vector_payload"]
+        nova_payload = snapshot["nova_payload"]
         vector_picks = vector_payload.get("longs") or vector_payload.get("recommended_longs") or []
         nova_picks = nova_payload.get("recommended_longs") or nova_payload.get("longs") or []
-        scan_time = vector_payload.get("generated_at") or vector_payload.get("cache_time") or nova_payload.get("scan_time") or status["ran_at"]
+        status.update({
+            "shared_snapshot": True,
+            "vector_cache_time": snapshot["vector_cache_time"],
+            "nova_cache_time": snapshot["nova_cache_time"],
+            "vector_cache_age_minutes": snapshot["vector_cache_age_minutes"],
+            "nova_cache_age_minutes": snapshot["nova_cache_age_minutes"],
+            "cache_gap_minutes": snapshot["cache_gap_minutes"],
+            "vector_pick_count": len(vector_picks),
+            "nova_pick_count": len(nova_picks),
+        })
 
         variants = [dict(r) for r in database.execute("""
             SELECT sv.*, vp.cash, vp.equity
@@ -4643,12 +4786,30 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None):
             source_picks = nova_picks if brain == "Nova" else vector_picks
             if brain == "Nova":
                 source_picks = [p for p in source_picks if p.get("nn_executable", True)]
-            selected = select_variant_picks(source_picks, variant.get("selection_mode"))
+            strategy_filtered = filter_variant_strategy_picks(source_picks, variant)
+            if not strategy_filtered:
+                status["skipped"].append({"variant_id": variant["id"], "reason": "no strategy-qualified picks"})
+                status["skipped_count"] += 1
+                status["variant_summaries"].append({
+                    "variant_id": variant["id"],
+                    "brain": brain,
+                    "strategy": variant.get("strategy"),
+                    "source_picks": len(source_picks),
+                    "strategy_qualified": 0,
+                    "selected": 0,
+                    "opened": 0,
+                })
+                update_variant_portfolio(database, variant["id"], note="no_strategy_picks")
+                continue
+            selected = select_variant_picks(strategy_filtered, variant.get("selection_mode"))
             if not selected:
                 status["skipped"].append({"variant_id": variant["id"], "reason": "no picks"})
                 status["skipped_count"] += 1
                 update_variant_portfolio(database, variant["id"], note="no_picks")
                 continue
+            variant_opened = 0
+            variant_skipped = 0
+            scan_time = snapshot["nova_cache_time"] if brain == "Nova" else snapshot["vector_cache_time"]
 
             for rank, pick in enumerate(selected, start=1):
                 ticker = pick.get("ticker")
@@ -4657,6 +4818,7 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None):
                 trade_id = f"{variant['id']}_{ticker}_{today}_long"
                 if database.execute("SELECT id FROM variant_virtual_trades WHERE id=?", [trade_id]).fetchone():
                     status["skipped_count"] += 1
+                    variant_skipped += 1
                     status["skipped"].append({"variant_id": variant["id"], "ticker": ticker, "reason": "already open/executed today"})
                     continue
                 if database.execute(
@@ -4664,6 +4826,7 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None):
                     [variant["id"], ticker]
                 ).fetchone():
                     status["skipped_count"] += 1
+                    variant_skipped += 1
                     status["skipped"].append({"variant_id": variant["id"], "ticker": ticker, "reason": "already open in variant"})
                     continue
 
@@ -4671,12 +4834,14 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None):
                 invested = variant_investment_amount(portfolio)
                 if invested <= 0:
                     status["skipped_count"] += 1
+                    variant_skipped += 1
                     status["skipped"].append({"variant_id": variant["id"], "ticker": ticker, "reason": "no cash"})
                     continue
 
                 buy_price = pick.get("open_price") or pick.get("price") or pick.get("buy_price") or 0
                 if not buy_price:
                     status["skipped_count"] += 1
+                    variant_skipped += 1
                     status["skipped"].append({"variant_id": variant["id"], "ticker": ticker, "reason": "missing price"})
                     continue
 
@@ -4704,6 +4869,7 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None):
                     WHERE variant_id=?
                 """, [round(invested, 4), status["ran_at"], variant["id"]])
                 status["opened_count"] += 1
+                variant_opened += 1
                 status["opened"].append({
                     "variant_id": variant["id"],
                     "ticker": ticker,
@@ -4713,6 +4879,16 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None):
                 })
 
             update_variant_portfolio(database, variant["id"], note=f"run_{trigger}")
+            status["variant_summaries"].append({
+                "variant_id": variant["id"],
+                "brain": brain,
+                "strategy": variant.get("strategy"),
+                "source_picks": len(source_picks),
+                "strategy_qualified": len(strategy_filtered),
+                "selected": len(selected),
+                "opened": variant_opened,
+                "skipped": variant_skipped,
+            })
 
         database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_variant_run', ?)", [json.dumps(status)])
         database.commit()
@@ -4777,9 +4953,6 @@ def monitor_variant_universes(trigger="manual"):
             elif pnl_pct <= -5:
                 should_close = True
                 sell_reason = "stop_loss"
-            elif row.get("buy_date") < today and 0 <= minutes_until_forced_close() < 30 and pnl_pct > 0.5:
-                should_close = True
-                sell_reason = "time_pressure"
 
             if should_close:
                 gross_pnl = current_value - invested
@@ -6630,7 +6803,7 @@ def api_day_trade_status():
         """, [five_days_ago]).fetchall()]
         database.close()
 
-        pdt_relevant_reasons = {"cut_loss", "stop_loss", "momentum_fade", "rsi_exhaustion", "target_hit", "time_pressure"}
+        pdt_relevant_reasons = {"cut_loss", "stop_loss", "momentum_fade", "rsi_exhaustion", "target_hit"}
         pdt_relevant_same_day = []
         excluded_same_day = []
         for row in same_day_rows:
@@ -7166,6 +7339,62 @@ def api_variant_leaderboard():
         log.error(f"variant-leaderboard error: {e}")
         return jsonify([]), 500
 
+@app.route("/api/variant-status")
+def api_variant_status():
+    """Small operational summary for UI and quick Railway checks."""
+    try:
+        db = get_database()
+        last_run = get_app_state_json("last_variant_run", {}) or {}
+        last_monitor = get_app_state_json("last_variant_monitor", {}) or {}
+        snapshot, refusal = variant_cache_snapshot(db, require_fresh=False)
+        counts = db.execute("""
+            SELECT
+                COUNT(*) AS variants,
+                SUM(CASE WHEN brain='Vector' THEN 1 ELSE 0 END) AS vector_variants,
+                SUM(CASE WHEN brain='Nova' THEN 1 ELSE 0 END) AS nova_variants
+            FROM strategy_variants
+            WHERE status='active'
+        """).fetchone()
+        portfolio = db.execute("""
+            SELECT
+                SUM(open_count) AS open_positions,
+                SUM(closed_count) AS closed_positions,
+                MAX(equity) AS best_equity,
+                MIN(equity) AS worst_equity
+            FROM variant_portfolios
+        """).fetchone()
+        db.close()
+        payload = {
+            "success": True,
+            "variants": counts["variants"] if counts else 0,
+            "vector_variants": counts["vector_variants"] if counts else 0,
+            "nova_variants": counts["nova_variants"] if counts else 0,
+            "open_positions": portfolio["open_positions"] if portfolio else 0,
+            "closed_positions": portfolio["closed_positions"] if portfolio else 0,
+            "best_equity": portfolio["best_equity"] if portfolio else None,
+            "worst_equity": portfolio["worst_equity"] if portfolio else None,
+            "last_run": last_run,
+            "last_monitor": last_monitor,
+        }
+        if snapshot:
+            payload.update({
+                "shared_snapshot": True,
+                "vector_cache_time": snapshot["vector_cache_time"],
+                "nova_cache_time": snapshot["nova_cache_time"],
+                "vector_cache_age_minutes": snapshot["vector_cache_age_minutes"],
+                "nova_cache_age_minutes": snapshot["nova_cache_age_minutes"],
+                "cache_gap_minutes": snapshot["cache_gap_minutes"],
+                "vector_pick_count": len(snapshot["vector_payload"].get("longs") or snapshot["vector_payload"].get("recommended_longs") or []),
+                "nova_pick_count": len(snapshot["nova_payload"].get("recommended_longs") or snapshot["nova_payload"].get("longs") or []),
+            })
+        else:
+            payload["shared_snapshot"] = False
+            payload["cache_issue"] = refusal
+        return jsonify(payload)
+    except Exception as e:
+        log.error(f"variant-status error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route("/api/variant/<variant_id>")
 def api_variant_detail(variant_id):
     """Return one universe with portfolio, trades, equity curve, and mutable weights."""
@@ -7203,6 +7432,8 @@ def api_variant_detail(variant_id):
                     payload["weights"][key] = json.loads(payload["weights"][key] or "{}")
                 except Exception:
                     payload["weights"][key] = {}
+            payload["weights"]["weight_count"] = len(payload["weights"].get("weights_json") or {})
+            payload["weights"]["baseline_weight_count"] = len(payload["weights"].get("baseline_weights_json") or {})
         if payload["portfolio"]:
             try:
                 payload["portfolio"]["lifecycle_reasons"] = json.loads(payload["portfolio"].get("lifecycle_reasons") or "[]")
