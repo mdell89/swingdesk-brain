@@ -1155,6 +1155,18 @@ def mark_running_events_error(job_type, started_after, error):
     database.close()
     return changed
 
+def get_running_comprehensive_scan():
+    """Return the active comprehensive scan event, if one is already running."""
+    mark_stalled_scan_events(max_age_minutes=10)
+    database = get_database()
+    row = database.execute("""
+        SELECT * FROM scan_events
+        WHERE job_type='comprehensive' AND status='running'
+        ORDER BY started_at DESC LIMIT 1
+    """).fetchone()
+    database.close()
+    return dict(row) if row else None
+
 def record_provider_health(provider, ok, failure_type=None, error=None, cooldown_minutes=0):
     """Track provider reliability so noisy APIs can cool down or be benched."""
     now = current_time_cst()
@@ -1408,19 +1420,39 @@ def record_nn_scan_status(**updates):
     set_app_state(NN_SCAN_STATUS_KEY, json.dumps(current))
     return current
 
-def start_nn_scan_background(scan_type="manual"):
+def start_shared_scan_background(scan_type="manual_shared"):
     """
-    Start a neural scan in the background and return immediately.
-    Prevents the UI from hanging on a full-universe scan.
+    Start a shared comprehensive scan in the background and return immediately.
+    Nova is scored from that same snapshot; this endpoint must never resurrect
+    a separate user-facing neural universe scan.
     """
     with _nn_scan_thread_lock:
         current = get_app_state_json(NN_SCAN_STATUS_KEY, {}) or {}
         if current.get("status") == "running":
-            return current
+            return {**current, "started": False, "already_running": True}
+        running_scan = get_running_comprehensive_scan()
+        if running_scan:
+            return record_nn_scan_status(
+                status="running",
+                scan_type=running_scan.get("scan_type", scan_type),
+                source="shared_comprehensive_scan",
+                started=False,
+                already_running=True,
+                started_at=running_scan.get("started_at"),
+                finished_at=None,
+                total_scanned=running_scan.get("tickers_attempted", 0),
+                qualified=0,
+                picks=0,
+                error=None,
+                scan_event_id=running_scan.get("id"),
+            )
 
-        record_nn_scan_status(
+        status = record_nn_scan_status(
             status="running",
             scan_type=scan_type,
+            source="shared_comprehensive_scan",
+            started=True,
+            already_running=False,
             started_at=current_time_cst().isoformat(),
             finished_at=None,
             total_scanned=0,
@@ -1431,27 +1463,38 @@ def start_nn_scan_background(scan_type="manual"):
 
         def worker():
             try:
-                result = run_nn_scan(scan_type=scan_type)
+                result = run_comprehensive_scan(scan_type=scan_type)
+                nn_result = result.get("nn_picks", {}) or {}
                 record_nn_scan_status(
                     status="complete",
                     scan_type=scan_type,
+                    source="shared_comprehensive_scan",
+                    started=False,
+                    already_running=False,
                     finished_at=current_time_cst().isoformat(),
-                    total_scanned=result.get("total_universe_scanned", result.get("total_scanned", 0)),
-                    qualified=result.get("qualified_count", result.get("total_scanned", 0)),
-                    picks=len(result.get("recommended_longs", []) or []),
+                    total_scanned=result.get("total_scanned", 0),
+                    qualified=nn_result.get("qualified_count", 0),
+                    picks=nn_result.get("picks", 0),
                     error=None,
                 )
             except Exception as exc:
-                log.error(f"Background NN scan failed: {exc}")
+                log.error(f"Background shared Nova scan failed: {exc}")
                 record_nn_scan_status(
                     status="error",
                     scan_type=scan_type,
+                    source="shared_comprehensive_scan",
+                    started=False,
+                    already_running=False,
                     finished_at=current_time_cst().isoformat(),
                     error=str(exc),
                 )
 
         threading.Thread(target=worker, daemon=True).start()
-        return get_app_state_json(NN_SCAN_STATUS_KEY, {}) or {}
+        return status
+
+def start_nn_scan_background(scan_type="manual_shared_nova"):
+    """Backward-compatible name for manual Nova refreshes; still runs the shared scan."""
+    return start_shared_scan_background(scan_type=scan_type)
 
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 TWELVE_DATA_BASE = "https://api.twelvedata.com"
@@ -6968,15 +7011,45 @@ def api_nn_train_now():
 
 @app.route("/api/nn-scan-now", methods=["POST"])
 def api_nn_scan_now():
-    """Compatibility endpoint: refresh the shared comprehensive snapshot, including Nova scoring."""
+    """Compatibility endpoint: queue a shared comprehensive scan with Nova scoring."""
     try:
-        result = run_comprehensive_scan(scan_type="manual_shared_nova")
-        return jsonify({
+        status = start_nn_scan_background(scan_type="manual_shared_nova")
+        response = {
             "success": True,
+            "started": bool(status.get("started", status.get("status") == "running")) and not bool(status.get("already_running")),
+            "already_running": bool(status.get("already_running")),
             "shared_scan": True,
-            "nn_picks": result.get("nn_picks", {}),
-            "total_scanned": result.get("total_scanned", 0),
-        })
+            "background": True,
+            "scan_type": status.get("scan_type", "manual_shared_nova"),
+            "status_endpoint": "/api/nn-scan-status",
+            "history_endpoint": "/api/scan-history",
+            "message": "Shared comprehensive scan queued; Nova will update from the same snapshot.",
+            "status": status,
+        }
+        http_status = 202 if status.get("status") == "running" else 200
+        return jsonify(response), http_status
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/shared-scan-now", methods=["POST"])
+def api_shared_scan_now():
+    """Queue a manual shared comprehensive scan; Vector and Nova score the same snapshot."""
+    try:
+        status = start_shared_scan_background(scan_type="manual_shared")
+        response = {
+            "success": True,
+            "started": bool(status.get("started", status.get("status") == "running")) and not bool(status.get("already_running")),
+            "already_running": bool(status.get("already_running")),
+            "shared_scan": True,
+            "background": True,
+            "scan_type": status.get("scan_type", "manual_shared"),
+            "status_endpoint": "/api/nn-scan-status",
+            "history_endpoint": "/api/scan-history",
+            "message": "Shared comprehensive scan queued; Vector and Nova will update from the same snapshot.",
+            "status": status,
+        }
+        http_status = 202 if status.get("status") == "running" else 200
+        return jsonify(response), http_status
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 

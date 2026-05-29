@@ -617,7 +617,7 @@ function LoadingScreen({ progress, statusText }) {
   return (
     <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", flexDirection: "column", gap: 16, background: BG }}>
       <div style={{ fontSize: 20, fontWeight: 700, color: T1, letterSpacing: 1 }}>SWING DESK</div>
-      <div style={{ fontSize: 10, color: T3, textTransform: "uppercase", letterSpacing: 2, marginBottom: 8 }}>Overnight Trading Brain</div>
+      <div style={{ fontSize: 10, color: T3, textTransform: "uppercase", letterSpacing: 2, marginBottom: 8 }}>Overnight Trading Intelligence</div>
       <div style={{ width: 200, height: 3, background: BORDER, borderRadius: 2, overflow: "hidden" }}>
         <div style={{ width: `${progress}%`, height: "100%", background: GREEN, borderRadius: 2, transition: "width 0.3s ease" }} />
       </div>
@@ -796,7 +796,7 @@ function PostCloseCard({ trade, onDismiss }) {
   const pnlColor = pnl >= 0 ? GREEN : RED;
   const isWin = pnl >= 0;
   const closeReason = trade.sell_reason === "forced_close" ? "Force-closed at 2:45 PM" :
-                      trade.sell_reason === "stop_loss" ? "Brain cut losses" : "Brain closed";
+                      trade.sell_reason === "stop_loss" ? "Vector cut losses" : "Vector closed";
   return (
     <div style={{ background: isWin ? "#0a1a0a" : "#1a0a0a", border: `1px solid ${isWin ? "#1a3a1a" : "#3a1a1a"}`, borderRadius: 10, borderLeft: `3px solid ${pnlColor}`, padding: "10px 12px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
       <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
@@ -1259,7 +1259,7 @@ function ExtendedRunnerCard({ trade, onHide, expanded, onToggle }) {
         <div style={{ padding: "8px 12px 12px", borderTop: `1px solid #1a1030` }}>
           <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <span style={{ fontSize: 10, color: T3 }}>Brain's P&L</span>
+              <span style={{ fontSize: 10, color: T3 }}>Vector P&L</span>
               <span style={{ fontSize: 10, color: GREEN }}>+{brainPnlPercent.toFixed(1)}%</span>
             </div>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
@@ -1283,7 +1283,7 @@ function ExtendedRunnerCard({ trade, onHide, expanded, onToggle }) {
               <span style={{ fontSize: 10, color: T1 }}>{trade.buy_date}</span>
             </div>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <span style={{ fontSize: 10, color: T3 }}>Brain sold</span>
+              <span style={{ fontSize: 10, color: T3 }}>Vector sold</span>
               <span style={{ fontSize: 10, color: T1 }}>{trade.sell_date}</span>
             </div>
           </div>
@@ -1568,6 +1568,7 @@ export default function App() {
   const [methodStats, setMethodStats] = useState(null);
   const [expandedMethods, setExpandedMethods] = useState({});
   const [weightsHistory, setWeightsHistory] = useState([]);
+  const [auditLog, setAuditLog] = useState([]);
   const [perfHistory, setPerfHistory] = useState([]);
   const [lastAudit, setLastAudit] = useState(null);
   const [lastScan, setLastScan] = useState(null);
@@ -1583,6 +1584,7 @@ export default function App() {
   const [analyticsPage, setAnalyticsPage] = useState("performance"); // performance | closed
   const [scanHistory, setScanHistory] = useState([]);
   const [portfolioTab, setPortfolioTab] = useState("brain"); // brain | neural | personal
+  const [selectedStrategy, setSelectedStrategy] = useState("SwingDesk");
   const [nnPositions, setNnPositions] = useState([]);
   const [nnPicks, setNnPicks] = useState({ recommended_longs: [], recommended_shorts: [] });
   const [nnStats, setNnStats] = useState(null);
@@ -1612,6 +1614,20 @@ export default function App() {
     { id: "method_lo",  label: "Methods ↓"  },
     { id: "oldest",     label: "Oldest"     },
     { id: "newest",     label: "Newest"     },
+  ];
+  const STRATEGY_OPTIONS = [
+    "SwingDesk",
+    "Bullish Mean Reversion",
+    "Darvas",
+    "Gap & Go",
+    "VWAP Reclaim",
+    "Donchian",
+    "Inside Day",
+    "NR7",
+    "Bull Flag",
+    "Pocket Pivot",
+    "S&R Breakout",
+    "Vol Squeeze Breakout",
   ];
   const [expandedCards, setExpandedCards] = useState({});
   const [doneCuts, setDoneCuts] = useState({});
@@ -1851,11 +1867,18 @@ export default function App() {
       setTabLoading(true);
       apiFetch("/virtual-trades").then(data => { setVirtualTrades(data); setTabLoading(false); }).catch(() => setTabLoading(false));
     }
+    if (tab === "intel" && virtualTrades.length === 0) {
+      setTabLoading(true);
+      apiFetch("/virtual-trades").then(data => { setVirtualTrades(data); setTabLoading(false); }).catch(() => setTabLoading(false));
+    }
     if ((tab === "virtual" || tab === "intel") && !methodStats) {
       apiFetch("/method-stats").then(data => {
         setMethodStats(data.methods || {});
         setWeightsHistory(data.weights_history || []);
       }).catch(() => {});
+    }
+    if (tab === "intel" && auditLog.length === 0) {
+      apiFetch("/audit/log").then(data => setAuditLog(data || [])).catch(() => {});
     }
     if (tab === "intel" && predictions.length === 0) {
       setTabLoading(true);
@@ -2052,20 +2075,36 @@ export default function App() {
         <div className="fadeIn">
 
           {/* ── Portfolio Tab Bar: Brain | Neural | Personal ── */}
-          <div style={{ display: "flex", gap: 4, padding: "10px 16px 0", marginBottom: 2 }}>
-            {[
-              ["brain",    "Brain",    BLUE],
-              ["neural",   "Neural",   "#a78bfa"],
-              ["personal", "Personal", AMBER],
-            ].map(([id, label, color]) => (
-              <button key={id} onClick={() => setPortfolioTab(id)} style={{
-                flex: 1, padding: "7px 0", borderRadius: 8, fontSize: 11, fontWeight: 700,
-                border: `1px solid ${portfolioTab === id ? color + "66" : BORDER}`,
-                cursor: "pointer", letterSpacing: .4, transition: ".15s",
-                background: portfolioTab === id ? color + "18" : "transparent",
-                color: portfolioTab === id ? color : T3,
-              }}>{label}</button>
-            ))}
+          <div style={{ padding: "10px 16px 0", marginBottom: 2 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr) auto", gap: 8, alignItems: "center" }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, height: 30, border: `1px solid ${BORDER}`, borderRadius: 8, background: CARD, padding: "0 9px" }}>
+                <span style={{ fontSize: 9, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6, flexShrink: 0 }}>Strategy:</span>
+                <select value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
+                  style={{ minWidth: 0, width: "100%", border: "none", outline: "none", background: "transparent", color: T1, fontSize: 12, fontWeight: 800, cursor: "pointer", appearance: "none" }}>
+                  {STRATEGY_OPTIONS.map(name => <option key={name} value={name} style={{ background: "#111", color: T1 }}>{name}</option>)}
+                </select>
+                <span aria-hidden="true" style={{ color: T3, fontSize: 10, flexShrink: 0 }}>▼</span>
+              </label>
+              <button onClick={() => setPortfolioTab("personal")} style={{
+                height: 30, padding: "0 9px", borderRadius: 8, fontSize: 9, fontWeight: 800,
+                border: `1px solid ${portfolioTab === "personal" ? AMBER + "66" : BORDER}`,
+                cursor: "pointer", letterSpacing: .4, background: portfolioTab === "personal" ? AMBER + "18" : "transparent",
+                color: portfolioTab === "personal" ? AMBER : T3, whiteSpace: "nowrap"
+              }}>PERSONAL</button>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginTop: 6 }}>
+              {[
+                ["brain", "Vector", BLUE],
+                ["neural", "Nova", "#a78bfa"],
+              ].map(([id, label, color]) => (
+                <button key={id} onClick={() => setPortfolioTab(id)} style={{
+                  padding: "7px 0", borderRadius: 7, fontSize: 11, fontWeight: 800,
+                  border: `1px solid ${portfolioTab === id ? color + "66" : BORDER}`,
+                  cursor: "pointer", letterSpacing: .4, background: portfolioTab === id ? color + "18" : "transparent",
+                  color: portfolioTab === id ? color : T3,
+                }}>{label}</button>
+              ))}
+            </div>
           </div>
 
           {/* ── BRAIN PORTFOLIO ── */}
@@ -2073,7 +2112,7 @@ export default function App() {
           <div style={{ padding: "10px 16px 14px" }}>
             {/* SwingDesk Brain row — evenly spaced across full width */}
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, minHeight: 24 }}>
-              <div style={{ fontSize: 10, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .8 }}>SwingDesk Brain</div>
+              <div style={{ fontSize: 10, color: T3, fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>SwingDesk / Vector / 8:45 / All</div>
               <div style={{ display: "flex", alignItems: "center", gap: 6, position: "relative" }}>
                 <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
                   <button onClick={() => setShowNetInfo(v => !v)}
@@ -2471,7 +2510,7 @@ export default function App() {
           {portfolioTab === "neural" && (
             <div style={{ padding: "10px 16px 0" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-                <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>Nova — Neural Brain</div>
+                <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>Nova / Neural</div>
                 <div style={{ display: "flex", gap: 6 }}>
                   <button onClick={() => runNeuralAction("open")} disabled={!!nnAction}
                     style={{ background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 5, color: T3, fontSize: 8, fontWeight: 700, letterSpacing: .4, padding: "4px 7px", cursor: nnAction ? "default" : "pointer", opacity: nnAction ? .55 : .75 }}>
@@ -2584,7 +2623,7 @@ export default function App() {
             <div style={{ padding: "10px 16px 0" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 10 }}>
                 <div style={{ fontSize: 10, color: AMBER, fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>Personal Portfolio</div>
-                <div style={{ fontSize: 9, color: T3, textAlign: "right", lineHeight: 1.2 }}>Add positions from Brain or Neural tabs</div>
+                <div style={{ fontSize: 9, color: T3, textAlign: "right", lineHeight: 1.2 }}>Add positions from Vector or Nova</div>
               </div>
 
               <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 10, marginBottom: 12 }}>
@@ -2605,7 +2644,7 @@ export default function App() {
               {personalTrades.length === 0 ? (
                 <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 24, textAlign: "center" }}>
                   <div style={{ fontSize: 13, color: T2, marginBottom: 6 }}>No personal positions yet.</div>
-                  <div style={{ fontSize: 11, color: T3 }}>Tap ADD on any Brain or Neural stock card.</div>
+                  <div style={{ fontSize: 11, color: T3 }}>Tap ADD on any Vector or Nova stock card.</div>
                 </div>
               ) : (
                 <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
@@ -3168,7 +3207,7 @@ export default function App() {
             </div>
             {expandedMethods.audit_history && (
               <div style={{ padding: "0 14px 14px", borderTop: `1px solid ${BORDER}` }}>
-                {weightsHistory.length === 0 ? (
+                {auditLog.length === 0 ? (
                   <div style={{ paddingTop: 12 }}>
                     <div style={{ fontSize: 10, color: T3, marginBottom: 10 }}>No completed audit history yet.</div>
                     <div style={{ fontSize: 9, color: T3, fontStyle: "italic", marginBottom: 6 }}>Example of what audit entries look like:</div>
@@ -3184,15 +3223,24 @@ export default function App() {
                   </div>
                 ) : (
                   <div style={{ paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
-                    {weightsHistory.slice(0, 10).map((entry, i) => (
-                      <div key={i} style={{ fontSize: 9, color: T1, padding: "6px 0", borderBottom: i < weightsHistory.length - 1 ? `1px solid ${BORDER}` : "none", lineHeight: 1.6 }}>
+                    {auditLog.slice(0, 10).map((entry, i) => {
+                      const reasoning = (() => {
+                        try { return JSON.parse(entry.reasoning || "[]"); } catch { return []; }
+                      })();
+                      return (
+                      <div key={entry.id || i} style={{ fontSize: 9, color: T1, padding: "6px 0", borderBottom: i < auditLog.length - 1 ? `1px solid ${BORDER}` : "none", lineHeight: 1.6 }}>
                         <div style={{ fontSize: 8, color: T3, marginBottom: 3 }}>{new Date(entry.timestamp).toLocaleString()}</div>
-                        {Object.entries(entry).filter(([k]) => k !== "timestamp" && k !== "id").map(([key, val]) => {
-                          const labels = { rsi_momentum: "RSI Momentum", volume_surge: "Volume Surge", overnight_gap_probability: "Overnight Gap", earnings_catalyst: "Earnings Catalyst", support_resistance: "S&R", relative_strength: "Relative Strength", sector_relative_strength: "Sector RS", vwap_reclaim: "VWAP Reclaim", volatility_squeeze: "Vol Squeeze" };
-                          return <div key={key} style={{ color: T2 }}>{labels[key] || key}: <span style={{ color: BLUE, fontFamily: "'DM Mono',monospace" }}>{((val || 0) * 100).toFixed(1)}%</span></div>;
-                        })}
+                        <div style={{ color: T2, marginBottom: 4 }}>{entry.summary || "Audit recorded."}</div>
+                        <div style={{ display: "flex", gap: 8, color: T3, fontFamily: "'DM Mono',monospace", marginBottom: reasoning.length ? 4 : 0 }}>
+                          <span>{entry.resolved_count || 0} resolved</span>
+                          <span>{entry.hit_count || 0} hits</span>
+                          <span>{entry.win_rate != null ? `${Math.round(Number(entry.win_rate) * 100)}%` : "-"} win</span>
+                        </div>
+                        {reasoning.slice(0, 2).map((line, idx) => (
+                          <div key={idx} style={{ color: T2 }}>• {line}</div>
+                        ))}
                       </div>
-                    ))}
+                    );})}
                   </div>
                 )}
               </div>
