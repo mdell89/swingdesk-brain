@@ -7134,6 +7134,66 @@ def api_performance_history():
 
     return jsonify(history)
 
+@app.route("/api/day-pnl")
+def api_day_pnl():
+    """Current main account value vs previous settled session close baseline."""
+    try:
+        now = current_time_cst()
+        today = now.strftime("%Y-%m-%d")
+        db = get_database()
+        settled_rows = [dict(r) for r in db.execute("""
+            SELECT sell_date AS date,
+                   SUM(COALESCE(gross_pnl, 0)) AS daily_pnl
+            FROM virtual_trades
+            WHERE outcome != 'open' AND sell_date IS NOT NULL
+            GROUP BY sell_date
+            ORDER BY sell_date ASC
+        """).fetchall()]
+        open_rows = [dict(r) for r in db.execute("""
+            SELECT invested_amount, current_value
+            FROM virtual_trades
+            WHERE outcome='open'
+        """).fetchall()]
+        db.close()
+
+        running = 1000.0
+        previous_close = 1000.0
+        today_settled = 0.0
+        previous_close_date = None
+        for row in settled_rows:
+            daily = float(row.get("daily_pnl") or 0)
+            if row.get("date") and row["date"] < today:
+                running += daily
+                previous_close = running
+                previous_close_date = row["date"]
+            elif row.get("date") == today:
+                today_settled += daily
+
+        open_pnl = sum(
+            float(r.get("current_value") or r.get("invested_amount") or 10) -
+            float(r.get("invested_amount") or 10)
+            for r in open_rows
+        )
+        current_value = previous_close + today_settled + open_pnl
+        day_pnl = current_value - previous_close
+        return jsonify({
+            "success": True,
+            "label": "Day's P&L",
+            "current_value": round(current_value, 2),
+            "previous_close_value": round(previous_close, 2),
+            "previous_close_date": previous_close_date,
+            "today_settled_pnl": round(today_settled, 4),
+            "open_pnl": round(open_pnl, 4),
+            "day_pnl": round(day_pnl, 4),
+            "day_pnl_percent": round((day_pnl / previous_close * 100), 2) if previous_close else 0,
+            "open_count": len(open_rows),
+            "as_of": now.isoformat(),
+            "basis": "previous settled session close plus today's settled and open P&L",
+        })
+    except Exception as e:
+        log.error(f"day-pnl error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route("/api/ping")
 def api_ping():
     """Lightweight wake-up endpoint. Frontend hits this first to warm Railway before real requests."""
@@ -7394,6 +7454,64 @@ def api_variant_status():
     except Exception as e:
         log.error(f"variant-status error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/variant-strategy-preview")
+def api_variant_strategy_preview():
+    """Show how each active strategy would filter the current shared snapshot."""
+    try:
+        db = get_database()
+        snapshot, refusal = variant_cache_snapshot(db, require_fresh=False)
+        variants = [dict(r) for r in db.execute("""
+            SELECT id, strategy, brain, execution_time, selection_mode, label
+            FROM strategy_variants
+            WHERE status='active'
+            ORDER BY strategy, brain, selection_mode
+        """).fetchall()]
+        db.close()
+        if not snapshot:
+            return jsonify({"success": False, "cache_issue": refusal, "rows": []})
+
+        vector_picks = snapshot["vector_payload"].get("longs") or snapshot["vector_payload"].get("recommended_longs") or []
+        nova_picks = snapshot["nova_payload"].get("recommended_longs") or snapshot["nova_payload"].get("longs") or []
+        rows = []
+        for variant in variants:
+            source = nova_picks if variant["brain"] == "Nova" else vector_picks
+            if variant["brain"] == "Nova":
+                source = [p for p in source if p.get("nn_executable", True)]
+            qualified = filter_variant_strategy_picks(source, variant)
+            selected = select_variant_picks(qualified, variant.get("selection_mode"))
+            rows.append({
+                "variant_id": variant["id"],
+                "label": variant["label"],
+                "strategy": variant["strategy"],
+                "brain": variant["brain"],
+                "execution_time": variant["execution_time"],
+                "selection_mode": variant["selection_mode"],
+                "source_count": len(source),
+                "qualified_count": len(qualified),
+                "selected_count": len(selected),
+                "selected_tickers": [p.get("ticker") for p in selected[:20]],
+                "qualified_preview": [
+                    {
+                        "ticker": p.get("ticker"),
+                        "confidence": p.get("long_conf") or p.get("confidence") or p.get("nn_score"),
+                        "move": p.get("long_move") or p.get("expected_move"),
+                        "day_change_pct": p.get("day_change_pct") or p.get("pct_change_prev_close"),
+                        "gap_pct": p.get("overnight_gap_pct") or p.get("gap_percent"),
+                    }
+                    for p in qualified[:10]
+                ],
+            })
+        return jsonify({
+            "success": True,
+            "vector_cache_time": snapshot["vector_cache_time"],
+            "nova_cache_time": snapshot["nova_cache_time"],
+            "cache_gap_minutes": snapshot["cache_gap_minutes"],
+            "rows": rows,
+        })
+    except Exception as e:
+        log.error(f"variant-strategy-preview error: {e}")
+        return jsonify({"success": False, "error": str(e), "rows": []}), 500
 
 @app.route("/api/variant/<variant_id>")
 def api_variant_detail(variant_id):

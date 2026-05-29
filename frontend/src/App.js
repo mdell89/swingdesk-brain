@@ -1642,6 +1642,7 @@ export default function App() {
   const [recoveringOpen, setRecoveringOpen] = useState(false);
   const [monitorStatus, setMonitorStatus] = useState(null);
   const [monitorRunning, setMonitorRunning] = useState(false);
+  const [dayPnlStatus, setDayPnlStatus] = useState(null);
 
   const [tab, setTab] = useState("today");
   const [tabLoading, setTabLoading] = useState(false);
@@ -1657,6 +1658,9 @@ export default function App() {
   const [nnPerfHistory, setNnPerfHistory] = useState([]);
   const [nnPerfTimeframe, setNnPerfTimeframe] = useState("M");
   const [nnAction, setNnAction] = useState(null);
+  const [variantStatus, setVariantStatus] = useState(null);
+  const [variantLeaderboard, setVariantLeaderboard] = useState([]);
+  const [novaUniverse, setNovaUniverse] = useState(null);
   const [personalForm, setPersonalForm] = useState({
     ticker: "",
     buy_price: "",
@@ -1741,16 +1745,22 @@ export default function App() {
   };
 
   const refreshNeuralPortfolio = async () => {
-    const [nnPicksData, nnPositionsData, nnStatsData, nnPerfData] = await Promise.all([
+    const [nnPicksData, nnPositionsData, nnStatsData, nnPerfData, variantStatusData, variantBoardData, novaUniverseData] = await Promise.all([
       apiFetch("/nn-picks").catch(() => ({ recommended_longs: [], recommended_shorts: [] })),
       apiFetch("/nn-positions").catch(() => []),
       apiFetch("/nn-stats").catch(() => null),
       apiFetch("/nn-perf-history").catch(() => []),
+      apiFetch("/variant-status").catch(() => null),
+      apiFetch("/variant-leaderboard").catch(() => []),
+      apiFetch("/variant/swingdesk_nova_0845_all").catch(() => null),
     ]);
     setNnPicks(nnPicksData || { recommended_longs: [], recommended_shorts: [] });
     setNnPositions(nnPositionsData || []);
     setNnStats(nnStatsData);
     setNnPerfHistory(nnPerfData || []);
+    setVariantStatus(variantStatusData);
+    setVariantLeaderboard(variantBoardData || []);
+    setNovaUniverse(novaUniverseData);
   };
 
   const runNeuralAction = async (kind) => {
@@ -1854,7 +1864,8 @@ export default function App() {
 
         // Fire all requests in parallel
         const [picksData, positions, statsData, runnersData, perfData, closedData,
-               nnPicksData, nnPositionsData, nnStatsData, nnPerfData, personalData, monitorData] = await Promise.all([
+               nnPicksData, nnPositionsData, nnStatsData, nnPerfData, personalData, monitorData,
+               dayPnlData, variantStatusData, variantBoardData, novaUniverseData] = await Promise.all([
           apiFetch("/picks").catch(() => ({ longs: [], shorts: [] })),
           apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
           apiFetch("/stats").catch(() => ({})),
@@ -1867,6 +1878,10 @@ export default function App() {
           apiFetch("/nn-perf-history").catch(() => []),
           apiFetch("/personal-trades").catch(() => []),
           apiFetch("/monitor-open-status").catch(() => null),
+          apiFetch("/day-pnl").catch(() => null),
+          apiFetch("/variant-status").catch(() => null),
+          apiFetch("/variant-leaderboard").catch(() => []),
+          apiFetch("/variant/swingdesk_nova_0845_all").catch(() => null),
         ]);
 
         // Auto-backfill lock_in_confidence for existing trades silently
@@ -1894,6 +1909,10 @@ export default function App() {
         setPersonalTrades(personalData || []);
         setMonitorStatus(monitorData);
         setMonitorRunning(monitorData?.status === "running" || monitorData?.status === "queued");
+        setDayPnlStatus(dayPnlData);
+        setVariantStatus(variantStatusData);
+        setVariantLeaderboard(variantBoardData || []);
+        setNovaUniverse(novaUniverseData);
 
         setLoadStatus("Ready"); setLoadProgress(100);
       } catch (error) {
@@ -1985,7 +2004,8 @@ export default function App() {
     const interval = setInterval(async () => {
       try {
         const [positions, perfData, closedData, statsData,
-               nnPicksData, nnPositionsData, nnStatsData, nnPerfData] = await Promise.all([
+               nnPicksData, nnPositionsData, nnStatsData, nnPerfData,
+               dayPnlData, variantStatusData, variantBoardData, novaUniverseData] = await Promise.all([
           apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
           apiFetch("/perf-history").catch(() => []),
           apiFetch("/today-closed").catch(() => []),
@@ -1994,6 +2014,10 @@ export default function App() {
           apiFetch("/nn-positions").catch(() => []),
           apiFetch("/nn-stats").catch(() => null),
           apiFetch("/nn-perf-history").catch(() => []),
+          apiFetch("/day-pnl").catch(() => null),
+          apiFetch("/variant-status").catch(() => null),
+          apiFetch("/variant-leaderboard").catch(() => []),
+          apiFetch("/variant/swingdesk_nova_0845_all").catch(() => null),
         ]);
         setOpenPositions(positions);
         setTodayClosed(closedData || []);
@@ -2002,6 +2026,10 @@ export default function App() {
         setNnPositions(nnPositionsData || []);
         setNnStats(nnStatsData);
         setNnPerfHistory(nnPerfData || []);
+        setDayPnlStatus(dayPnlData);
+        setVariantStatus(variantStatusData);
+        setVariantLeaderboard(variantBoardData || []);
+        setNovaUniverse(novaUniverseData);
         buildPerfHistory(perfData, positions);
       } catch {}
     }, 2.5 * 60 * 1000);
@@ -2162,6 +2190,14 @@ export default function App() {
   const perfChange = perfLast - perfFirst;
   const perfPercent = perfFirst > 0 ? (perfChange / perfFirst * 100) : 0;
   const perfUp = perfChange >= 0;
+  const backendDayPnl = dayPnlStatus?.success ? Number(dayPnlStatus.day_pnl || 0) : null;
+  const backendDayUp = backendDayPnl == null ? perfUp : backendDayPnl >= 0;
+  const novaUniversePortfolio = novaUniverse?.portfolio || null;
+  const novaUniverseTrades = Array.isArray(novaUniverse?.trades) ? novaUniverse.trades : [];
+  const novaUniverseOpen = novaUniverseTrades.filter(t => t.outcome === "open");
+  const novaUniverseClosed = novaUniverseTrades.filter(t => t.outcome !== "open");
+  const novaUniverseBalance = novaUniversePortfolio?.equity != null ? Number(novaUniversePortfolio.equity) : null;
+  const novaLeader = variantLeaderboard.find(v => v.id === "swingdesk_nova_0845_all");
 
   if (!loaded) return <LoadingScreen progress={loadProgress} statusText={loadStatus} />;
 
@@ -2265,20 +2301,22 @@ export default function App() {
                 const baseline = yesterdaySettled.length
                   ? yesterdaySettled[yesterdaySettled.length - 1].virtual
                   : (perfHistory.find(p => p.seed)?.virtual || 1000);
-                const dayPnl = perfLast - baseline;
+                const dayPnl = backendDayPnl == null ? (perfLast - baseline) : backendDayPnl;
                 const dayUp2 = dayPnl >= 0;
                 return (
                   <div style={{ textAlign: "right", lineHeight: 1 }}>
-                    <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Account day</div>
+                    <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L</div>
                     <div style={{ fontSize: 16, fontWeight: 600, color: dayUp2 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{dayUp2 ? "+" : ""}${dayPnl.toFixed(2)}</div>
-                    <div style={{ fontSize: 8, color: T3, marginTop: 3 }}>age: {Math.floor((Date.now() - new Date("2026-05-22T00:00:00").getTime()) / 86400000)}d</div>
+                    <div style={{ fontSize: 8, color: T3, marginTop: 3 }}>
+                      {dayPnlStatus?.previous_close_value != null ? `vs $${Number(dayPnlStatus.previous_close_value).toFixed(2)}` : `age: ${Math.floor((Date.now() - new Date("2026-05-22T00:00:00").getTime()) / 86400000)}d`}
+                    </div>
                   </div>
                 );
               })()}
             </div>
 
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
-              <span style={{ fontSize: 13, fontWeight: 500, color: perfUp ? GREEN : RED }}>{perfUp ? "↑" : "↓"} {Math.abs(perfPercent).toFixed(2)}%</span>
+              <span style={{ fontSize: 13, fontWeight: 500, color: backendDayUp ? GREEN : RED }}>{perfUp ? "↑" : "↓"} {Math.abs(perfPercent).toFixed(2)}%</span>
               <span style={{ fontSize: 12, color: T3 }}>{perfUp ? "+" : ""}${perfChange.toFixed(2)}</span>
             </div>
             <MiniChart data={perfHistory} timeframe={perfTimeframe} feeAdjusted={feeAdjusted} />
@@ -2344,6 +2382,29 @@ export default function App() {
               ))}
             </div>
           </div>
+
+          {variantLeaderboard.length > 0 && (
+            <div style={{ margin: "0 16px 10px", background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "9px 10px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 7 }}>
+                <div style={{ fontSize: 9, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .7 }}>Universe leaders</div>
+                <div style={{ fontSize: 8, color: T3 }}>{variantStatus?.variants || variantLeaderboard.length} live</div>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                {variantLeaderboard.slice(0, 3).map(row => (
+                  <div key={row.id} style={{ display: "grid", gridTemplateColumns: "18px 1fr auto", gap: 7, alignItems: "center" }}>
+                    <div style={{ fontSize: 10, color: row.brain === "Nova" ? "#a78bfa" : BLUE, fontWeight: 900, fontFamily: "'DM Mono',monospace" }}>#{row.rank}</div>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: 10, color: T1, fontWeight: 800, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.label}</div>
+                      <div style={{ fontSize: 8, color: T3 }}>{row.open_count || 0} open · {row.closed_count || 0} closed</div>
+                    </div>
+                    <div style={{ fontSize: 11, color: Number(row.return_pct || 0) >= 0 ? GREEN : RED, fontWeight: 900, fontFamily: "'DM Mono',monospace" }}>
+                      {Number(row.return_pct || 0) >= 0 ? "+" : ""}{Number(row.return_pct || 0).toFixed(2)}%
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
 
 
@@ -2676,7 +2737,9 @@ export default function App() {
 
               {(() => {
                 const nnFiltered = filterPerfHistoryForTimeframe(nnPerfHistory, nnPerfTimeframe);
-                const nnLast = nnStats?.portfolio_value != null
+                const nnLast = novaUniverseBalance != null
+                  ? novaUniverseBalance
+                  : nnStats?.portfolio_value != null
                   ? Number(nnStats.portfolio_value)
                   : (nnFiltered[nnFiltered.length - 1]?.virtual || 1000);
                 const nnFirst = nnPerfTimeframe === "D"
@@ -2698,9 +2761,9 @@ export default function App() {
                         </div>
                       </div>
                       <div style={{ textAlign: "right", fontSize: 9, color: T3 }}>
-                        Neural P&L
+                        Nova universe
                         <div style={{ color: "#a78bfa", fontWeight: 800, fontFamily: "'DM Mono',monospace", fontSize: 12, marginTop: 2 }}>
-                          {nnStats?.resolved ?? 0} closed
+                          {novaUniverseClosed.length || nnStats?.resolved || 0} closed
                         </div>
                       </div>
                     </div>
@@ -2718,8 +2781,8 @@ export default function App() {
 
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 12 }}>
                 {[
-                  ["Balance", nnStats?.portfolio_value != null ? `$${Number(nnStats.portfolio_value).toFixed(2)}` : "$1,000.00", T1],
-                  ["Open", nnStats?.open_positions ?? nnPositions.filter(t => t.outcome === "open").length, GREEN],
+                  ["Balance", novaUniverseBalance != null ? `$${novaUniverseBalance.toFixed(2)}` : (nnStats?.portfolio_value != null ? `$${Number(nnStats.portfolio_value).toFixed(2)}` : "$1,000.00"), T1],
+                  ["Open", novaUniverseOpen.length || nnStats?.open_positions || nnPositions.filter(t => t.outcome === "open").length, GREEN],
                   ["Next", nnStats?.next_investment_amount != null ? `$${Number(nnStats.next_investment_amount).toFixed(2)}` : "$10.00", "#a78bfa"],
                 ].map(([label, value, color]) => (
                   <div key={label} style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "8px 10px" }}>
@@ -2732,14 +2795,30 @@ export default function App() {
                 Shared snapshot: <span style={{ color: "#a78bfa", fontWeight: 800 }}>{nnPicks?.source || "comprehensive_scan"}</span>
                 {nnPicks?.cache_time && ` · ${new Date(nnPicks.cache_time).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`}
                 {nnPicks?.qualified_count != null && ` · ${nnPicks.qualified_count} qualified`}
+                {variantStatus?.nova_cache_age_minutes != null && ` · Nova cache ${Math.round(variantStatus.nova_cache_age_minutes)}m`}
               </div>
 
+              {novaLeader && (
+                <div style={{ background: "#140f24", border: "1px solid #a78bfa55", borderRadius: 8, padding: "7px 10px", marginBottom: 12, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+                  {[
+                    ["Rank", `#${novaLeader.rank}`, "#a78bfa"],
+                    ["Return", `${Number(novaLeader.return_pct || 0).toFixed(2)}%`, Number(novaLeader.return_pct || 0) >= 0 ? GREEN : RED],
+                    ["Trades", `${novaLeader.open_count || 0} open`, T2],
+                  ].map(([label, value, color]) => (
+                    <div key={label}>
+                      <div style={{ fontSize: 8, color: T3, textTransform: "uppercase", fontWeight: 800, letterSpacing: .5 }}>{label}</div>
+                      <div style={{ fontSize: 12, color, fontWeight: 800, fontFamily: "'DM Mono',monospace" }}>{value}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
               {/* NN Open Positions */}
-              {nnPositions.filter(t => t.outcome === "open").length > 0 && (
+              {(novaUniverseOpen.length > 0 || nnPositions.filter(t => t.outcome === "open").length > 0) && (
                 <div style={{ marginBottom: 16 }}>
                   <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 6 }}>Open positions</div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                    {nnPositions.filter(t => t.outcome === "open").map(trade => (
+                    {(novaUniverseOpen.length ? novaUniverseOpen : nnPositions.filter(t => t.outcome === "open")).map(trade => (
                       <PositionCard key={trade.id} trade={trade} isLong={true}
                         themeKey={themeKey}
                         pdtRemaining={pdtRemaining}
