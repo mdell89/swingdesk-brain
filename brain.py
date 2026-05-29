@@ -1420,6 +1420,119 @@ def record_nn_scan_status(**updates):
     set_app_state(NN_SCAN_STATUS_KEY, json.dumps(current))
     return current
 
+def confidence_evidence_level(sample_size):
+    """Human label for how much resolved history supports a confidence bucket."""
+    n = int(sample_size or 0)
+    if n >= 75:
+        return "Strong"
+    if n >= 30:
+        return "Building"
+    if n >= 10:
+        return "Thin"
+    return "New"
+
+def confidence_evidence_bin(confidence):
+    try:
+        conf = int(round(float(confidence or 0)))
+    except Exception:
+        conf = 0
+    if conf < 65:
+        return (0, 64, "<65")
+    if conf >= 85:
+        return (85, 100, "85+")
+    low = max(65, (conf // 5) * 5)
+    high = low + 4
+    return (low, high, f"{low}-{high}")
+
+def build_confidence_evidence_cache():
+    """
+    Count resolved historical predictions by confidence bucket.
+    This is sample-size context only; it does not change scoring.
+    """
+    bins = {}
+    try:
+        db = get_database()
+        rows = [dict(r) for r in db.execute("""
+            SELECT confidence, outcome, actual_move
+            FROM predictions
+            WHERE confidence IS NOT NULL
+              AND outcome IN ('hit', 'miss')
+        """).fetchall()]
+        db.close()
+    except Exception as exc:
+        log.debug(f"confidence evidence unavailable: {exc}")
+        rows = []
+
+    for row in rows:
+        low, high, label = confidence_evidence_bin(row.get("confidence"))
+        bucket = bins.setdefault(label, {
+            "bin": label,
+            "bin_low": low,
+            "bin_high": high,
+            "sample_size": 0,
+            "wins": 0,
+            "losses": 0,
+            "moves": [],
+        })
+        bucket["sample_size"] += 1
+        if row.get("outcome") == "hit":
+            bucket["wins"] += 1
+        else:
+            bucket["losses"] += 1
+        if row.get("actual_move") is not None:
+            bucket["moves"].append(float(row.get("actual_move") or 0))
+
+    for bucket in bins.values():
+        n = bucket["sample_size"]
+        bucket["level"] = confidence_evidence_level(n)
+        bucket["win_rate"] = round(bucket["wins"] / n * 100, 1) if n else None
+        bucket["avg_move"] = round(sum(bucket["moves"]) / len(bucket["moves"]), 2) if bucket["moves"] else None
+        bucket.pop("moves", None)
+    return bins
+
+def evidence_for_confidence(confidence, cache=None):
+    low, high, label = confidence_evidence_bin(confidence)
+    cache = cache if cache is not None else build_confidence_evidence_cache()
+    evidence = dict(cache.get(label) or {
+        "bin": label,
+        "bin_low": low,
+        "bin_high": high,
+        "sample_size": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": None,
+        "avg_move": None,
+        "level": "New",
+    })
+    evidence["description"] = (
+        f"{evidence['level']} evidence: {evidence['sample_size']} resolved past picks "
+        f"in the {label}% confidence bucket. This is sample-size context, not a scoring input."
+    )
+    return evidence
+
+def attach_confidence_evidence(items, confidence_key="long_conf", cache=None):
+    cache = cache if cache is not None else build_confidence_evidence_cache()
+    for item in items or []:
+        item["evidence"] = evidence_for_confidence(item.get(confidence_key), cache)
+    return items
+
+def get_nn_scan_status_payload():
+    """Return shared Nova scan status with stale running states marked clearly."""
+    status = get_app_state_json(NN_SCAN_STATUS_KEY, {}) or {}
+    if status.get("status") == "running":
+        running_scan = get_running_comprehensive_scan()
+        if not running_scan:
+            next_status = dict(status)
+            next_status.update(
+                status="stalled",
+                started=False,
+                already_running=False,
+                finished_at=current_time_cst().isoformat(),
+                error=status.get("error") or "Background shared scan no longer has a running scan event.",
+            )
+            status = record_nn_scan_status(**next_status)
+    return status
+
 def start_shared_scan_background(scan_type="manual_shared"):
     """
     Start a shared comprehensive scan in the background and return immediately.
@@ -1427,7 +1540,7 @@ def start_shared_scan_background(scan_type="manual_shared"):
     a separate user-facing neural universe scan.
     """
     with _nn_scan_thread_lock:
-        current = get_app_state_json(NN_SCAN_STATUS_KEY, {}) or {}
+        current = get_nn_scan_status_payload()
         if current.get("status") == "running":
             return {**current, "started": False, "already_running": True}
         running_scan = get_running_comprehensive_scan()
@@ -3620,6 +3733,10 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
     for pick in recommended_longs[:MAX_LONG_PICKS]:
         pick["news"] = price_data_news.get(pick["ticker"], [])
 
+    evidence_cache = build_confidence_evidence_cache()
+    attach_confidence_evidence(recommended_longs, "long_conf", evidence_cache)
+    attach_confidence_evidence(recommended_shorts, "short_conf", evidence_cache)
+
     scan_result = {
         "longs": recommended_longs[:MAX_LONG_PICKS],
         "shorts": recommended_shorts[:MAX_SHORT_PICKS],
@@ -3770,6 +3887,7 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
         scored.sort(key=lambda x: x["long_conf"], reverse=True)
         qualified = [s for s in scored if s.get("nn_executable")]
         top_picks = (qualified or scored)[:MAX_LONG_PICKS]
+        attach_confidence_evidence(top_picks, "long_conf")
         result = {
             "scan_type": f"nn_shared_{scan_type}",
             "scan_time": current_time_cst().isoformat(),
@@ -5972,6 +6090,7 @@ def api_open_positions_dynamic():
         WINDOW3 = 13 * 60 + 10
         MARKET_OPEN = 8 * 60 + 30
         MARKET_CLOSE = 15 * 60
+        evidence_cache = build_confidence_evidence_cache()
 
         enriched_positions = []
         for position in open_positions:
@@ -5995,6 +6114,7 @@ def api_open_positions_dynamic():
             enriched["dynamic_confidence"] = position.get("dynamic_confidence") or position.get("confidence", 0)
             enriched["dynamic_estimate"] = position.get("dynamic_estimate") or position.get("expected_move", 0)
             enriched["lock_in_confidence"] = position.get("lock_in_confidence") or position.get("confidence", 0)
+            enriched["evidence"] = evidence_for_confidence(enriched["lock_in_confidence"], evidence_cache)
             enriched["last_price_updated"] = position.get("last_price_updated")
             enriched["day_change_percent"] = position.get("day_change_percent") or 0
 
@@ -7057,7 +7177,7 @@ def api_shared_scan_now():
 def api_nn_scan_status():
     """Return latest background NN scan status."""
     try:
-        return jsonify(get_app_state_json(NN_SCAN_STATUS_KEY, {}) or {})
+        return jsonify(get_nn_scan_status_payload())
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 

@@ -140,6 +140,30 @@ function confidenceColor(score, theme) {
   return theme === "navy" ? "#3a5570" : "#8a8f98";
 }
 
+function evidenceColor(level) {
+  if (level === "Strong") return GREEN;
+  if (level === "Building") return BLUE;
+  if (level === "Thin") return AMBER;
+  return T3;
+}
+
+function EvidenceBadge({ evidence }) {
+  if (!evidence) return null;
+  const level = evidence.level || "New";
+  const color = evidenceColor(level);
+  const title = evidence.description || `Evidence: ${level}`;
+  return (
+    <span title={title} style={{
+      fontSize: 7, fontWeight: 800, color, letterSpacing: .25,
+      padding: "1px 4px", background: color + "16", borderRadius: 3,
+      border: `1px solid ${color}55`, whiteSpace: "nowrap", flexShrink: 0,
+      display: "inline-flex", alignItems: "center", gap: 3,
+    }}>
+      EVID {level} <span aria-hidden="true" style={{ fontSize: 8, lineHeight: 1 }}>ⓘ</span>
+    </span>
+  );
+}
+
 function mapPickFields(pick) {
   return {
     ...pick,
@@ -691,6 +715,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
       <CardActionRow
         borderColor={BORDER}
         actions={<>
+          <EvidenceBadge evidence={pick.evidence} />
           {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 && (
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
           )}
@@ -730,6 +755,8 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
                 ["Volume ratio", `${pick.vol_ratio}x`],
                 ["Gap", `${pick.overnight_gap_pct >= 0 ? "+" : ""}${pick.overnight_gap_pct?.toFixed(1)}%`],
                 ["Day change", `${pick.day_change_pct >= 0 ? "+" : ""}${pick.day_change_pct?.toFixed(1)}%`],
+                ["Evidence", pick.evidence ? pick.evidence.level : "New"],
+                ["Sample", pick.evidence ? `${pick.evidence.sample_size || 0} past` : "0 past"],
               ].map(([label, value]) => (
                 <div key={label} style={{ display: "flex", justifyContent: "space-between", borderBottom: `1px solid ${CARD_BORDER_LONG}`, paddingBottom: 3 }}>
                   <span style={{ fontSize: 9, color: T3 }}>{label}</span>
@@ -1011,6 +1038,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
         staleTime={isStale ? staleTime : null}
         borderColor={rulingColor}
         actions={<>
+          <EvidenceBadge evidence={trade.evidence} />
           {trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7 && (
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
           )}
@@ -1059,6 +1087,8 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
               ["Current estimate", `+${dynamicEstimate.toFixed(1)}%`],
               ["Entry confidence", `${frozenConfidence}%`],
               ["Current confidence", `${dynamicConfidence}%`],
+              ["Evidence", trade.evidence ? trade.evidence.level : "New"],
+              ["Sample", trade.evidence ? `${trade.evidence.sample_size || 0} past` : "0 past"],
             ].filter(Boolean).map(([label, value]) => (
               <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: `1px solid ${rulingColor}` }}>
                 <span style={{ fontSize: 9, color: T3, paddingBottom: 3 }}>{label}</span>
