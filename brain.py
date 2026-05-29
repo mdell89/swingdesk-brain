@@ -1155,6 +1155,35 @@ def get_app_state_json(key, default=None):
     except Exception:
         return default
 
+def get_app_state_value(key, default=None):
+    """Read a raw app_state value."""
+    database = get_database()
+    row = database.execute("SELECT value FROM app_state WHERE key=?", [key]).fetchone()
+    database.close()
+    return row["value"] if row else default
+
+def notification_enabled():
+    try:
+        return get_app_state_value("notify_on_close", "true") != "false"
+    except Exception:
+        return True
+
+def record_monitor_status(**updates):
+    """Persist the latest open-position monitor status for UI and alerting."""
+    now = current_time_cst().isoformat()
+    current = get_app_state_json("open_position_monitor_status", {}) or {}
+    current.update(updates)
+    current["updated_at"] = now
+    set_app_state("open_position_monitor_status", json.dumps(current))
+    return current
+
+def get_monitor_status():
+    status = get_app_state_json("open_position_monitor_status", {}) or {}
+    last_monitor = get_app_state_json("last_open_position_monitor", {}) or {}
+    if last_monitor and not status.get("last_success_at"):
+        status["last_success_at"] = last_monitor.get("checked_at")
+    return status
+
 def begin_scan_event(scan_type, job_type="scan", tickers_attempted=0):
     """Create a durable scan/monitor event row and return its id."""
     database = get_database()
@@ -3497,6 +3526,74 @@ def send_telegram_notification(message):
         return False
 
 
+def send_swingdesk_notification(message):
+    """Send a configured SwingDesk notification through Telegram or Twilio."""
+    if not notification_enabled():
+        return False
+
+    provider = os.environ.get("NOTIFY_PROVIDER", "twilio").lower()
+    if provider == "telegram":
+        return send_telegram_notification(message)
+
+    try:
+        from twilio.rest import Client
+        account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+        auth_token  = os.environ.get("TWILIO_AUTH_TOKEN")
+        from_number = os.environ.get("TWILIO_FROM_NUMBER")
+        to_number   = os.environ.get("TWILIO_TO_NUMBER")
+        if not all([account_sid, auth_token, from_number, to_number]):
+            log.warning("Twilio env vars not set - SMS skipped")
+            return False
+        client = Client(account_sid, auth_token)
+        client.messages.create(body=message, from_=from_number, to=to_number)
+        log.info(f"Notification sent: {message}")
+        return True
+    except Exception as e:
+        log.error(f"Twilio SMS error: {e}")
+        return False
+
+def _parse_iso(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts))
+    except Exception:
+        return None
+
+def _alert_state():
+    return get_app_state_json("notification_alert_state", {}) or {}
+
+def _save_alert_state(state):
+    set_app_state("notification_alert_state", json.dumps(state))
+
+def can_send_alert(alert_key, cooldown_minutes=None, once_per_day=False):
+    state = _alert_state()
+    now = current_time_cst()
+    record = state.get(alert_key) or {}
+    last_sent = _parse_iso(record.get("last_sent_at"))
+    if once_per_day and last_sent and last_sent.strftime("%Y-%m-%d") == now.strftime("%Y-%m-%d"):
+        return False
+    if cooldown_minutes and last_sent and (now - last_sent).total_seconds() < cooldown_minutes * 60:
+        return False
+    return True
+
+def mark_alert_sent(alert_key, extra=None):
+    state = _alert_state()
+    record = state.get(alert_key) or {}
+    record.update(extra or {})
+    record["last_sent_at"] = current_time_cst().isoformat()
+    state[alert_key] = record
+    _save_alert_state(state)
+
+def send_deduped_alert(alert_key, message, cooldown_minutes=None, once_per_day=False, extra=None):
+    if not can_send_alert(alert_key, cooldown_minutes=cooldown_minutes, once_per_day=once_per_day):
+        return False
+    sent = send_swingdesk_notification(message)
+    if sent:
+        mark_alert_sent(alert_key, extra)
+    return sent
+
+
 def send_close_notification(ticker, pnl_dollar, pnl_pct, close_reason, close_time=None):
     """
     Send notification when a position closes.
@@ -3536,6 +3633,125 @@ def send_close_notification(ticker, pnl_dollar, pnl_pct, close_reason, close_tim
         log.info(f"SMS sent: {message}")
     except Exception as e:
         log.error(f"Twilio SMS error: {e}")
+
+
+def is_visible_weak_state(position, pnl_percent):
+    """Backend mirror of the open-card Weak state: negative open P&L is Weak."""
+    target = float(position.get("expected_move") or 10)
+    if pnl_percent >= target:
+        return False
+    return pnl_percent < 0
+
+def update_weak_alert_state(position, pnl_percent, should_sell=False):
+    """Send low-noise Weak alerts based on the same binary state the UI shows."""
+    ticker = position.get("ticker")
+    trade_id = position.get("id") or f"{ticker}_{position.get('buy_date')}"
+    if not ticker or should_sell:
+        return
+
+    state = _alert_state()
+    weak_key = f"weak_state:{trade_id}"
+    record = state.get(weak_key) or {"weak_checks": 0, "clear_checks": 0, "eligible": True}
+    is_weak = is_visible_weak_state(position, pnl_percent)
+
+    if is_weak:
+        record["weak_checks"] = int(record.get("weak_checks") or 0) + 1
+        record["clear_checks"] = 0
+    else:
+        record["clear_checks"] = int(record.get("clear_checks") or 0) + 1
+        if record["clear_checks"] >= 2:
+            record["weak_checks"] = 0
+            record["eligible"] = True
+
+    state[weak_key] = record
+    _save_alert_state(state)
+
+    if not is_weak or record["weak_checks"] < 2 or record.get("eligible") is False:
+        return
+
+    today = current_time_cst().strftime("%Y-%m-%d")
+    alert_key = f"weak:{trade_id}:{today}"
+    message = f"SwingDesk: {ticker} is Weak on 2 checks ({pnl_percent:+.1f}% open P&L). Watching, not a sell rule."
+    sent = send_deduped_alert(
+        alert_key,
+        message,
+        once_per_day=True,
+        extra={"ticker": ticker, "trade_id": trade_id, "alert_type": "weak"},
+    )
+    if sent:
+        state = _alert_state()
+        record = state.get(weak_key) or record
+        record["eligible"] = False
+        state[weak_key] = record
+        _save_alert_state(state)
+
+def send_sell_rule_alert(position, pnl_percent, reason):
+    """Send immediate sell-rule alert and suppress future weak alerts for this trade."""
+    ticker = position.get("ticker")
+    trade_id = position.get("id") or f"{ticker}_{position.get('buy_date')}"
+    if not ticker:
+        return
+    alert_key = f"sell_rule:{trade_id}:{current_time_cst().strftime('%Y-%m-%d')}:{reason}"
+    message = f"SwingDesk SELL: {ticker} triggered {str(reason).replace('_', ' ')} at {pnl_percent:+.1f}%."
+    sent = send_deduped_alert(
+        alert_key,
+        message,
+        extra={"ticker": ticker, "trade_id": trade_id, "alert_type": "sell_rule", "reason": reason},
+    )
+    if sent:
+        state = _alert_state()
+        weak_key = f"weak_state:{trade_id}"
+        record = state.get(weak_key) or {}
+        record["eligible"] = False
+        record["sell_rule_fired"] = True
+        state[weak_key] = record
+        _save_alert_state(state)
+
+def evaluate_monitor_health_alert(status=None):
+    """Alert when open-position monitoring is stale during market hours."""
+    status = status or get_monitor_status()
+    if not is_market_open():
+        return
+
+    open_count = int(status.get("total_open_positions") or status.get("open_positions") or 0)
+    if open_count <= 0:
+        return
+
+    last_success = _parse_iso(status.get("last_success_at") or status.get("finished_at"))
+    if not last_success:
+        return
+
+    age_minutes = int((current_time_cst() - last_success).total_seconds() / 60)
+    if age_minutes < 10:
+        return
+
+    near_force_close = 0 <= minutes_until_forced_close() <= 30
+    prefix = "Monitor stale near force-close" if near_force_close else "Monitor stale"
+    message = f"SwingDesk: {prefix} - open positions have not updated in {age_minutes}m."
+    sent = send_deduped_alert(
+        "monitor_failure",
+        message,
+        cooldown_minutes=60,
+        extra={"alert_type": "monitor_failure", "age_minutes": age_minutes},
+    )
+    if sent:
+        set_app_state("monitor_failure_alert_active", "true")
+
+def maybe_send_monitor_recovery_alert(status):
+    """Send one recovery alert after a stale/failure monitor alert was sent."""
+    if get_app_state_value("monitor_failure_alert_active", "false") != "true":
+        return
+    updated_count = int(status.get("updated_count") or 0)
+    total = int(status.get("total_open_positions") or 0)
+    message = f"SwingDesk: Monitor recovered - {updated_count}/{total} open positions updated."
+    sent = send_deduped_alert(
+        "monitor_recovery",
+        message,
+        cooldown_minutes=60,
+        extra={"alert_type": "monitor_recovery", "updated_count": updated_count, "total": total},
+    )
+    if sent:
+        set_app_state("monitor_failure_alert_active", "false")
 
 
 def is_extended_hours():
@@ -4912,6 +5128,17 @@ def _monitor_open_positions_impl():
     database.close()
 
     if not open_positions and not monitored_candidates:
+        status = record_monitor_status(
+            status="complete",
+            started=False,
+            total_open_positions=0,
+            updated_count=0,
+            current_ticker=None,
+            last_success_at=current_time_cst().isoformat(),
+            finished_at=current_time_cst().isoformat(),
+            error=None,
+        )
+        maybe_send_monitor_recovery_alert(status)
         return
 
     # Combine all tickers that need price checks
@@ -4921,13 +5148,36 @@ def _monitor_open_positions_impl():
     ))
 
     if not all_tickers:
+        status = record_monitor_status(
+            status="complete",
+            started=False,
+            total_open_positions=len(open_positions),
+            updated_count=0,
+            current_ticker=None,
+            last_success_at=current_time_cst().isoformat(),
+            finished_at=current_time_cst().isoformat(),
+            error=None,
+        )
+        maybe_send_monitor_recovery_alert(status)
         return
 
     monitor_event_id = begin_scan_event("open_position_monitor", job_type="monitor", tickers_attempted=len(all_tickers))
+    record_monitor_status(
+        status="running",
+        started=True,
+        started_at=current_time_cst().isoformat(),
+        finished_at=None,
+        total_open_positions=len(open_positions),
+        total_tickers=len(all_tickers),
+        updated_count=0,
+        current_ticker=None,
+        error=None,
+    )
     current_prices = fetch_current_prices(all_tickers)
     now = current_time_cst()
     today = now.strftime("%Y-%m-%d")
     database = get_database()
+    updated_open_count = 0
 
     # Load last known prices for stale detection
     last_price_cache = {}
@@ -4943,11 +5193,19 @@ def _monitor_open_positions_impl():
 
     for position in open_positions:
         ticker = position["ticker"]
+        database.commit()
+        record_monitor_status(
+            status="running",
+            current_ticker=ticker,
+            total_open_positions=len(open_positions),
+            updated_count=updated_open_count,
+        )
         if ticker not in current_prices:
             database.execute("""
                 INSERT INTO position_checks (position_id, check_time, price, pnl_percent, sentiment, ticker)
                 VALUES (?,?,?,?,?,?)
             """, [position["id"], now.isoformat(), None, None, "stale: no fresh provider price", ticker])
+            database.commit()
             continue
 
         price_data = current_prices[ticker]
@@ -4967,6 +5225,7 @@ def _monitor_open_positions_impl():
 
         database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
             [f"last_monitor_price_{ticker}", json.dumps({"price": price, "stale_count": stale_count})])
+        database.commit()
 
         # Stale price guard — if price unchanged 3+ checks during market hours, skip
         if stale_count >= 3 and is_market_open():
@@ -5089,6 +5348,15 @@ def _monitor_open_positions_impl():
 
         # Refresh news for open positions — once per monitor cycle, rate-limited
         # Only refresh if news is stale (>30 min old) to stay within Alpha Vantage limits
+        updated_open_count += 1
+        database.commit()
+        record_monitor_status(
+            status="running",
+            current_ticker=ticker,
+            total_open_positions=len(open_positions),
+            updated_count=updated_open_count,
+        )
+
         try:
             news_key = f"last_news_fetch_{ticker}"
             last_news_row = database.execute("SELECT value FROM app_state WHERE key=?", [news_key]).fetchone()
@@ -5106,6 +5374,7 @@ def _monitor_open_positions_impl():
         except Exception as e:
             log.debug(f"News refresh skipped for {ticker}: {e}")
 
+        database.commit()
         # Skip sell decisions outside regular market hours
         if not is_market_open():
             continue
@@ -5116,6 +5385,10 @@ def _monitor_open_positions_impl():
         if is_sell_day and now.hour >= 8 and now.hour < 15:
             # Evaluate sell decision
             should_sell, reason, sentiment = evaluate_sell_decision(position, price)
+            if should_sell:
+                send_sell_rule_alert(position, pnl_percent, reason)
+            else:
+                update_weak_alert_state(position, pnl_percent, should_sell=False)
 
             # PDT check: if this would be a same-day close (day trade), verify we have capacity
             is_day_trade = position["buy_date"] == today
@@ -5192,6 +5465,20 @@ def _monitor_open_positions_impl():
         "candidates": len(monitored_candidates),
         "provider_summary": get_app_state_json("last_price_provider_summary", {}) or {},
     }))
+    status = record_monitor_status(
+        status="complete" if current_prices else "failed",
+        started=False,
+        total_open_positions=len(open_positions),
+        total_tickers=len(all_tickers),
+        updated_count=updated_open_count,
+        current_ticker=None,
+        last_success_at=now.isoformat() if updated_open_count > 0 or not open_positions else get_monitor_status().get("last_success_at"),
+        finished_at=current_time_cst().isoformat(),
+        error=None if current_prices else "no current prices returned",
+    )
+    if current_prices:
+        maybe_send_monitor_recovery_alert(status)
+    evaluate_monitor_health_alert(status)
     log.info(f"Monitored {len(open_positions)} positions + {len(monitored_candidates)} candidates")
 
 def monitor_open_positions():
@@ -5200,13 +5487,21 @@ def monitor_open_positions():
     if not _monitor_singleflight_lock.acquire(blocking=False):
         event_id = begin_scan_event("open_position_monitor", job_type="monitor", tickers_attempted=0)
         finish_scan_event(event_id, status="skipped", error="monitor already running")
+        status = record_monitor_status(status="running", started=True, already_running=True, error=None)
         log.info("monitor_open_positions skipped - previous monitor pass still running")
-        return {"success": False, "skipped": True, "reason": "monitor already running"}
+        return {"success": False, "skipped": True, "reason": "monitor already running", "status": status}
     try:
         mark_stalled_scan_events(max_age_minutes=10)
         return _monitor_open_positions_impl()
     except Exception as exc:
         mark_running_events_error("monitor", started_at, exc)
+        status = record_monitor_status(
+            status="failed",
+            started=False,
+            finished_at=current_time_cst().isoformat(),
+            error=str(exc),
+        )
+        evaluate_monitor_health_alert(status)
         log.error(f"monitor_open_positions failed: {exc}")
         raise
     finally:
@@ -5728,10 +6023,82 @@ def api_picks_fresh():
 def api_monitor_open_now():
     """Force one open-position monitor pass for freshness diagnostics."""
     try:
-        monitor_open_positions()
-        return jsonify({"success": True, "ran_at": current_time_cst().isoformat()})
+        current = get_monitor_status()
+        if current.get("status") == "running":
+            return jsonify({
+                "success": True,
+                "started": False,
+                "already_running": True,
+                "background": True,
+                "status": current,
+                "status_endpoint": "/api/monitor-open-status",
+            })
+
+        record_monitor_status(
+            status="queued",
+            started=True,
+            started_at=current_time_cst().isoformat(),
+            finished_at=None,
+            updated_count=0,
+            current_ticker=None,
+            error=None,
+        )
+        thread = threading.Thread(target=monitor_open_positions, daemon=True)
+        thread.start()
+        return jsonify({
+            "success": True,
+            "started": True,
+            "background": True,
+            "status": get_monitor_status(),
+            "status_endpoint": "/api/monitor-open-status",
+        })
     except Exception as error:
         log.error(f"Manual monitor-open-now failed: {error}")
+        record_monitor_status(status="failed", started=False, finished_at=current_time_cst().isoformat(), error=str(error))
+        return jsonify({"success": False, "error": str(error)}), 500
+
+@app.route("/api/monitor-open-status")
+def api_monitor_open_status():
+    """Return latest open-position monitor progress and freshness state."""
+    try:
+        status = get_monitor_status()
+        evaluate_monitor_health_alert(status)
+        return jsonify(status)
+    except Exception as error:
+        return jsonify({"status": "unknown", "error": str(error)}), 500
+
+@app.route("/api/day-trade-status")
+def api_day_trade_status():
+    """Verify PDT/day-trade count against the durable ledger and closed trades."""
+    try:
+        now = current_time_cst()
+        five_days_ago = (now - timedelta(days=5)).strftime("%Y-%m-%d")
+        database = get_database()
+        ledger_rows = [dict(r) for r in database.execute("""
+            SELECT * FROM day_trades
+            WHERE date >= ?
+            ORDER BY date DESC, logged_at DESC
+        """, [five_days_ago]).fetchall()]
+        same_day_rows = [dict(r) for r in database.execute("""
+            SELECT id, ticker, buy_date, sell_date, buy_time, sell_time, sell_reason, outcome
+            FROM virtual_trades
+            WHERE buy_date = sell_date
+              AND sell_date >= ?
+            ORDER BY sell_date DESC, sell_time DESC
+        """, [five_days_ago]).fetchall()]
+        database.close()
+        return jsonify({
+            "success": True,
+            "window_start": five_days_ago,
+            "pdt_used": len(ledger_rows),
+            "pdt_remaining": max(0, 3 - len(ledger_rows)),
+            "ledger_count": len(ledger_rows),
+            "same_day_closed_count": len(same_day_rows),
+            "matches_closed_rows": len(ledger_rows) == len(same_day_rows),
+            "ledger": ledger_rows,
+            "same_day_closed": same_day_rows,
+        })
+    except Exception as error:
         return jsonify({"success": False, "error": str(error)}), 500
 
 @app.route("/api/freshness-repair-now", methods=["POST"])

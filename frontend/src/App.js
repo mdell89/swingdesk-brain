@@ -163,6 +163,40 @@ function EvidenceBadge({ evidence }) {
     </span>
   );
 }
+EvidenceBadge.displayName = "EvidenceBadge";
+
+function EvidenceBadgeCompact({ evidence }) {
+  if (!evidence) return null;
+  const level = evidence.level || "New";
+  const color = evidenceColor(level);
+  const title = evidence.description || `Evidence: ${level}`;
+  return (
+    <span className="tag-glow" title={title} style={{
+      fontSize: 7, fontWeight: 800, color, letterSpacing: .25,
+      padding: "1px 4px", background: color + "16", borderRadius: 3,
+      border: `1px solid ${color}55`, whiteSpace: "nowrap", flexShrink: 0,
+      display: "inline-flex", alignItems: "center",
+    }}>
+      {level}
+    </span>
+  );
+}
+
+function EvidenceValue({ evidence }) {
+  const level = evidence?.level || "New";
+  const color = evidenceColor(level);
+  const title = evidence?.description || `Evidence: ${level}`;
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontFamily: "'DM Mono',monospace" }}>
+      <span className="tag-glow" title={title} style={{
+        width: 13, height: 13, borderRadius: "50%", border: `1px solid ${color}77`,
+        color, display: "inline-flex", alignItems: "center", justifyContent: "center",
+        fontSize: 8, fontWeight: 900, lineHeight: 1, background: color + "12",
+      }}>i</span>
+      <span style={{ color }}>{level}</span>
+    </span>
+  );
+}
 
 function mapPickFields(pick) {
   return {
@@ -715,7 +749,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
       <CardActionRow
         borderColor={BORDER}
         actions={<>
-          <EvidenceBadge evidence={pick.evidence} />
+          <EvidenceBadgeCompact evidence={pick.evidence} />
           {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 && (
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
           )}
@@ -755,7 +789,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
                 ["Volume ratio", `${pick.vol_ratio}x`],
                 ["Gap", `${pick.overnight_gap_pct >= 0 ? "+" : ""}${pick.overnight_gap_pct?.toFixed(1)}%`],
                 ["Day change", `${pick.day_change_pct >= 0 ? "+" : ""}${pick.day_change_pct?.toFixed(1)}%`],
-                ["Evidence", pick.evidence ? pick.evidence.level : "New"],
+                ["Evidence", <EvidenceValue evidence={pick.evidence} />],
                 ["Sample", pick.evidence ? `${pick.evidence.sample_size || 0} past` : "0 past"],
               ].map(([label, value]) => (
                 <div key={label} style={{ display: "flex", justifyContent: "space-between", borderBottom: `1px solid ${CARD_BORDER_LONG}`, paddingBottom: 3 }}>
@@ -1038,7 +1072,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
         staleTime={isStale ? staleTime : null}
         borderColor={rulingColor}
         actions={<>
-          <EvidenceBadge evidence={trade.evidence} />
+          <EvidenceBadgeCompact evidence={trade.evidence} />
           {trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7 && (
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
           )}
@@ -1087,7 +1121,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
               ["Current estimate", `+${dynamicEstimate.toFixed(1)}%`],
               ["Entry confidence", `${frozenConfidence}%`],
               ["Current confidence", `${dynamicConfidence}%`],
-              ["Evidence", trade.evidence ? trade.evidence.level : "New"],
+              ["Evidence", <EvidenceValue evidence={trade.evidence} />],
               ["Sample", trade.evidence ? `${trade.evidence.sample_size || 0} past` : "0 past"],
             ].filter(Boolean).map(([label, value]) => (
               <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: `1px solid ${rulingColor}` }}>
@@ -1606,6 +1640,8 @@ export default function App() {
   const [queueStatus, setQueueStatus] = useState(null);
   const [openExecution, setOpenExecution] = useState(null);
   const [recoveringOpen, setRecoveringOpen] = useState(false);
+  const [monitorStatus, setMonitorStatus] = useState(null);
+  const [monitorRunning, setMonitorRunning] = useState(false);
 
   const [tab, setTab] = useState("today");
   const [tabLoading, setTabLoading] = useState(false);
@@ -1772,6 +1808,28 @@ export default function App() {
     }
     setRecoveringOpen(false);
   };
+
+  const refreshMonitorStatus = async () => {
+    const status = await apiFetch("/monitor-open-status").catch(() => null);
+    if (status) {
+      setMonitorStatus(status);
+      setMonitorRunning(status.status === "running" || status.status === "queued");
+    }
+    return status;
+  };
+
+  const runOpenMonitor = async () => {
+    if (monitorRunning) return;
+    setMonitorRunning(true);
+    try {
+      const result = await apiFetch("/monitor-open-now", { method: "POST" });
+      if (result?.status) setMonitorStatus(result.status);
+      await refreshMonitorStatus();
+    } catch (error) {
+      setMonitorStatus(prev => ({ ...(prev || {}), status: "failed", error: error.message }));
+      setMonitorRunning(false);
+    }
+  };
   // ── Initial data load ──
   useEffect(() => {
     (async () => {
@@ -1796,7 +1854,7 @@ export default function App() {
 
         // Fire all requests in parallel
         const [picksData, positions, statsData, runnersData, perfData, closedData,
-               nnPicksData, nnPositionsData, nnStatsData, nnPerfData, personalData] = await Promise.all([
+               nnPicksData, nnPositionsData, nnStatsData, nnPerfData, personalData, monitorData] = await Promise.all([
           apiFetch("/picks").catch(() => ({ longs: [], shorts: [] })),
           apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
           apiFetch("/stats").catch(() => ({})),
@@ -1808,6 +1866,7 @@ export default function App() {
           apiFetch("/nn-stats").catch(() => null),
           apiFetch("/nn-perf-history").catch(() => []),
           apiFetch("/personal-trades").catch(() => []),
+          apiFetch("/monitor-open-status").catch(() => null),
         ]);
 
         // Auto-backfill lock_in_confidence for existing trades silently
@@ -1833,6 +1892,8 @@ export default function App() {
         setNnStats(nnStatsData);
         setNnPerfHistory(nnPerfData || []);
         setPersonalTrades(personalData || []);
+        setMonitorStatus(monitorData);
+        setMonitorRunning(monitorData?.status === "running" || monitorData?.status === "queued");
 
         setLoadStatus("Ready"); setLoadProgress(100);
       } catch (error) {
@@ -1948,6 +2009,14 @@ export default function App() {
   }, []);
 
   // ── Computed values ──
+  useEffect(() => {
+    if (!loaded) return;
+    const interval = setInterval(() => {
+      refreshMonitorStatus().catch(() => {});
+    }, monitorRunning ? 3000 : 30000);
+    return () => clearInterval(interval);
+  }, [loaded, monitorRunning]);
+
   const openTickers = new Set(openPositions.filter(t => t.outcome === "open").map(t => t.ticker));
   const allBuyPicks = picks.longs.filter(pick => !openTickers.has(pick.ticker));
   const allShortPicks = picks.shorts.filter(pick => !openTickers.has(pick.ticker));
@@ -2024,6 +2093,25 @@ export default function App() {
 
   const buyVisible = buyListExpanded ? allBuyPicks : allBuyPicks.slice(0, 20);
   const sellVisible = sellListExpanded ? sortedOpenFilteredPositions : sortedOpenFilteredPositions.slice(0, 20);
+  const monitorUpdated = Number(monitorStatus?.updated_count || 0);
+  const monitorTotal = Number(monitorStatus?.total_open_positions || openLongPositions.length || 0);
+  const monitorStatusText = monitorStatus?.status === "running" || monitorStatus?.status === "queued"
+    ? `Scanning open positions: ${monitorUpdated}/${monitorTotal} updated`
+    : monitorStatus?.status === "failed"
+      ? `Open-position monitor failed${monitorStatus?.error ? `: ${monitorStatus.error}` : ""}`
+      : monitorStatus?.status === "complete"
+        ? `Open-position monitor complete: ${monitorUpdated}/${monitorTotal} updated`
+        : monitorStatus?.last_success_at
+          ? `Last monitor update ${relativeTime(monitorStatus.last_success_at)}`
+          : "Monitor status waiting";
+  const monitorTickerText = monitorStatus?.current_ticker
+    ? `Now checking ${monitorStatus.current_ticker}`
+    : monitorStatus?.finished_at
+      ? `Finished ${relativeTime(monitorStatus.finished_at)}`
+      : "";
+  const monitorLastSuccessMs = monitorStatus?.last_success_at ? new Date(monitorStatus.last_success_at).getTime() : null;
+  const monitorAgeMinutes = monitorLastSuccessMs ? Math.floor((Date.now() - monitorLastSuccessMs) / 60000) : null;
+  const monitorStale = openLongPositions.length > 0 && (monitorStatus?.status === "failed" || monitorAgeMinutes == null || monitorAgeMinutes >= 10);
 
   // Open P&L from currently held positions
   const livePnl = openPositions.reduce((total, trade) => {
@@ -2274,7 +2362,7 @@ export default function App() {
                 whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
               }}>{label}</button>
             ))}
-            <div title="Sort" style={{ display: "flex", alignItems: "center", justifyContent: "center", background: "transparent", borderRadius: 6, padding: "7px 0", gap: 2, border: `1px solid ${BORDER}`, minWidth: 0, position: "relative" }}>
+            <div title="Sort" style={{ display: "flex", alignItems: "center", justifyContent: "center", background: "transparent", borderRadius: 6, padding: 7, gap: 2, border: `1px solid ${BORDER}`, minWidth: 0, position: "relative" }}>
               <span aria-hidden="true" style={{ fontSize: 11, color: T3, lineHeight: 1 }}>↕</span>
               <select
                 value={sortMode}
@@ -2430,6 +2518,43 @@ export default function App() {
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right", paddingRight: 6 }}>+$</div>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right" }}>Conf</div>
                   </CardMetricGrid>
+                )}
+
+                {openLongPositions.length > 0 && (
+                  <div style={{
+                    display: "flex", alignItems: "center", justifyContent: "space-between",
+                    gap: 8, margin: "0 0 8px", padding: "7px 8px",
+                    background: monitorStale ? "#160909" : CARD,
+                    border: `1px solid ${monitorStale ? RED + "55" : BORDER}`,
+                    borderRadius: 7,
+                  }}>
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <div style={{ fontSize: 9, color: monitorStale ? RED : T2, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {monitorStatusText}
+                      </div>
+                      {monitorTickerText && (
+                        <div style={{ fontSize: 8, color: T3, marginTop: 2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{monitorTickerText}</div>
+                      )}
+                    </div>
+                    <button
+                      onClick={runOpenMonitor}
+                      disabled={monitorRunning}
+                      style={{
+                        border: `1px solid ${monitorRunning ? BORDER : BLUE + "66"}`,
+                        background: monitorRunning ? "transparent" : BLUE + "12",
+                        color: monitorRunning ? T3 : BLUE,
+                        borderRadius: 5,
+                        padding: "4px 7px",
+                        fontSize: 8.5,
+                        fontWeight: 800,
+                        letterSpacing: .3,
+                        whiteSpace: "nowrap",
+                        cursor: monitorRunning ? "default" : "pointer",
+                      }}
+                    >
+                      {monitorRunning ? "RUNNING" : "RUN MONITOR"}
+                    </button>
+                  </div>
                 )}
 
                 {openLongPositions.length > 0 && (
