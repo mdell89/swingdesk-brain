@@ -2002,6 +2002,41 @@ def build_entry_integrity(position, price_data):
         return "watch", f"Entry is {largest[1]:+.1f}% vs {largest[0]}"
     return "ok", "Entry is within expected quote context"
 
+def normalize_monitor_quote(raw, fallback_price=None):
+    """Return a dict quote shape so monitor math never depends on provider quirks."""
+    if isinstance(raw, dict):
+        price = raw.get("price", fallback_price)
+        quote = dict(raw)
+    else:
+        price = raw if raw is not None else fallback_price
+        quote = {}
+    try:
+        price = float(price)
+    except Exception:
+        price = float(fallback_price or 0)
+    quote["price"] = price
+    quote.setdefault("previous_close", fallback_price or price)
+    quote.setdefault("open", price)
+    quote.setdefault("high", price)
+    quote.setdefault("low", price)
+    quote.setdefault("volume", 0)
+    quote.setdefault("average_volume", 1)
+    quote.setdefault("volume_ratio", 1.0)
+    quote.setdefault("gap_percent", 0)
+    quote.setdefault("day_change_pct", quote.get("day_change_percent", 0))
+    quote.setdefault("day_change_percent", quote.get("day_change_pct", 0))
+    quote.setdefault("source", "unknown")
+    return quote
+
+def monitor_baselines(position, price_data, pnl_percent):
+    """Build safe percent baseline and entry-integrity fields for monitor writes."""
+    return {
+        "pct_prev_close": pct_from_baseline(price_data.get("price"), price_data.get("previous_close")),
+        "pct_regular_open": pct_from_baseline(price_data.get("price"), price_data.get("open")),
+        "pct_entry": pnl_percent,
+        "entry_integrity": build_entry_integrity(position, price_data),
+    }
+
 def _provider_quote(provider, ticker):
     """Fetch one quote and classify failures for the fallback router."""
     try:
@@ -5011,18 +5046,16 @@ def monitor_nn_open_positions():
         raw = current_prices.get(ticker)
         if not raw:
             continue
-        price = raw["price"] if isinstance(raw, dict) else float(raw)
-        day_change_pct = raw.get("day_change_pct", 0) if isinstance(raw, dict) else 0
+        buy_price = float(position["buy_price"] or 0)
+        price_data = normalize_monitor_quote(raw, buy_price)
+        price = price_data["price"]
+        day_change_pct = price_data.get("day_change_pct", 0)
         buy_price = float(position["buy_price"] or price)
         invested = float(position["invested_amount"] or DEFAULT_INVESTMENT)
         pnl_percent = (price - buy_price) / buy_price * 100
         if position["direction"] == "short":
             pnl_percent = -pnl_percent
         pnl_dollars = invested * (pnl_percent / 100)
-        pct_prev_close = pct_from_baseline(price, price_data.get("previous_close"))
-        pct_regular_open = pct_from_baseline(price, price_data.get("open"))
-        pct_entry = pnl_percent
-        entry_integrity_status, entry_integrity_note = build_entry_integrity(position, price_data)
         current_value = invested + pnl_dollars
         high_pct = max(position.get("intraday_high_pct") or 0, pnl_percent)
         low_pct = min(position.get("intraday_low_pct") or 0, pnl_percent)
@@ -5036,14 +5069,14 @@ def monitor_nn_open_positions():
         try:
             price_data_for_dynamic = {ticker: {
                 "price": price,
-                "previous_close": raw.get("previous_close", buy_price) if isinstance(raw, dict) else buy_price,
-                "open": raw.get("open", price) if isinstance(raw, dict) else price,
-                "high": raw.get("high", price) if isinstance(raw, dict) else price,
-                "low": raw.get("low", price) if isinstance(raw, dict) else price,
-                "volume": raw.get("volume", 0) if isinstance(raw, dict) else 0,
-                "average_volume": raw.get("average_volume", 1) if isinstance(raw, dict) else 1,
-                "volume_ratio": raw.get("volume_ratio", 1.0) if isinstance(raw, dict) else 1.0,
-                "gap_percent": raw.get("gap_percent", 0) if isinstance(raw, dict) else 0,
+                "previous_close": price_data.get("previous_close", buy_price),
+                "open": price_data.get("open", price),
+                "high": price_data.get("high", price),
+                "low": price_data.get("low", price),
+                "volume": price_data.get("volume", 0),
+                "average_volume": price_data.get("average_volume", 1),
+                "volume_ratio": price_data.get("volume_ratio", 1.0),
+                "gap_percent": price_data.get("gap_percent", 0),
                 "day_change_percent": day_change_pct,
             }}
             weights = get_signal_weights()
@@ -5208,9 +5241,9 @@ def _monitor_open_positions_impl():
             database.commit()
             continue
 
-        price_data = current_prices[ticker]
-        price = price_data["price"] if isinstance(price_data, dict) else float(price_data)
-        day_change_pct = price_data.get("day_change_pct", 0) if isinstance(price_data, dict) else 0
+        price_data = normalize_monitor_quote(current_prices[ticker], position.get("buy_price"))
+        price = price_data["price"]
+        day_change_pct = price_data.get("day_change_pct", 0)
 
         # Stale price detection — if price is identical to last 3 consecutive checks
         # during market hours, skip sell decisions (possible halt or bad data)
@@ -5248,6 +5281,11 @@ def _monitor_open_positions_impl():
         if position["direction"] == "short":
             pnl_percent = -pnl_percent
         pnl_dollars = invested * (pnl_percent / 100)
+        baseline_data = monitor_baselines(position, price_data, pnl_percent)
+        pct_prev_close = baseline_data["pct_prev_close"]
+        pct_regular_open = baseline_data["pct_regular_open"]
+        pct_entry = baseline_data["pct_entry"]
+        entry_integrity_status, entry_integrity_note = baseline_data["entry_integrity"]
 
         # Update current value, intraday extremes, and dynamic scores
         current_value = invested + pnl_dollars
@@ -6073,6 +6111,7 @@ def api_day_trade_status():
     try:
         now = current_time_cst()
         five_days_ago = (now - timedelta(days=5)).strftime("%Y-%m-%d")
+        today = now.strftime("%Y-%m-%d")
         database = get_database()
         ledger_rows = [dict(r) for r in database.execute("""
             SELECT * FROM day_trades
@@ -6087,16 +6126,61 @@ def api_day_trade_status():
             ORDER BY sell_date DESC, sell_time DESC
         """, [five_days_ago]).fetchall()]
         database.close()
+
+        pdt_relevant_reasons = {"cut_loss", "stop_loss", "momentum_fade", "rsi_exhaustion", "target_hit", "time_pressure"}
+        pdt_relevant_same_day = []
+        excluded_same_day = []
+        for row in same_day_rows:
+            reason = row.get("sell_reason")
+            buy_time = str(row.get("buy_time") or "")
+            sell_time = str(row.get("sell_time") or "")
+            is_today = row.get("sell_date") == today
+            reason_relevant = reason in pdt_relevant_reasons
+            looks_intraday = buy_time and sell_time and buy_time != sell_time
+            if is_today and reason_relevant and looks_intraday:
+                pdt_relevant_same_day.append(row)
+            else:
+                excluded_same_day.append({
+                    **row,
+                    "excluded_reason": "historical_or_forced_close_not_counted_for_live_pdt",
+                })
+
+        ledger_keys = {
+            (row.get("ticker"), row.get("date"), str(row.get("buy_time") or ""), str(row.get("sell_time") or ""))
+            for row in ledger_rows
+        }
+        relevant_keys = {
+            (row.get("ticker"), row.get("sell_date"), str(row.get("buy_time") or ""), str(row.get("sell_time") or ""))
+            for row in pdt_relevant_same_day
+        }
+        missing_from_ledger = [
+            row for row in pdt_relevant_same_day
+            if (row.get("ticker"), row.get("sell_date"), str(row.get("buy_time") or ""), str(row.get("sell_time") or "")) not in ledger_keys
+        ]
+        extra_ledger_rows = [
+            row for row in ledger_rows
+            if (row.get("ticker"), row.get("date"), str(row.get("buy_time") or ""), str(row.get("sell_time") or "")) not in relevant_keys
+        ]
+
         return jsonify({
             "success": True,
             "window_start": five_days_ago,
+            "today": today,
             "pdt_used": len(ledger_rows),
             "pdt_remaining": max(0, 3 - len(ledger_rows)),
             "ledger_count": len(ledger_rows),
             "same_day_closed_count": len(same_day_rows),
-            "matches_closed_rows": len(ledger_rows) == len(same_day_rows),
+            "pdt_relevant_same_day_count": len(pdt_relevant_same_day),
+            "excluded_same_day_count": len(excluded_same_day),
+            "counter_consistent": len(missing_from_ledger) == 0,
+            "matches_closed_rows": len(ledger_rows) == len(pdt_relevant_same_day),
+            "note": "PDT ledger is compared to today's PDT-relevant same-day exits only; historical or forced-close rows are listed as excluded context.",
             "ledger": ledger_rows,
             "same_day_closed": same_day_rows,
+            "pdt_relevant_same_day": pdt_relevant_same_day,
+            "excluded_same_day": excluded_same_day,
+            "missing_from_ledger": missing_from_ledger,
+            "extra_ledger_rows": extra_ledger_rows,
         })
     except Exception as error:
         return jsonify({"success": False, "error": str(error)}), 500
