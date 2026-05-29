@@ -660,6 +660,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
   const confidence = isLong ? pick.lc : pick.sc;
   const estimatedMove = isLong ? pick.lm : pick.sm;
   const reasoningText = isLong ? pick.lr : pick.sr;
+  const companyContext = getCompanyContext(pick);
   const borderColor = confidenceColor(confidence, themeKey);
   const dayChange = pick.dayChg || 0;
   const dayUp = dayChange >= 0;
@@ -674,7 +675,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
           <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
             <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 14, fontWeight: 600, color: T1, lineHeight: 1.2 }}>{pick.ticker}</span>
           </div>
-          {pick.name && <span style={{ fontSize: 9, color: T3, lineHeight: 1.2, marginTop: 1 }}>{pick.name}</span>}
+          {pick.name && pick.name !== pick.ticker && <span style={{ fontSize: 9, color: T3, lineHeight: 1.2, marginTop: 1 }}>{pick.name}</span>}
         </div>
         <div style={{ fontSize: 11, fontWeight: 600, color: dayUp ? GREEN : RED, textAlign: "center" }}>{dayUp ? "+" : ""}{dayChange.toFixed(1)}%</div>
         <SpineCell>
@@ -711,6 +712,10 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
       />
       {expanded && (
         <div style={{ padding: "0 12px 12px", borderTop: `1px solid ${CARD_BORDER_LONG}` }}>
+            <div style={{ padding: "6px 0 7px", borderBottom: `1px solid ${CARD_BORDER_LONG}`, marginBottom: 5 }}>
+              <div style={{ fontSize: 10, color: T1, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{companyContext.name}</div>
+              <div style={{ fontSize: 9, color: T3, marginTop: 2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{companyContext.description}</div>
+            </div>
             {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 && (
               <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 8px", background: "#0e1a0e", borderRadius: 6, border: "1px solid #1a3a1a" }}>
                 <span style={{ fontSize: 9, fontWeight: 800, color: GREEN, letterSpacing: .5 }}>52W HIGH</span>
@@ -733,7 +738,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
               ))}
             </div>
             <div style={{ padding: "6px 10px", background: "#0e0e10", borderRadius: 7 }}>
-              <span style={{ fontSize: 10, color: T2, fontStyle: "italic" }}>"{reasoningText}"</span>
+              <span style={{ fontSize: 10, color: T2, fontStyle: "italic" }}>{reasoningText}</span>
             </div>
             {pick.confluence_methods && pick.confluence_methods.length > 0 && (
               <div style={{ padding: "6px 10px 6px 4px", background: "#000", borderRadius: 7, marginBottom: 6, border: "1px solid rgba(255,255,255,0.12)" }}>
@@ -976,7 +981,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
       <CardMetricGrid style={{ padding: "12px" }}>
         <div style={{ display: "flex", flexDirection: "column", justifyContent: "center" }}>
           <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 14, fontWeight: 600, color: T1, lineHeight: 1.2 }}>{trade.ticker}</span>
-          {trade.name && <span style={{ fontSize: 9, color: T3, lineHeight: 1.2, marginTop: 1 }}>{trade.name}</span>}
+          {trade.name && trade.name !== trade.ticker && <span style={{ fontSize: 9, color: T3, lineHeight: 1.2, marginTop: 1 }}>{trade.name}</span>}
         </div>
         <div style={{ fontSize: 11, fontWeight: 600, color: (() => { const d = Number(trade.day_change_percent) || 0; return d > 0 ? GREEN : d < 0 ? RED : T3; })(), fontFamily: "'DM Mono',monospace", textAlign: "center" }}>
           {(() => { const d = Number(trade.day_change_percent) || 0; return `${d >= 0 ? "+" : ""}${d.toFixed(1)}%`; })()}
@@ -1584,7 +1589,6 @@ export default function App() {
   const [nnPerfHistory, setNnPerfHistory] = useState([]);
   const [nnPerfTimeframe, setNnPerfTimeframe] = useState("M");
   const [nnAction, setNnAction] = useState(null);
-  const [nnScanStatus, setNnScanStatus] = useState(null);
   const [personalForm, setPersonalForm] = useState({
     ticker: "",
     buy_price: "",
@@ -1617,6 +1621,7 @@ export default function App() {
   const [sellListExpanded, setSellListExpanded] = useState(false);
   const [openDayFilter, setOpenDayFilter] = useState("all");
   const [dismissedPostClose, setDismissedPostClose] = useState({});
+  const [queueLogOpen, setQueueLogOpen] = useState(false);
 
   const [perfTimeframe, setPerfTimeframe] = useState("M");
   const [feeAdjusted, setFeeAdjusted] = useState(false);
@@ -1670,8 +1675,7 @@ export default function App() {
     if (nnAction) return;
     setNnAction(kind);
     try {
-      const result = await apiFetch(kind === "scan" ? "/nn-scan-now" : "/nn-open-now", { method: "POST" });
-      if (kind === "scan") setNnScanStatus(result.status || { status: "running" });
+      await apiFetch("/nn-open-now", { method: "POST" });
       await refreshNeuralPortfolio();
     } catch {}
     setNnAction(null);
@@ -1891,22 +1895,6 @@ export default function App() {
   }, []);
 
   // ── Computed values ──
-  useEffect(() => {
-    if (nnScanStatus?.status !== "running") return;
-    const interval = setInterval(async () => {
-      try {
-        const status = await apiFetch("/nn-scan-status");
-        setNnScanStatus(status);
-        if (status.status && status.status !== "running") {
-          await refreshNeuralPortfolio();
-        }
-      } catch {
-        setNnScanStatus(prev => ({ ...(prev || {}), status: "error", error: "status unavailable" }));
-      }
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [nnScanStatus?.status]);
-
   const openTickers = new Set(openPositions.filter(t => t.outcome === "open").map(t => t.ticker));
   const allBuyPicks = picks.longs.filter(pick => !openTickers.has(pick.ticker));
   const allShortPicks = picks.shorts.filter(pick => !openTickers.has(pick.ticker));
@@ -1991,13 +1979,6 @@ export default function App() {
     return total + (current - invested);
   }, 0);
 
-  const resolved = predictions.filter(p => p.outcome !== "pending");
-  // Single source of truth: win rate from virtual_trades closed outcomes only
-  const _closedForWinRate = virtualTrades.filter(t => t.outcome !== "open");
-  const winRate = _closedForWinRate.length > 0
-    ? Math.round(_closedForWinRate.filter(t => t.outcome === "hit").length / _closedForWinRate.length * 100)
-    : null;
-
   // Portfolio balance = last closed balance + unrealized P&L
   const tradingPerfPoints = perfHistory.filter(p => {
     const d = new Date(p.ts);
@@ -2061,7 +2042,7 @@ export default function App() {
         @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
         .fadeIn{animation:fadeUp .2s ease}
         @keyframes tagGlow{0%{box-shadow:none;opacity:1}50%{box-shadow:0 0 4px 1px currentColor;opacity:0.85}100%{box-shadow:none;opacity:1}}
-        .tag-glow{animation:tagGlow 0.9s ease-in-out 0.3s}
+        .tag-glow{animation:tagGlow 0.9s ease-in-out 0.25s}
       `}</style>
 
       <TickerBanner openPositions={openPositions} />
@@ -2210,22 +2191,22 @@ export default function App() {
 
 
           {/* SUB TOGGLE — Picks/Open + Sort */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr .95fr", margin: "0 16px 12px", gap: 4, alignItems: "stretch" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 42px", margin: "0 16px 12px", gap: 4, alignItems: "stretch" }}>
             {[
               ["buy", `Picks (${allBuyPicks.length})`, BLUE, "#0f1e35", `1px solid ${BLUE}44`],
               ["sell", `Open (${openLongPositions.length})`, GREEN, "#091a0d", `1px solid ${GREEN}44`],
               ["closed", `Closed (${todayClosedVisible.length})`, AMBER, "#1a1500", `1px solid ${AMBER}55`]
             ].map(([id, label, color, activeBg, border]) => (
               <button key={id} onClick={() => setLongSub(id)} style={{
-                padding: "7px 0", borderRadius: 6, fontSize: 10, fontWeight: 700,
+                padding: "7px 0", borderRadius: 6, fontSize: 9.5, fontWeight: 700,
                 border: longSub === id ? border : border,
                 cursor: "pointer", transition: ".15s",
                 background: longSub === id ? activeBg : "transparent", color: color,
                 whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
               }}>{label}</button>
             ))}
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", background: "transparent", borderRadius: 6, padding: "7px 0", gap: 4, border: `1px solid ${BORDER}`, minWidth: 0 }}>
-              <span style={{ fontSize: 10, color: T3, fontWeight: 600, whiteSpace: "nowrap", lineHeight: "1", display: "block" }}>Sort:</span>
+            <div title="Sort" style={{ display: "flex", alignItems: "center", justifyContent: "center", background: "transparent", borderRadius: 6, padding: "7px 0", gap: 2, border: `1px solid ${BORDER}`, minWidth: 0, position: "relative" }}>
+              <span aria-hidden="true" style={{ fontSize: 11, color: T3, lineHeight: 1 }}>↕</span>
               <select
                 value={sortMode}
                 onChange={e => setSortMode(e.target.value)}
@@ -2233,12 +2214,13 @@ export default function App() {
                   border: "none", cursor: "pointer",
                   background: "transparent",
                   color: T1,
-                  fontSize: 10, fontWeight: 600,
+                  fontSize: 0, fontWeight: 600,
                   appearance: "none", outline: "none",
                   margin: 0, padding: 0,
                   lineHeight: "1",
                   textAlign: "center", textAlignLast: "center",
                   display: "block",
+                  position: "absolute", inset: 0, opacity: 0,
                 }}
               >
                 {SORT_OPTIONS.map(o => (
@@ -2256,7 +2238,7 @@ export default function App() {
               <>
                 {allBuyPicks.length === 0 ? (
                   <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 20, fontSize: 13, color: T3, textAlign: "center" }}>
-                    {portfolioTab === "neural" ? "Neural picks will appear after the NN scan runs." : "No picks yet — pre-market scan runs from 4–8:15 AM CST."}
+                    {portfolioTab === "neural" ? "Nova picks appear after the shared comprehensive snapshot is scored." : "No picks yet — shared scans run throughout active market windows."}
                   </div>
                 ) : (
                   <>
@@ -2489,11 +2471,11 @@ export default function App() {
           {portfolioTab === "neural" && (
             <div style={{ padding: "10px 16px 0" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-                <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>SwingDeskNet — Neural Brain</div>
+                <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>Nova — Neural Brain</div>
                 <div style={{ display: "flex", gap: 6 }}>
                   <button onClick={() => runNeuralAction("open")} disabled={!!nnAction}
                     style={{ background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 5, color: T3, fontSize: 8, fontWeight: 700, letterSpacing: .4, padding: "4px 7px", cursor: nnAction ? "default" : "pointer", opacity: nnAction ? .55 : .75 }}>
-                    {nnAction === "open" ? "..." : "RECOVER"}
+                    {nnAction === "open" ? "..." : "RECOVER OPEN"}
                   </button>
                 </div>
               </div>
@@ -2552,13 +2534,11 @@ export default function App() {
                   </div>
                 ))}
               </div>
-              {nnScanStatus && (
-                <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "7px 10px", marginBottom: 12, fontSize: 10, color: T3 }}>
-                  NN scan: <span style={{ color: nnScanStatus.status === "error" ? RED : nnScanStatus.status === "running" ? AMBER : GREEN, fontWeight: 700 }}>{nnScanStatus.status || "unknown"}</span>
-                  {nnScanStatus.status === "complete" && ` · ${nnScanStatus.picks || 0} picks · ${nnScanStatus.qualified || 0} qualified`}
-                  {nnScanStatus.error && ` · ${nnScanStatus.error}`}
-                </div>
-              )}
+              <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "7px 10px", marginBottom: 12, fontSize: 10, color: T3 }}>
+                Shared snapshot: <span style={{ color: "#a78bfa", fontWeight: 800 }}>{nnPicks?.source || "comprehensive_scan"}</span>
+                {nnPicks?.cache_time && ` · ${new Date(nnPicks.cache_time).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`}
+                {nnPicks?.qualified_count != null && ` · ${nnPicks.qualified_count} qualified`}
+              </div>
 
               {/* NN Open Positions */}
               {nnPositions.filter(t => t.outcome === "open").length > 0 && (
@@ -2737,11 +2717,14 @@ export default function App() {
             const avgWin = hits.length > 0 ? hits.reduce((s, t) => s + (t.actual_move || 0), 0) / hits.length : null;
             const avgLoss = misses.length > 0 ? misses.reduce((s, t) => s + (t.actual_move || 0), 0) / misses.length : null;
 
-            // Close time analysis
-            const hitsWithTime = hits.filter(t => t.sell_time);
-            const missesWithTime = misses.filter(t => t.sell_time);
-            const avgHitTime = hitsWithTime.length > 0 ? hitsWithTime[hitsWithTime.length >> 1]?.sell_time : null;
-            const avgMissTime = missesWithTime.length > 0 ? missesWithTime[missesWithTime.length >> 1]?.sell_time : null;
+            const avgHeldDays = rows => {
+              const vals = rows.map(t => Number(t.closed_days || 0)).filter(Boolean);
+              if (!vals.length) return null;
+              return vals.reduce((s, v) => s + v, 0) / vals.length;
+            };
+            const avgHitHeld = avgHeldDays(hits);
+            const avgMissHeld = avgHeldDays(misses);
+            const avgAllHeld = avgHeldDays(closedTrades);
 
             // Sector breakdown
             const sectorMap = {};
@@ -2771,18 +2754,20 @@ export default function App() {
                   ))}
                 </div>
 
-                {(avgHitTime || avgMissTime) && (
+                {(avgAllHeld || avgHitHeld || avgMissHeld) && (
                   <div style={{ marginBottom: 16 }}>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8, marginBottom: 8 }}>Avg close time</div>
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-                      {avgHitTime && <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 12px" }}>
-                        <div style={{ fontSize: 9, color: T3, marginBottom: 3 }}>Winners close</div>
-                        <div style={{ fontSize: 14, fontWeight: 600, color: GREEN }}>{avgHitTime}</div>
-                      </div>}
-                      {avgMissTime && <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 12px" }}>
-                        <div style={{ fontSize: 9, color: T3, marginBottom: 3 }}>Losers close</div>
-                        <div style={{ fontSize: 14, fontWeight: 600, color: RED }}>{avgMissTime}</div>
-                      </div>}
+                    <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8, marginBottom: 8 }}>Avg time held</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+                      {[
+                        ["All", avgAllHeld, T1],
+                        ["Wins", avgHitHeld, GREEN],
+                        ["Cuts", avgMissHeld, RED],
+                      ].map(([label, value, color]) => value != null && (
+                        <div key={label} style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 12px" }}>
+                          <div style={{ fontSize: 9, color: T3, marginBottom: 3 }}>{label}</div>
+                          <div style={{ fontSize: 14, fontWeight: 600, color }}>{value.toFixed(1)}d</div>
+                        </div>
+                      ))}
                     </div>
                   </div>
                 )}
@@ -2926,7 +2911,13 @@ export default function App() {
           {analyticsPage === "performance" && (<>
           {queueStatus && (
             <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "12px 14px", marginTop: 16 }}>
-              <div style={{ fontSize: 10, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, marginBottom: 8 }}>Trade queue</div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <div style={{ fontSize: 10, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Trade queue</div>
+                <button onClick={() => setQueueLogOpen(v => !v)}
+                  style={{ background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 4, color: BLUE, fontSize: 8, fontWeight: 800, letterSpacing: .4, padding: "3px 7px", cursor: "pointer" }}>
+                  {queueLogOpen ? "HIDE" : "VIEW"}
+                </button>
+              </div>
               <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
                 <span style={{ fontSize: 11, color: T2 }}>In queue</span>
                 <span style={{ fontSize: 11, color: T1 }}>{queueStatus.available_count}</span>
@@ -2939,6 +2930,17 @@ export default function App() {
                 <span style={{ fontSize: 11, color: T2 }}>Fallback <span style={{ fontSize: 9, color: T3 }}>(1% of portfolio)</span></span>
                 <span style={{ fontSize: 11, color: T3, fontFamily: "'DM Mono',monospace" }}>${queueStatus.default_fallback?.toFixed(2)}</span>
               </div>
+              {queueLogOpen && (
+                <div style={{ marginTop: 10, borderTop: `1px solid ${BORDER}`, paddingTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+                  {(queueStatus.recent_entries || []).slice(0, 100).map((entry, i) => (
+                    <div key={`${entry.source_trade_id || "queue"}_${i}`} style={{ display: "grid", gridTemplateColumns: "auto 1fr auto", gap: 8, alignItems: "center", fontSize: 9 }}>
+                      <span style={{ color: entry.consumed ? T3 : GREEN, fontWeight: 800 }}>{entry.consumed ? "used" : "next"}</span>
+                      <span style={{ color: T3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.source_trade_id || "fallback"}</span>
+                      <span style={{ color: T1, fontFamily: "'DM Mono',monospace" }}>${Number(entry.amount || 0).toFixed(2)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
@@ -3217,14 +3219,21 @@ export default function App() {
 
           <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8, marginBottom: 10 }}>Performance</div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
-            {[["Win rate", winRate !== null ? winRate + "%" : "—", winRate >= 60 ? GREEN : winRate >= 45 ? AMBER : T2],
-              ["Predictions", predictions.length, T1], ["Resolved", resolved.length, T2],
-            ].map(([label, value, color]) => (
-              <div key={label} style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px" }}>
-                <div style={{ fontSize: 8, color: T3, textTransform: "uppercase", letterSpacing: .5, marginBottom: 3, fontWeight: 600 }}>{label}</div>
-                <div style={{ fontSize: 18, fontWeight: 700, color: color }}>{value}</div>
-              </div>
-            ))}
+            {(() => {
+              const closed = virtualTrades.filter(t => t.outcome !== "open");
+              const hits = closed.filter(t => t.outcome === "hit");
+              const brainWinRate = closed.length ? Math.round(hits.length / closed.length * 100) : null;
+              return [
+                ["Win rate", brainWinRate !== null ? brainWinRate + "%" : "-", brainWinRate >= 60 ? GREEN : brainWinRate >= 45 ? AMBER : T2],
+                ["Trades", virtualTrades.length, T1],
+                ["Closed", closed.length, T2],
+              ].map(([label, value, color]) => (
+                <div key={label} style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px" }}>
+                  <div style={{ fontSize: 8, color: T3, textTransform: "uppercase", letterSpacing: .5, marginBottom: 3, fontWeight: 600 }}>{label}</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: color }}>{value}</div>
+                </div>
+              ));
+            })()}
           </div>
         </div>
       )}

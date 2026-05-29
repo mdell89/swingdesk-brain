@@ -3715,29 +3715,29 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
             }
 
             nn_conf = nn_score_ticker(synthetic, "long")
-            if nn_conf < NN_CONFIDENCE_FLOOR:
-                continue
-
             scored.append({
                 **base,
                 "long_conf": nn_conf,
                 "long_reasoning": f"NN confidence {nn_conf}% from shared scan",
                 "crude_conf": base.get("long_conf"),
                 "nn_score": nn_conf,
+                "nn_executable": nn_conf >= NN_CONFIDENCE_FLOOR,
             })
 
         scored.sort(key=lambda x: x["long_conf"], reverse=True)
-        top_picks = scored[:MAX_LONG_PICKS]
+        qualified = [s for s in scored if s.get("nn_executable")]
+        top_picks = (qualified or scored)[:MAX_LONG_PICKS]
         result = {
             "scan_type": f"nn_shared_{scan_type}",
             "scan_time": current_time_cst().isoformat(),
             "recommended_longs": top_picks,
             "recommended_shorts": [],
             "total_scanned": len(scored_stocks),
-            "qualified_count": len(scored),
+            "qualified_count": len(qualified),
+            "ranked_count": len(scored),
             "picks": len(top_picks),
             "source": "shared_comprehensive_scan",
-            "message": "No NN picks qualified above threshold" if not top_picks else None,
+            "message": "No NN picks qualified above threshold; showing top Nova-ranked shared-snapshot candidates" if top_picks and not qualified else ("No shared-snapshot candidates available for Nova" if not top_picks else None),
         }
 
         db = get_database()
@@ -3749,11 +3749,11 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
             scan_type=f"shared_{scan_type}",
             finished_at=current_time_cst().isoformat(),
             total_scanned=len(scored_stocks),
-            qualified=len(scored),
+            qualified=len(qualified),
             picks=len(top_picks),
             error=None,
         )
-        log.info(f"Shared NN scoring: {len(top_picks)} picks, {len(scored)} qualified from {len(scored_stocks)} scanned")
+        log.info(f"Shared NN scoring: {len(top_picks)} picks, {len(qualified)} qualified, {len(scored)} ranked from {len(scored_stocks)} scanned")
         return result
     except Exception as e:
         log.error(f"Shared NN scoring failed: {e}")
@@ -4236,7 +4236,8 @@ def execute_nn_opening_positions(trigger="scheduled", buy_time="08:45:00"):
             return record_nn_open_execution_status(status)
 
         picks = json.loads(cached["value"])
-        all_picks = (picks.get("recommended_longs") or picks.get("longs") or [])[:MAX_LONG_PICKS]
+        cached_longs = (picks.get("recommended_longs") or picks.get("longs") or [])
+        all_picks = [p for p in cached_longs if p.get("nn_executable", True)][:MAX_LONG_PICKS]
         status["cached_pick_count"] = len(all_picks)
 
         if not all_picks:
@@ -5025,8 +5026,47 @@ def run_self_audit():
                 "summary": result.get("summary", ""),
                 "confidence": result.get("confidence", "medium")}
     except Exception as error:
-        log.error(f"Audit error: {error}")
-        return {"success": False, "error": str(error)}
+        log.error(f"Claude audit error, using deterministic local audit fallback: {error}")
+        fallback_summary = "Local audit recorded because Claude was unavailable; weights held steady until the next successful LLM audit."
+        database = get_database()
+        ts = current_time_cst().isoformat()
+        database.execute("""
+            INSERT INTO audit_log (timestamp, weights_before, weights_after, reasoning, summary,
+            total_predictions, resolved_count, hit_count, miss_count, win_rate)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, [ts, json.dumps(current_weights), json.dumps(current_weights),
+              json.dumps([fallback_summary, f"Claude audit unavailable: {str(error)[:160]}"]),
+              fallback_summary, total_predictions, len(resolved_predictions), len(hit_predictions),
+              len(miss_predictions), win_rate])
+        database.execute("""
+            INSERT INTO weights_history (timestamp, rsi_momentum, volume_surge,
+            overnight_gap_probability, earnings_catalyst, support_resistance,
+            relative_strength, sector_relative_strength, vwap_reclaim, volatility_squeeze,
+            win_rate, total_resolved)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """, [ts,
+              current_weights.get("rsi_momentum", 0),
+              current_weights.get("volume_surge", 0),
+              current_weights.get("overnight_gap_probability", 0),
+              current_weights.get("earnings_catalyst", 0),
+              current_weights.get("support_resistance", 0),
+              current_weights.get("relative_strength", 0),
+              current_weights.get("sector_relative_strength", 0),
+              current_weights.get("vwap_reclaim", 0),
+              current_weights.get("volatility_squeeze", 0),
+              win_rate, len(resolved_predictions)])
+        database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_audit',?)", [ts])
+        database.commit()
+        database.close()
+        return {
+            "success": True,
+            "fallback": True,
+            "weights": current_weights,
+            "reasoning": [fallback_summary],
+            "summary": fallback_summary,
+            "confidence": "low",
+            "llm_error": str(error),
+        }
 
 # ── SCHEDULER ─────────────────────────────────────────────────────────────────
 def run_scheduler():
@@ -6928,10 +6968,15 @@ def api_nn_train_now():
 
 @app.route("/api/nn-scan-now", methods=["POST"])
 def api_nn_scan_now():
-    """Manually trigger NN scan in the background. Returns immediately."""
+    """Compatibility endpoint: refresh the shared comprehensive snapshot, including Nova scoring."""
     try:
-        status = start_nn_scan_background(scan_type="manual")
-        return jsonify({"success": True, "started": status.get("status") == "running", "status": status})
+        result = run_comprehensive_scan(scan_type="manual_shared_nova")
+        return jsonify({
+            "success": True,
+            "shared_scan": True,
+            "nn_picks": result.get("nn_picks", {}),
+            "total_scanned": result.get("total_scanned", 0),
+        })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
