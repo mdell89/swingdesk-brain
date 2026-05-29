@@ -745,6 +745,49 @@ def initialize_database():
             error TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS strategy_variants (
+            id TEXT PRIMARY KEY,
+            strategy TEXT NOT NULL,
+            brain TEXT NOT NULL,
+            execution_time TEXT,
+            selection_mode TEXT,
+            exit_mode TEXT,
+            label TEXT NOT NULL,
+            status TEXT DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS signal_observations (
+            id TEXT PRIMARY KEY,
+            scan_event_id INTEGER,
+            scan_time TEXT NOT NULL,
+            scan_type TEXT,
+            strategy TEXT NOT NULL,
+            variant_id TEXT NOT NULL,
+            brain TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            direction TEXT DEFAULT 'long',
+            sector TEXT,
+            price REAL,
+            confidence INTEGER,
+            confidence_bin TEXT,
+            expected_move REAL,
+            selected INTEGER DEFAULT 0,
+            executable INTEGER DEFAULT 0,
+            rank INTEGER,
+            signal_scores TEXT DEFAULT '{}',
+            signal_values TEXT DEFAULT '{}',
+            fired_signals TEXT DEFAULT '[]',
+            confluence_count INTEGER DEFAULT 0,
+            confluence_methods TEXT DEFAULT '[]',
+            regime_context TEXT DEFAULT '{}',
+            context_json TEXT DEFAULT '{}',
+            outcome TEXT DEFAULT 'pending',
+            actual_move REAL,
+            resolved_at TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS provider_health (
             provider TEXT PRIMARY KEY,
             status TEXT DEFAULT 'active',
@@ -927,6 +970,11 @@ def initialize_database():
             sell_time TEXT,
             logged_at TEXT
         );
+
+        CREATE INDEX IF NOT EXISTS idx_signal_observations_scan ON signal_observations(scan_event_id);
+        CREATE INDEX IF NOT EXISTS idx_signal_observations_variant ON signal_observations(strategy, variant_id, scan_time);
+        CREATE INDEX IF NOT EXISTS idx_signal_observations_ticker ON signal_observations(ticker, scan_time);
+        CREATE INDEX IF NOT EXISTS idx_signal_observations_confidence ON signal_observations(confidence_bin, outcome);
     """)
 
     # Add new columns to weights_history if upgrading from earlier schema
@@ -995,6 +1043,22 @@ def initialize_database():
             database.execute(f"ALTER TABLE nn_virtual_trades ADD COLUMN {column_definition}")
         except:
             pass  # Column already exists
+
+    now_iso = current_time_cst().isoformat()
+    default_variants = [
+        ("swingdesk_vector_0845_all", "SwingDesk", "Vector", "08:45", "All", "time_or_thesis", "SwingDesk / Vector / 8:45 / All"),
+        ("swingdesk_nova_0845_all", "SwingDesk", "Nova", "08:45", "All", "time_or_thesis", "SwingDesk / Nova / 8:45 / All"),
+        ("swingdesk_nova_0845_top1", "SwingDesk", "Nova", "08:45", "Top 1", "time_or_thesis", "SwingDesk / Nova / 8:45 / Top 1"),
+    ]
+    for variant in default_variants:
+        try:
+            database.execute("""
+                INSERT OR IGNORE INTO strategy_variants
+                (id, strategy, brain, execution_time, selection_mode, exit_mode, label, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+            """, [*variant, now_iso, now_iso])
+        except Exception as e:
+            log.debug(f"strategy variant seed skipped: {e}")
 
     # Seed default signal weights if not already set
     existing_weights = database.execute("SELECT value FROM app_state WHERE key='weights'").fetchone()
@@ -1515,6 +1579,171 @@ def attach_confidence_evidence(items, confidence_key="long_conf", cache=None):
     for item in items or []:
         item["evidence"] = evidence_for_confidence(item.get(confidence_key), cache)
     return items
+
+def build_regime_context(scan_type=None):
+    """Small, structured market context placeholder for later Aegis analysis."""
+    now = current_time_cst()
+    return {
+        "date": now.strftime("%Y-%m-%d"),
+        "weekday": now.strftime("%A"),
+        "time_cst": now.strftime("%H:%M"),
+        "scan_type": scan_type,
+        "market_open": is_market_open(),
+        "extended_hours": is_extended_hours(),
+    }
+
+def build_observation_context(stock_data=None, queue_locked=False):
+    """Context-only data; these fields are logged but do not affect scoring."""
+    stock_data = stock_data or {}
+    return {
+        "queue_locked": bool(queue_locked),
+        "data_source": stock_data.get("source", "unknown"),
+        "news_article_count": int(stock_data.get("news_article_count") or 0),
+        "news_sentiment_score": float(stock_data.get("news_sentiment_score") or 0),
+        "weather_context": None,
+    }
+
+def insert_signal_observations(rows):
+    """Bulk insert signal observation rows without changing scoring behavior."""
+    if not rows:
+        return 0
+    db = get_database()
+    inserted = 0
+    for row in rows:
+        try:
+            db.execute("""
+                INSERT OR REPLACE INTO signal_observations
+                (id, scan_event_id, scan_time, scan_type, strategy, variant_id, brain,
+                 ticker, direction, sector, price, confidence, confidence_bin, expected_move,
+                 selected, executable, rank, signal_scores, signal_values, fired_signals,
+                 confluence_count, confluence_methods, regime_context, context_json,
+                 outcome, actual_move, resolved_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                row.get("id"),
+                row.get("scan_event_id"),
+                row.get("scan_time"),
+                row.get("scan_type"),
+                row.get("strategy", "SwingDesk"),
+                row.get("variant_id"),
+                row.get("brain"),
+                row.get("ticker"),
+                row.get("direction", "long"),
+                row.get("sector"),
+                row.get("price"),
+                row.get("confidence"),
+                row.get("confidence_bin"),
+                row.get("expected_move"),
+                int(bool(row.get("selected"))),
+                int(bool(row.get("executable"))),
+                row.get("rank"),
+                json.dumps(row.get("signal_scores") or {}),
+                json.dumps(row.get("signal_values") or {}),
+                json.dumps(row.get("fired_signals") or []),
+                int(row.get("confluence_count") or 0),
+                json.dumps(row.get("confluence_methods") or []),
+                json.dumps(row.get("regime_context") or {}),
+                json.dumps(row.get("context_json") or {}),
+                row.get("outcome", "pending"),
+                row.get("actual_move"),
+                row.get("resolved_at"),
+            ])
+            inserted += 1
+        except Exception as exc:
+            log.debug(f"signal observation skipped for {row.get('ticker')}: {exc}")
+    db.commit()
+    db.close()
+    return inserted
+
+def log_vector_signal_observations(scan_event_id, scan_type, price_data, scored_stocks, rsi_values,
+                                   earnings_soon, weights, selected_tickers=None, executable_tickers=None,
+                                   queue_locked=False):
+    """Log one Vector observation per scored ticker from the shared scan snapshot."""
+    scan_time = current_time_cst().isoformat()
+    regime = build_regime_context(scan_type)
+    selected_sequence = list(selected_tickers or [])
+    selected_set = set(selected_sequence)
+    executable_tickers = set(executable_tickers or [])
+    ranked = {ticker: i + 1 for i, ticker in enumerate(selected_sequence)}
+    rows = []
+    for item in scored_stocks or []:
+        ticker = item.get("ticker")
+        if not ticker or ticker not in price_data:
+            continue
+        stock_data = price_data.get(ticker, {})
+        rsi = rsi_values.get(ticker, item.get("rsi", 50.0))
+        scores, fired, values = compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, "long")
+        _, _, conf_bin = confidence_evidence_bin(item.get("long_conf"))
+        rows.append({
+            "id": f"{scan_event_id}:swingdesk_vector_0845_all:{ticker}:long",
+            "scan_event_id": scan_event_id,
+            "scan_time": scan_time,
+            "scan_type": scan_type,
+            "strategy": "SwingDesk",
+            "variant_id": "swingdesk_vector_0845_all",
+            "brain": "Vector",
+            "ticker": ticker,
+            "direction": "long",
+            "sector": item.get("sector"),
+            "price": item.get("price"),
+            "confidence": item.get("long_conf"),
+            "confidence_bin": conf_bin,
+            "expected_move": item.get("long_move"),
+            "selected": ticker in selected_set,
+            "executable": ticker in executable_tickers,
+            "rank": ranked.get(ticker),
+            "signal_scores": scores,
+            "signal_values": values,
+            "fired_signals": fired,
+            "confluence_count": item.get("confluence_count", 0),
+            "confluence_methods": item.get("confluence_methods", []),
+            "regime_context": regime,
+            "context_json": build_observation_context(stock_data, queue_locked),
+        })
+    return insert_signal_observations(rows)
+
+def log_nova_signal_observations(scan_event_id, scan_type, scored_rows, price_data, queue_locked=False):
+    """Log Nova observations from the same shared scan snapshot."""
+    if not scan_event_id:
+        return 0
+    scan_time = current_time_cst().isoformat()
+    regime = build_regime_context(scan_type)
+    selected = scored_rows[:MAX_LONG_PICKS] if scored_rows else []
+    selected_tickers = {row.get("ticker") for row in selected}
+    executable_tickers = {row.get("ticker") for row in scored_rows or [] if row.get("nn_executable")}
+    ranked = {row.get("ticker"): i + 1 for i, row in enumerate(scored_rows or [])}
+    rows = []
+    for row in scored_rows or []:
+        ticker = row.get("ticker")
+        stock_data = price_data.get(ticker, {}) if ticker else {}
+        _, _, conf_bin = confidence_evidence_bin(row.get("long_conf"))
+        rows.append({
+            "id": f"{scan_event_id}:swingdesk_nova_0845_all:{ticker}:long",
+            "scan_event_id": scan_event_id,
+            "scan_time": scan_time,
+            "scan_type": scan_type,
+            "strategy": "SwingDesk",
+            "variant_id": "swingdesk_nova_0845_all",
+            "brain": "Nova",
+            "ticker": ticker,
+            "direction": "long",
+            "sector": row.get("sector"),
+            "price": row.get("price"),
+            "confidence": row.get("long_conf"),
+            "confidence_bin": conf_bin,
+            "expected_move": row.get("long_move"),
+            "selected": ticker in selected_tickers,
+            "executable": ticker in executable_tickers,
+            "rank": ranked.get(ticker),
+            "signal_scores": row.get("signal_scores_for_observation") or {},
+            "signal_values": row.get("signal_values_for_observation") or {},
+            "fired_signals": row.get("fired_signals_for_observation") or [],
+            "confluence_count": row.get("confluence_count", 0),
+            "confluence_methods": row.get("confluence_methods", []),
+            "regime_context": regime,
+            "context_json": build_observation_context(stock_data, queue_locked),
+        })
+    return insert_signal_observations(rows)
 
 def get_nn_scan_status_payload():
     """Return shared Nova scan status with stale running states marked clearly."""
@@ -3733,6 +3962,19 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
     for pick in recommended_longs[:MAX_LONG_PICKS]:
         pick["news"] = price_data_news.get(pick["ticker"], [])
 
+    vector_observations = log_vector_signal_observations(
+        scan_event_id,
+        scan_type,
+        price_data,
+        scored_stocks,
+        rsi_values,
+        earnings_soon,
+        weights,
+        selected_tickers=[s["ticker"] for s in recommended_longs[:MAX_LONG_PICKS]],
+        executable_tickers=[s["ticker"] for s in recommended_longs],
+        queue_locked=queue_is_locked,
+    )
+
     evidence_cache = build_confidence_evidence_cache()
     attach_confidence_evidence(recommended_longs, "long_conf", evidence_cache)
     attach_confidence_evidence(recommended_shorts, "short_conf", evidence_cache)
@@ -3748,12 +3990,16 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
         "queue_locked": bool(queue_is_locked),
         "execution_locked": bool(queue_is_locked),
     }
-    nn_scan_result = build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soon, scan_type)
+    nn_scan_result = build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soon, scan_type, scan_event_id, queue_is_locked)
     scan_result["nn_picks"] = {
         "picks": nn_scan_result.get("picks", len(nn_scan_result.get("recommended_longs", []) or [])),
         "qualified_count": nn_scan_result.get("qualified_count", 0),
         "source": nn_scan_result.get("source", "shared_comprehensive_scan"),
         "error": nn_scan_result.get("error"),
+    }
+    scan_result["observations"] = {
+        "vector": vector_observations,
+        "nova": nn_scan_result.get("observations_logged", 0),
     }
 
     # Cache picks and log scan
@@ -3827,7 +4073,7 @@ def get_cached_picks():
     return None
 
 # ── NEURAL NETWORK SCAN ──────────────────────────────────────────────────────
-def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soon, scan_type="shared"):
+def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soon, scan_type="shared", scan_event_id=None, queue_locked=False):
     """
     Score NN picks from the already-built comprehensive scan snapshot.
     This avoids a second universe fetch and keeps crude + NN on the same data.
@@ -3882,12 +4128,16 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
                 "crude_conf": base.get("long_conf"),
                 "nn_score": nn_conf,
                 "nn_executable": nn_conf >= NN_CONFIDENCE_FLOOR,
+                "signal_scores_for_observation": sig_scores,
+                "signal_values_for_observation": sig_values,
+                "fired_signals_for_observation": fired,
             })
 
         scored.sort(key=lambda x: x["long_conf"], reverse=True)
         qualified = [s for s in scored if s.get("nn_executable")]
         top_picks = (qualified or scored)[:MAX_LONG_PICKS]
         attach_confidence_evidence(top_picks, "long_conf")
+        observations_logged = log_nova_signal_observations(scan_event_id, scan_type, scored, price_data, queue_locked)
         result = {
             "scan_type": f"nn_shared_{scan_type}",
             "scan_time": current_time_cst().isoformat(),
@@ -3898,6 +4148,7 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
             "ranked_count": len(scored),
             "picks": len(top_picks),
             "source": "shared_comprehensive_scan",
+            "observations_logged": observations_logged,
             "message": "No NN picks qualified above threshold; showing top Nova-ranked shared-snapshot candidates" if top_picks and not qualified else ("No shared-snapshot candidates available for Nova" if not top_picks else None),
         }
 
@@ -5881,6 +6132,114 @@ def api_method_stats():
     except Exception as e:
         log.error(f"method-stats error: {e}")
         return jsonify({"methods": {}, "weights_history": []}), 500
+
+@app.route("/api/strategy-variants")
+def api_strategy_variants():
+    """Return registered strategy/model/execution variants."""
+    try:
+        db = get_database()
+        rows = [dict(r) for r in db.execute("""
+            SELECT sv.*,
+                   COUNT(so.id) AS observations,
+                   SUM(CASE WHEN so.selected=1 THEN 1 ELSE 0 END) AS selected_observations,
+                   MAX(so.scan_time) AS last_observed_at
+            FROM strategy_variants sv
+            LEFT JOIN signal_observations so ON so.variant_id = sv.id
+            GROUP BY sv.id
+            ORDER BY sv.strategy, sv.brain, sv.execution_time, sv.selection_mode
+        """).fetchall()]
+        db.close()
+        return jsonify(rows)
+    except Exception as e:
+        log.error(f"strategy-variants error: {e}")
+        return jsonify([]), 500
+
+@app.route("/api/evidence-stats")
+def api_evidence_stats():
+    """
+    Return evidence/calibration foundation stats.
+    Confidence-bin outcome stats come from resolved predictions; observation
+    coverage comes from the new all-scanned-ticker ledger.
+    """
+    try:
+        evidence_bins = build_confidence_evidence_cache()
+        db = get_database()
+        observation_total = db.execute("SELECT COUNT(*) AS n FROM signal_observations").fetchone()["n"]
+        observation_selected = db.execute("SELECT COUNT(*) AS n FROM signal_observations WHERE selected=1").fetchone()["n"]
+        observation_executable = db.execute("SELECT COUNT(*) AS n FROM signal_observations WHERE executable=1").fetchone()["n"]
+        last_observation = db.execute("SELECT MAX(scan_time) AS ts FROM signal_observations").fetchone()["ts"]
+        by_variant = [dict(r) for r in db.execute("""
+            SELECT variant_id, brain,
+                   COUNT(*) AS observations,
+                   SUM(CASE WHEN selected=1 THEN 1 ELSE 0 END) AS selected,
+                   SUM(CASE WHEN executable=1 THEN 1 ELSE 0 END) AS executable,
+                   MAX(scan_time) AS last_observed_at
+            FROM signal_observations
+            GROUP BY variant_id, brain
+            ORDER BY observations DESC
+        """).fetchall()]
+        by_confidence = [dict(r) for r in db.execute("""
+            SELECT confidence_bin,
+                   COUNT(*) AS observations,
+                   SUM(CASE WHEN selected=1 THEN 1 ELSE 0 END) AS selected,
+                   SUM(CASE WHEN executable=1 THEN 1 ELSE 0 END) AS executable
+            FROM signal_observations
+            GROUP BY confidence_bin
+            ORDER BY MIN(confidence)
+        """).fetchall()]
+        db.close()
+
+        return jsonify({
+            "confidence_bins": list(evidence_bins.values()),
+            "observation_coverage": {
+                "total": observation_total,
+                "selected": observation_selected,
+                "executable": observation_executable,
+                "last_observed_at": last_observation,
+                "by_variant": by_variant,
+                "by_confidence": by_confidence,
+            },
+            "note": "Evidence stats are observational context only; they do not change Vector or Nova scoring.",
+        })
+    except Exception as e:
+        log.error(f"evidence-stats error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/signal-observations")
+def api_signal_observations():
+    """Return recent raw scan observations for audit/debug/Aegis research."""
+    try:
+        limit = min(max(int(request.args.get("limit", 100)), 1), 500)
+        variant_id = request.args.get("variant_id")
+        ticker = request.args.get("ticker")
+        where = []
+        params = []
+        if variant_id:
+            where.append("variant_id=?")
+            params.append(variant_id)
+        if ticker:
+            where.append("ticker=?")
+            params.append(ticker.upper())
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        db = get_database()
+        rows = [dict(r) for r in db.execute(f"""
+            SELECT *
+            FROM signal_observations
+            {where_sql}
+            ORDER BY scan_time DESC, rank IS NULL, rank ASC, confidence DESC
+            LIMIT ?
+        """, params + [limit]).fetchall()]
+        db.close()
+        for row in rows:
+            for key in ("signal_scores", "signal_values", "fired_signals", "confluence_methods", "regime_context", "context_json"):
+                try:
+                    row[key] = json.loads(row[key] or "{}")
+                except Exception:
+                    row[key] = [] if key in ("fired_signals", "confluence_methods") else {}
+        return jsonify(rows)
+    except Exception as e:
+        log.error(f"signal-observations error: {e}")
+        return jsonify([]), 500
 
 @app.route("/api/position-checks/<position_id>")
 def api_position_checks(position_id):
