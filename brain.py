@@ -788,6 +788,91 @@ def initialize_database():
             resolved_at TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS variant_portfolios (
+            variant_id TEXT PRIMARY KEY,
+            starting_cash REAL DEFAULT 1000.0,
+            cash REAL DEFAULT 1000.0,
+            equity REAL DEFAULT 1000.0,
+            realized_pnl REAL DEFAULT 0.0,
+            open_value REAL DEFAULT 0.0,
+            open_count INTEGER DEFAULT 0,
+            closed_count INTEGER DEFAULT 0,
+            win_count INTEGER DEFAULT 0,
+            loss_count INTEGER DEFAULT 0,
+            max_equity REAL DEFAULT 1000.0,
+            max_drawdown_pct REAL DEFAULT 0.0,
+            lifecycle_status TEXT DEFAULT 'active',
+            recommended_status TEXT DEFAULT 'active',
+            lifecycle_reasons TEXT DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS variant_signal_weights (
+            variant_id TEXT PRIMARY KEY,
+            brain TEXT NOT NULL,
+            weights_json TEXT NOT NULL,
+            baseline_weights_json TEXT NOT NULL,
+            learning_revision INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS variant_virtual_trades (
+            id TEXT PRIMARY KEY,
+            variant_id TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            brain TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            direction TEXT DEFAULT 'long',
+            buy_date TEXT NOT NULL,
+            buy_time TEXT,
+            buy_price REAL,
+            invested_amount REAL,
+            current_value REAL,
+            confidence INTEGER,
+            expected_move REAL,
+            outcome TEXT DEFAULT 'open',
+            sell_date TEXT,
+            sell_time TEXT,
+            sell_price REAL,
+            actual_move REAL,
+            gross_pnl REAL,
+            net_pnl REAL,
+            sell_reason TEXT,
+            sector TEXT,
+            reasoning TEXT,
+            signal_scores TEXT DEFAULT '{}',
+            source_scan_time TEXT,
+            source_rank INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS variant_equity_points (
+            id TEXT PRIMARY KEY,
+            variant_id TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            equity REAL NOT NULL,
+            cash REAL,
+            open_value REAL,
+            realized_pnl REAL,
+            open_count INTEGER DEFAULT 0,
+            closed_count INTEGER DEFAULT 0,
+            note TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS variant_lifecycle_reviews (
+            id TEXT PRIMARY KEY,
+            variant_id TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            recommended_status TEXT NOT NULL,
+            current_status TEXT,
+            reasons TEXT DEFAULT '[]',
+            metrics_json TEXT DEFAULT '{}',
+            applied INTEGER DEFAULT 0
+        );
+
         CREATE TABLE IF NOT EXISTS provider_health (
             provider TEXT PRIMARY KEY,
             status TEXT DEFAULT 'active',
@@ -975,6 +1060,9 @@ def initialize_database():
         CREATE INDEX IF NOT EXISTS idx_signal_observations_variant ON signal_observations(strategy, variant_id, scan_time);
         CREATE INDEX IF NOT EXISTS idx_signal_observations_ticker ON signal_observations(ticker, scan_time);
         CREATE INDEX IF NOT EXISTS idx_signal_observations_confidence ON signal_observations(confidence_bin, outcome);
+        CREATE INDEX IF NOT EXISTS idx_variant_trades_variant ON variant_virtual_trades(variant_id, outcome);
+        CREATE INDEX IF NOT EXISTS idx_variant_trades_ticker ON variant_virtual_trades(ticker, buy_date);
+        CREATE INDEX IF NOT EXISTS idx_variant_equity_variant ON variant_equity_points(variant_id, timestamp);
     """)
 
     # Add new columns to weights_history if upgrading from earlier schema
@@ -1047,8 +1135,33 @@ def initialize_database():
     now_iso = current_time_cst().isoformat()
     default_variants = [
         ("swingdesk_vector_0845_all", "SwingDesk", "Vector", "08:45", "All", "time_or_thesis", "SwingDesk / Vector / 8:45 / All"),
+        ("swingdesk_vector_0845_top1", "SwingDesk", "Vector", "08:45", "Top 1", "time_or_thesis", "SwingDesk / Vector / 8:45 / Top 1"),
+        ("swingdesk_vector_0845_top3", "SwingDesk", "Vector", "08:45", "Top 3", "time_or_thesis", "SwingDesk / Vector / 8:45 / Top 3"),
         ("swingdesk_nova_0845_all", "SwingDesk", "Nova", "08:45", "All", "time_or_thesis", "SwingDesk / Nova / 8:45 / All"),
         ("swingdesk_nova_0845_top1", "SwingDesk", "Nova", "08:45", "Top 1", "time_or_thesis", "SwingDesk / Nova / 8:45 / Top 1"),
+        ("swingdesk_nova_0845_top3", "SwingDesk", "Nova", "08:45", "Top 3", "time_or_thesis", "SwingDesk / Nova / 8:45 / Top 3"),
+        ("darvas_vector_reg_all", "Darvas", "Vector", "reg", "All", "strategy_exit", "Darvas / Vector / Reg / All"),
+        ("darvas_nova_reg_all", "Darvas", "Nova", "reg", "All", "strategy_exit", "Darvas / Nova / Reg / All"),
+        ("gap_go_vector_reg_all", "Gap & Go", "Vector", "reg", "All", "strategy_exit", "Gap & Go / Vector / Reg / All"),
+        ("gap_go_nova_reg_all", "Gap & Go", "Nova", "reg", "All", "strategy_exit", "Gap & Go / Nova / Reg / All"),
+        ("vwap_reclaim_vector_reg_all", "VWAP Reclaim", "Vector", "reg", "All", "strategy_exit", "VWAP Reclaim / Vector / Reg / All"),
+        ("vwap_reclaim_nova_reg_all", "VWAP Reclaim", "Nova", "reg", "All", "strategy_exit", "VWAP Reclaim / Nova / Reg / All"),
+        ("bullish_mean_reversion_vector_reg_all", "Bullish Mean Reversion", "Vector", "reg", "All", "strategy_exit", "Bullish Mean Reversion / Vector / Reg / All"),
+        ("bullish_mean_reversion_nova_reg_all", "Bullish Mean Reversion", "Nova", "reg", "All", "strategy_exit", "Bullish Mean Reversion / Nova / Reg / All"),
+        ("donchian_vector_reg_all", "Donchian", "Vector", "reg", "All", "strategy_exit", "Donchian / Vector / Reg / All"),
+        ("donchian_nova_reg_all", "Donchian", "Nova", "reg", "All", "strategy_exit", "Donchian / Nova / Reg / All"),
+        ("inside_day_vector_reg_all", "Inside Day", "Vector", "reg", "All", "strategy_exit", "Inside Day / Vector / Reg / All"),
+        ("inside_day_nova_reg_all", "Inside Day", "Nova", "reg", "All", "strategy_exit", "Inside Day / Nova / Reg / All"),
+        ("nr7_vector_reg_all", "NR7", "Vector", "reg", "All", "strategy_exit", "NR7 / Vector / Reg / All"),
+        ("nr7_nova_reg_all", "NR7", "Nova", "reg", "All", "strategy_exit", "NR7 / Nova / Reg / All"),
+        ("bull_flag_vector_reg_all", "Bull Flag", "Vector", "reg", "All", "strategy_exit", "Bull Flag / Vector / Reg / All"),
+        ("bull_flag_nova_reg_all", "Bull Flag", "Nova", "reg", "All", "strategy_exit", "Bull Flag / Nova / Reg / All"),
+        ("pocket_pivot_vector_reg_all", "Pocket Pivot", "Vector", "reg", "All", "strategy_exit", "Pocket Pivot / Vector / Reg / All"),
+        ("pocket_pivot_nova_reg_all", "Pocket Pivot", "Nova", "reg", "All", "strategy_exit", "Pocket Pivot / Nova / Reg / All"),
+        ("sr_breakout_vector_reg_all", "S&R Breakout", "Vector", "reg", "All", "strategy_exit", "S&R Breakout / Vector / Reg / All"),
+        ("sr_breakout_nova_reg_all", "S&R Breakout", "Nova", "reg", "All", "strategy_exit", "S&R Breakout / Nova / Reg / All"),
+        ("vol_squeeze_breakout_vector_reg_all", "Vol Squeeze Breakout", "Vector", "reg", "All", "strategy_exit", "Vol Squeeze Breakout / Vector / Reg / All"),
+        ("vol_squeeze_breakout_nova_reg_all", "Vol Squeeze Breakout", "Nova", "reg", "All", "strategy_exit", "Vol Squeeze Breakout / Nova / Reg / All"),
     ]
     for variant in default_variants:
         try:
@@ -1060,20 +1173,40 @@ def initialize_database():
         except Exception as e:
             log.debug(f"strategy variant seed skipped: {e}")
 
+    baseline_weights = canonical_signal_weights()
+    database.execute(
+        "INSERT OR IGNORE INTO app_state VALUES ('canonical_signal_weights', ?)",
+        [json.dumps(baseline_weights)]
+    )
+    variant_rows = database.execute("SELECT id, brain FROM strategy_variants").fetchall()
+    for row in variant_rows:
+        try:
+            database.execute("""
+                INSERT OR IGNORE INTO variant_portfolios
+                (variant_id, starting_cash, cash, equity, realized_pnl, open_value,
+                 open_count, closed_count, win_count, loss_count, max_equity,
+                 max_drawdown_pct, lifecycle_status, recommended_status, lifecycle_reasons,
+                 created_at, updated_at)
+                VALUES (?, 1000.0, 1000.0, 1000.0, 0.0, 0.0, 0, 0, 0, 0,
+                        1000.0, 0.0, 'active', 'active', '[]', ?, ?)
+            """, [row["id"], now_iso, now_iso])
+            database.execute("""
+                INSERT OR IGNORE INTO variant_signal_weights
+                (variant_id, brain, weights_json, baseline_weights_json, learning_revision, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 0, ?, ?)
+            """, [row["id"], row["brain"], json.dumps(baseline_weights), json.dumps(baseline_weights), now_iso, now_iso])
+            database.execute("""
+                INSERT OR IGNORE INTO variant_equity_points
+                (id, variant_id, timestamp, equity, cash, open_value, realized_pnl, open_count, closed_count, note)
+                VALUES (?, ?, ?, 1000.0, 1000.0, 0.0, 0.0, 0, 0, 'seed')
+            """, [f"{row['id']}_seed", row["id"], now_iso])
+        except Exception as e:
+            log.debug(f"variant universe seed skipped for {row['id']}: {e}")
+
     # Seed default signal weights if not already set
     existing_weights = database.execute("SELECT value FROM app_state WHERE key='weights'").fetchone()
     if not existing_weights:
-        default_weights = {
-            "rsi_momentum": 0.15,
-            "volume_surge": 0.15,
-            "overnight_gap_probability": 0.18,
-            "earnings_catalyst": 0.14,
-            "support_resistance": 0.13,
-            "relative_strength": 0.12,
-            "sector_relative_strength": 0.10,
-            "vwap_reclaim": 0.08,
-            "volatility_squeeze": 0.05,
-        }
+        default_weights = canonical_signal_weights()
         database.execute("INSERT INTO app_state VALUES ('weights',?)", [json.dumps(default_weights)])
     else:
         # Migrate existing weights: fill in any missing keys with defaults
@@ -1978,6 +2111,20 @@ def pct_from_baseline(price, baseline):
     except Exception:
         return None
 
+def canonical_signal_weights():
+    """Protected original signal-weight baseline used to seed every universe."""
+    return {
+        "rsi_momentum": 0.15,
+        "volume_surge": 0.15,
+        "overnight_gap_probability": 0.18,
+        "earnings_catalyst": 0.14,
+        "support_resistance": 0.13,
+        "relative_strength": 0.12,
+        "sector_relative_strength": 0.10,
+        "vwap_reclaim": 0.08,
+        "volatility_squeeze": 0.05,
+    }
+
 def build_entry_integrity(position, price_data):
     """Lightweight audit comparing stored entry against quote context."""
     buy_price = float(position.get("buy_price") or 0)
@@ -2036,6 +2183,129 @@ def monitor_baselines(position, price_data, pnl_percent):
         "pct_entry": pnl_percent,
         "entry_integrity": build_entry_integrity(position, price_data),
     }
+
+def select_variant_picks(picks, selection_mode):
+    """Apply a variant selection mode to a ranked pick list."""
+    mode = (selection_mode or "All").lower().replace(" ", "")
+    if mode in ("top1", "1"):
+        return picks[:1]
+    if mode in ("top3", "3"):
+        return picks[:3]
+    return picks
+
+def pick_confidence_and_move(pick, brain="Vector"):
+    confidence = pick.get("long_conf") or pick.get("confidence") or pick.get("nn_score") or 0
+    expected_move = pick.get("long_move") or pick.get("expected_move") or 0
+    try:
+        confidence = int(round(float(confidence)))
+    except Exception:
+        confidence = 0
+    try:
+        expected_move = float(expected_move or 0)
+    except Exception:
+        expected_move = 0.0
+    return confidence, expected_move
+
+def variant_investment_amount(portfolio):
+    """Small starting allocation that compounds independently per universe."""
+    equity = float(portfolio.get("equity") or 1000.0)
+    cash = float(portfolio.get("cash") or equity)
+    amount = max(10.0, round(equity * 0.01, 2))
+    return min(amount, max(cash, 0.0))
+
+def update_variant_portfolio(database, variant_id, note="snapshot"):
+    """Recalculate portfolio equity and lifecycle recommendation for one universe."""
+    portfolio = database.execute("SELECT * FROM variant_portfolios WHERE variant_id=?", [variant_id]).fetchone()
+    if not portfolio:
+        return None
+    open_rows = [dict(r) for r in database.execute(
+        "SELECT * FROM variant_virtual_trades WHERE variant_id=? AND outcome='open'", [variant_id]
+    ).fetchall()]
+    closed_rows = [dict(r) for r in database.execute(
+        "SELECT * FROM variant_virtual_trades WHERE variant_id=? AND outcome!='open'", [variant_id]
+    ).fetchall()]
+    cash = float(portfolio["cash"] or 0)
+    open_value = sum(float(r.get("current_value") or r.get("invested_amount") or 0) for r in open_rows)
+    realized_pnl = sum(float(r.get("net_pnl") if r.get("net_pnl") is not None else r.get("gross_pnl") or 0) for r in closed_rows)
+    equity = round(cash + open_value, 4)
+    max_equity = max(float(portfolio["max_equity"] or 1000.0), equity)
+    drawdown = 0.0 if max_equity <= 0 else round((max_equity - equity) / max_equity * 100, 2)
+    wins = [r for r in closed_rows if float(r.get("actual_move") or 0) > 0]
+    losses = [r for r in closed_rows if float(r.get("actual_move") or 0) <= 0]
+    recommended_status, reasons = recommend_variant_lifecycle(
+        closed_count=len(closed_rows),
+        win_count=len(wins),
+        equity=equity,
+        max_drawdown_pct=drawdown,
+    )
+    now = current_time_cst().isoformat()
+    database.execute("""
+        UPDATE variant_portfolios
+        SET equity=?, open_value=?, realized_pnl=?, open_count=?, closed_count=?,
+            win_count=?, loss_count=?, max_equity=?, max_drawdown_pct=?,
+            recommended_status=?, lifecycle_reasons=?, updated_at=?
+        WHERE variant_id=?
+    """, [equity, round(open_value, 4), round(realized_pnl, 4), len(open_rows), len(closed_rows),
+          len(wins), len(losses), max_equity, drawdown, recommended_status, json.dumps(reasons), now, variant_id])
+    point_id = f"{variant_id}_{int(time.time())}_{note}"
+    database.execute("""
+        INSERT OR REPLACE INTO variant_equity_points
+        (id, variant_id, timestamp, equity, cash, open_value, realized_pnl, open_count, closed_count, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [point_id, variant_id, now, equity, cash, round(open_value, 4), round(realized_pnl, 4),
+          len(open_rows), len(closed_rows), note])
+    if reasons:
+        database.execute("""
+            INSERT OR REPLACE INTO variant_lifecycle_reviews
+            (id, variant_id, timestamp, recommended_status, current_status, reasons, metrics_json, applied)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+        """, [
+            f"{variant_id}_{recommended_status}_{current_time_cst().strftime('%Y%m%d')}",
+            variant_id, now, recommended_status, portfolio["lifecycle_status"],
+            json.dumps(reasons),
+            json.dumps({"closed_count": len(closed_rows), "win_count": len(wins), "equity": equity, "max_drawdown_pct": drawdown}),
+        ])
+    return {
+        "variant_id": variant_id,
+        "equity": equity,
+        "open_count": len(open_rows),
+        "closed_count": len(closed_rows),
+        "recommended_status": recommended_status,
+        "lifecycle_reasons": reasons,
+    }
+
+def recommend_variant_lifecycle(closed_count, win_count, equity, max_drawdown_pct):
+    """Deterministic lifecycle flags; Aegis explains, user approves movement."""
+    reasons = []
+    win_rate = (win_count / closed_count * 100) if closed_count else None
+    status = "active"
+    if closed_count >= 75 and (win_rate < 38 or equity < 750 or max_drawdown_pct > 25):
+        status = "archive_candidate"
+    elif closed_count >= 50 and (win_rate < 40 or equity < 825 or max_drawdown_pct > 18):
+        status = "benched_recommended"
+    elif closed_count >= 30 and (win_rate < 45 or equity < 900 or max_drawdown_pct > 12):
+        status = "watchlist"
+    if win_rate is not None:
+        if closed_count >= 75 and win_rate < 38:
+            reasons.append(f"win rate {win_rate:.1f}% below 38% after {closed_count} trades")
+        elif closed_count >= 50 and win_rate < 40:
+            reasons.append(f"win rate {win_rate:.1f}% below 40% after {closed_count} trades")
+        elif closed_count >= 30 and win_rate < 45:
+            reasons.append(f"win rate {win_rate:.1f}% below 45% after {closed_count} trades")
+    if equity < 750 and closed_count >= 75:
+        reasons.append("equity below $750")
+    elif equity < 825 and closed_count >= 50:
+        reasons.append("equity below $825")
+    elif equity < 900 and closed_count >= 30:
+        reasons.append("equity below $900")
+    if max_drawdown_pct > 25 and closed_count >= 75:
+        reasons.append("drawdown above 25%")
+    elif max_drawdown_pct > 18 and closed_count >= 50:
+        reasons.append("drawdown above 18%")
+    elif max_drawdown_pct > 12 and closed_count >= 30:
+        reasons.append("drawdown above 12%")
+    return status, reasons
+
 
 def _provider_quote(provider, ticker):
     """Fetch one quote and classify failures for the fallback router."""
@@ -4003,9 +4273,9 @@ def evaluate_sell_decision(trade, current_price, rsi=None, volume_ratio=None):
     if remaining_minutes <= 0:
         return True, "forced_close", f"Force-closed at 2:45 PM — {pnl_percent:+.1f}%"
 
-    # ── TARGET HIT — Take profits on strong moves ──
+    # ── TARGET HIT — informational only; let winners ride until thesis weakens ──
     if pnl_percent >= 8:
-        return True, "target_hit", f"Sold — target hit at {pnl_percent:+.1f}%"
+        return False, "target_hit", f"Holding winner — target hit at {pnl_percent:+.1f}%"
 
     # ── STOP LOSS — Cut losses on strong reversals ──
     if pnl_percent <= -5:
@@ -4307,6 +4577,11 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
         picks_count=len(scan_result["longs"]) + len(scan_result["shorts"]),
         provider_summary=get_app_state_json("last_price_provider_summary", {}) or {},
     )
+    try:
+        scan_result["variant_run"] = run_variant_universes_from_cache(trigger=f"scan_{scan_type}")
+    except Exception as variant_error:
+        scan_result["variant_run"] = {"success": False, "errors": [str(variant_error)]}
+        log.error(f"Variant universe run after scan failed: {variant_error}")
     log.info(f"Scan complete: {len(recommended_longs)} longs, {len(recommended_shorts)} shorts from {len(scored_stocks)} scanned")
     return scan_result
 
@@ -4324,6 +4599,231 @@ def get_cached_picks():
     return None
 
 # ── NEURAL NETWORK SCAN ──────────────────────────────────────────────────────
+def run_variant_universes_from_cache(trigger="manual", buy_time=None):
+    """Open simulated trades for every active strategy universe from cached shared scan outputs."""
+    status = {
+        "success": True,
+        "trigger": trigger,
+        "ran_at": current_time_cst().isoformat(),
+        "variants": 0,
+        "opened_count": 0,
+        "skipped_count": 0,
+        "opened": [],
+        "skipped": [],
+        "errors": [],
+    }
+    today = current_time_cst().strftime("%Y-%m-%d")
+    buy_time = buy_time or current_time_cst().strftime("%H:%M:%S")
+    database = get_database()
+    try:
+        vector_cached = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
+        nova_cached = database.execute("SELECT value FROM app_state WHERE key='cached_nn_picks'").fetchone()
+        if not vector_cached and not nova_cached:
+            status["success"] = False
+            status["errors"].append("No cached Vector or Nova picks available")
+            return status
+
+        vector_payload = json.loads(vector_cached["value"]) if vector_cached else {}
+        nova_payload = json.loads(nova_cached["value"]) if nova_cached else {}
+        vector_picks = vector_payload.get("longs") or vector_payload.get("recommended_longs") or []
+        nova_picks = nova_payload.get("recommended_longs") or nova_payload.get("longs") or []
+        scan_time = vector_payload.get("generated_at") or vector_payload.get("cache_time") or nova_payload.get("scan_time") or status["ran_at"]
+
+        variants = [dict(r) for r in database.execute("""
+            SELECT sv.*, vp.cash, vp.equity
+            FROM strategy_variants sv
+            JOIN variant_portfolios vp ON vp.variant_id = sv.id
+            WHERE sv.status='active' AND vp.lifecycle_status!='archived'
+            ORDER BY sv.strategy, sv.brain, sv.selection_mode
+        """).fetchall()]
+        status["variants"] = len(variants)
+
+        for variant in variants:
+            brain = variant.get("brain")
+            source_picks = nova_picks if brain == "Nova" else vector_picks
+            if brain == "Nova":
+                source_picks = [p for p in source_picks if p.get("nn_executable", True)]
+            selected = select_variant_picks(source_picks, variant.get("selection_mode"))
+            if not selected:
+                status["skipped"].append({"variant_id": variant["id"], "reason": "no picks"})
+                status["skipped_count"] += 1
+                update_variant_portfolio(database, variant["id"], note="no_picks")
+                continue
+
+            for rank, pick in enumerate(selected, start=1):
+                ticker = pick.get("ticker")
+                if not ticker:
+                    continue
+                trade_id = f"{variant['id']}_{ticker}_{today}_long"
+                if database.execute("SELECT id FROM variant_virtual_trades WHERE id=?", [trade_id]).fetchone():
+                    status["skipped_count"] += 1
+                    status["skipped"].append({"variant_id": variant["id"], "ticker": ticker, "reason": "already open/executed today"})
+                    continue
+                if database.execute(
+                    "SELECT id FROM variant_virtual_trades WHERE variant_id=? AND ticker=? AND outcome='open'",
+                    [variant["id"], ticker]
+                ).fetchone():
+                    status["skipped_count"] += 1
+                    status["skipped"].append({"variant_id": variant["id"], "ticker": ticker, "reason": "already open in variant"})
+                    continue
+
+                portfolio = dict(database.execute("SELECT * FROM variant_portfolios WHERE variant_id=?", [variant["id"]]).fetchone())
+                invested = variant_investment_amount(portfolio)
+                if invested <= 0:
+                    status["skipped_count"] += 1
+                    status["skipped"].append({"variant_id": variant["id"], "ticker": ticker, "reason": "no cash"})
+                    continue
+
+                buy_price = pick.get("open_price") or pick.get("price") or pick.get("buy_price") or 0
+                if not buy_price:
+                    status["skipped_count"] += 1
+                    status["skipped"].append({"variant_id": variant["id"], "ticker": ticker, "reason": "missing price"})
+                    continue
+
+                confidence, expected_move = pick_confidence_and_move(pick, brain)
+                signal_scores = pick.get("signal_scores") or pick.get("signal_scores_for_observation") or {}
+                if not isinstance(signal_scores, str):
+                    signal_scores = json.dumps(signal_scores)
+                reasoning = pick.get("long_reasoning") or f"{brain} variant simulation"
+                database.execute("""
+                    INSERT INTO variant_virtual_trades
+                    (id, variant_id, strategy, brain, ticker, direction, buy_date, buy_time,
+                     buy_price, invested_amount, current_value, confidence, expected_move,
+                     outcome, sector, reasoning, signal_scores, source_scan_time, source_rank,
+                     created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 'long', ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    trade_id, variant["id"], variant["strategy"], brain, ticker, today, buy_time,
+                    float(buy_price), round(invested, 4), round(invested, 4), confidence, expected_move,
+                    pick.get("sector") or get_sector(ticker), reasoning, signal_scores, scan_time, rank,
+                    status["ran_at"], status["ran_at"],
+                ])
+                database.execute("""
+                    UPDATE variant_portfolios
+                    SET cash=ROUND(cash - ?, 4), updated_at=?
+                    WHERE variant_id=?
+                """, [round(invested, 4), status["ran_at"], variant["id"]])
+                status["opened_count"] += 1
+                status["opened"].append({
+                    "variant_id": variant["id"],
+                    "ticker": ticker,
+                    "buy_price": float(buy_price),
+                    "invested_amount": round(invested, 4),
+                    "rank": rank,
+                })
+
+            update_variant_portfolio(database, variant["id"], note=f"run_{trigger}")
+
+        database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_variant_run', ?)", [json.dumps(status)])
+        database.commit()
+        return status
+    except Exception as error:
+        database.rollback()
+        status["success"] = False
+        status["errors"].append(str(error))
+        log.error(f"variant universe run failed: {error}")
+        return status
+    finally:
+        database.close()
+
+def monitor_variant_universes(trigger="manual"):
+    """Refresh and conservatively settle open trades in every variant universe."""
+    status = {
+        "success": True,
+        "trigger": trigger,
+        "ran_at": current_time_cst().isoformat(),
+        "open_count": 0,
+        "updated_count": 0,
+        "closed_count": 0,
+        "errors": [],
+    }
+    now = current_time_cst()
+    today = now.strftime("%Y-%m-%d")
+    database = get_database()
+    try:
+        open_rows = [dict(r) for r in database.execute(
+            "SELECT * FROM variant_virtual_trades WHERE outcome='open'"
+        ).fetchall()]
+        status["open_count"] = len(open_rows)
+        if not open_rows:
+            database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_variant_monitor', ?)", [json.dumps(status)])
+            database.commit()
+            return status
+
+        tickers = sorted({r["ticker"] for r in open_rows})
+        current_prices = fetch_current_prices(tickers)
+        touched_variants = set()
+
+        for row in open_rows:
+            ticker = row["ticker"]
+            raw = current_prices.get(ticker)
+            if not raw:
+                continue
+            price_data = normalize_monitor_quote(raw, row.get("buy_price"))
+            price = float(price_data["price"])
+            buy_price = float(row.get("buy_price") or price)
+            invested = float(row.get("invested_amount") or 0)
+            pnl_pct = (price - buy_price) / max(buy_price, 0.01) * 100
+            if row.get("direction") == "short":
+                pnl_pct = -pnl_pct
+            current_value = invested + invested * pnl_pct / 100
+            should_close = False
+            sell_reason = None
+
+            # Winner target hits are intentionally informational only.
+            if row.get("buy_date") < today and minutes_until_forced_close() <= 0:
+                should_close = True
+                sell_reason = "forced_close"
+            elif pnl_pct <= -5:
+                should_close = True
+                sell_reason = "stop_loss"
+            elif row.get("buy_date") < today and 0 <= minutes_until_forced_close() < 30 and pnl_pct > 0.5:
+                should_close = True
+                sell_reason = "time_pressure"
+
+            if should_close:
+                gross_pnl = current_value - invested
+                database.execute("""
+                    UPDATE variant_virtual_trades
+                    SET current_value=?, sell_date=?, sell_time=?, sell_price=?,
+                        actual_move=?, gross_pnl=?, net_pnl=?, outcome=?, sell_reason=?, updated_at=?
+                    WHERE id=?
+                """, [
+                    round(current_value, 4), today, now.strftime("%H:%M:%S"), price,
+                    round(pnl_pct, 2), round(gross_pnl, 4), round(gross_pnl, 4),
+                    "hit" if pnl_pct > 0 else "miss", sell_reason, status["ran_at"], row["id"],
+                ])
+                database.execute("""
+                    UPDATE variant_portfolios
+                    SET cash=ROUND(cash + ?, 4), updated_at=?
+                    WHERE variant_id=?
+                """, [round(current_value, 4), status["ran_at"], row["variant_id"]])
+                status["closed_count"] += 1
+            else:
+                database.execute("""
+                    UPDATE variant_virtual_trades
+                    SET current_value=?, actual_move=?, updated_at=?
+                    WHERE id=?
+                """, [round(current_value, 4), round(pnl_pct, 2), status["ran_at"], row["id"]])
+
+            status["updated_count"] += 1
+            touched_variants.add(row["variant_id"])
+
+        for variant_id in touched_variants:
+            update_variant_portfolio(database, variant_id, note=f"monitor_{trigger}")
+
+        database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_variant_monitor', ?)", [json.dumps(status)])
+        database.commit()
+        return status
+    except Exception as error:
+        database.rollback()
+        status["success"] = False
+        status["errors"].append(str(error))
+        log.error(f"variant monitor failed: {error}")
+        return status
+    finally:
+        database.close()
+
 def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soon, scan_type="shared", scan_event_id=None, queue_locked=False):
     """
     Score NN picks from the already-built comprehensive scan snapshot.
@@ -4406,6 +4906,7 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
         db = get_database()
         db.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_nn_picks',?)", [json.dumps(result)])
         db.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_nn_picks_time',?)", [current_time_cst().isoformat()])
+        db.commit()
         db.close()
         record_nn_scan_status(
             status="complete",
@@ -5849,6 +6350,7 @@ def run_scheduler():
     # 8:45 AM CST = 13:45 UTC — Execute positions at market open + 15 min
     schedule.every().day.at("13:45").do(execute_opening_positions)
     schedule.every().day.at("13:45").do(execute_nn_opening_positions)
+    schedule.every().day.at("13:45").do(lambda: run_variant_universes_from_cache(trigger="scheduled_0845", buy_time="08:45:00"))
 
     # 2:45 PM CST = 19:45 UTC — Force-close previous session positions
     schedule.every().day.at("19:45").do(force_close_previous_session)
@@ -5919,6 +6421,7 @@ def run_scheduler():
             try:
                 monitor_open_positions()
                 monitor_nn_open_positions()
+                monitor_variant_universes(trigger="scheduled")
             except Exception as error:
                 log.error(f"Monitor error: {error}")
 
@@ -6604,6 +7107,121 @@ def api_strategy_variants():
     except Exception as e:
         log.error(f"strategy-variants error: {e}")
         return jsonify([]), 500
+
+@app.route("/api/variant-portfolios")
+def api_variant_portfolios():
+    """Return every live universe portfolio with current counts."""
+    try:
+        db = get_database()
+        rows = [dict(r) for r in db.execute("""
+            SELECT sv.id, sv.strategy, sv.brain, sv.execution_time, sv.selection_mode,
+                   sv.exit_mode, sv.label, sv.status AS registry_status,
+                   vp.*
+            FROM strategy_variants sv
+            JOIN variant_portfolios vp ON vp.variant_id = sv.id
+            ORDER BY sv.strategy, sv.brain, sv.selection_mode
+        """).fetchall()]
+        db.close()
+        for row in rows:
+            try:
+                row["lifecycle_reasons"] = json.loads(row.get("lifecycle_reasons") or "[]")
+            except Exception:
+                row["lifecycle_reasons"] = []
+        return jsonify(rows)
+    except Exception as e:
+        log.error(f"variant-portfolios error: {e}")
+        return jsonify([]), 500
+
+@app.route("/api/variant-leaderboard")
+def api_variant_leaderboard():
+    """Rank universes by equity, win rate, drawdown, and sample size."""
+    try:
+        db = get_database()
+        rows = [dict(r) for r in db.execute("""
+            SELECT sv.id, sv.strategy, sv.brain, sv.execution_time, sv.selection_mode,
+                   sv.exit_mode, sv.label,
+                   vp.equity, vp.starting_cash, vp.cash, vp.open_value, vp.open_count,
+                   vp.closed_count, vp.win_count, vp.loss_count, vp.max_drawdown_pct,
+                   vp.lifecycle_status, vp.recommended_status, vp.lifecycle_reasons,
+                   MAX(vt.updated_at) AS last_trade_at
+            FROM strategy_variants sv
+            JOIN variant_portfolios vp ON vp.variant_id = sv.id
+            LEFT JOIN variant_virtual_trades vt ON vt.variant_id = sv.id
+            GROUP BY sv.id
+            ORDER BY vp.equity DESC, vp.win_count DESC, vp.max_drawdown_pct ASC
+        """).fetchall()]
+        db.close()
+        for idx, row in enumerate(rows, start=1):
+            closed = int(row.get("closed_count") or 0)
+            wins = int(row.get("win_count") or 0)
+            row["rank"] = idx
+            row["return_pct"] = round((float(row.get("equity") or 1000) - float(row.get("starting_cash") or 1000)) / max(float(row.get("starting_cash") or 1000), 0.01) * 100, 2)
+            row["win_rate"] = round(wins / closed * 100, 1) if closed else None
+            try:
+                row["lifecycle_reasons"] = json.loads(row.get("lifecycle_reasons") or "[]")
+            except Exception:
+                row["lifecycle_reasons"] = []
+        return jsonify(rows)
+    except Exception as e:
+        log.error(f"variant-leaderboard error: {e}")
+        return jsonify([]), 500
+
+@app.route("/api/variant/<variant_id>")
+def api_variant_detail(variant_id):
+    """Return one universe with portfolio, trades, equity curve, and mutable weights."""
+    try:
+        db = get_database()
+        variant = db.execute("SELECT * FROM strategy_variants WHERE id=?", [variant_id]).fetchone()
+        if not variant:
+            db.close()
+            return jsonify({"error": "variant not found"}), 404
+        portfolio = db.execute("SELECT * FROM variant_portfolios WHERE variant_id=?", [variant_id]).fetchone()
+        weights = db.execute("SELECT * FROM variant_signal_weights WHERE variant_id=?", [variant_id]).fetchone()
+        trades = [dict(r) for r in db.execute("""
+            SELECT * FROM variant_virtual_trades
+            WHERE variant_id=?
+            ORDER BY buy_date DESC, created_at DESC
+            LIMIT 200
+        """, [variant_id]).fetchall()]
+        equity = [dict(r) for r in db.execute("""
+            SELECT * FROM variant_equity_points
+            WHERE variant_id=?
+            ORDER BY timestamp DESC
+            LIMIT 200
+        """, [variant_id]).fetchall()]
+        db.close()
+        payload = {
+            "variant": dict(variant),
+            "portfolio": dict(portfolio) if portfolio else None,
+            "weights": dict(weights) if weights else None,
+            "trades": trades,
+            "equity_points": equity,
+        }
+        if payload["weights"]:
+            for key in ("weights_json", "baseline_weights_json"):
+                try:
+                    payload["weights"][key] = json.loads(payload["weights"][key] or "{}")
+                except Exception:
+                    payload["weights"][key] = {}
+        if payload["portfolio"]:
+            try:
+                payload["portfolio"]["lifecycle_reasons"] = json.loads(payload["portfolio"].get("lifecycle_reasons") or "[]")
+            except Exception:
+                payload["portfolio"]["lifecycle_reasons"] = []
+        return jsonify(payload)
+    except Exception as e:
+        log.error(f"variant detail error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/variant-run-now", methods=["POST"])
+def api_variant_run_now():
+    """Manually run active universes from the latest cached shared scan."""
+    return jsonify(run_variant_universes_from_cache(trigger="manual"))
+
+@app.route("/api/variant-monitor-now", methods=["POST"])
+def api_variant_monitor_now():
+    """Manually refresh all open universe simulations."""
+    return jsonify(monitor_variant_universes(trigger="manual"))
 
 @app.route("/api/evidence-stats")
 def api_evidence_stats():
@@ -8489,17 +9107,7 @@ def api_reset_weights():
     Safe to call at any time — does not affect audit history.
     """
     try:
-        default_weights = {
-            "rsi_momentum": 0.15,
-            "volume_surge": 0.15,
-            "overnight_gap_probability": 0.18,
-            "earnings_catalyst": 0.14,
-            "support_resistance": 0.13,
-            "relative_strength": 0.12,
-            "sector_relative_strength": 0.10,
-            "vwap_reclaim": 0.08,
-            "volatility_squeeze": 0.05,
-        }
+        default_weights = canonical_signal_weights()
         save_signal_weights(default_weights)
         log.info(f"Weights reset to 9-signal defaults: {default_weights}")
         return jsonify({"success": True, "weights": default_weights})
