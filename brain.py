@@ -1529,7 +1529,7 @@ def finish_scan_event(event_id, status="success", tickers_updated=0, picks_count
     database.commit()
     database.close()
 
-def mark_stalled_scan_events(max_age_minutes=10, zero_progress_minutes=3):
+def mark_stalled_scan_events(max_age_minutes=45, zero_progress_minutes=20):
     """Mark old running scan/monitor rows as stalled so freshness is never ambiguous."""
     cutoff = (current_time_cst() - timedelta(minutes=max_age_minutes)).isoformat()
     zero_cutoff = (current_time_cst() - timedelta(minutes=zero_progress_minutes)).isoformat()
@@ -1573,7 +1573,7 @@ def mark_running_events_error(job_type, started_after, error):
 
 def get_running_comprehensive_scan():
     """Return the active comprehensive scan event, if one is already running."""
-    mark_stalled_scan_events(max_age_minutes=10)
+    mark_stalled_scan_events()
     database = get_database()
     row = database.execute("""
         SELECT * FROM scan_events
@@ -4757,10 +4757,34 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
 
     log.info(f"Comprehensive scan: {len(universe)} tickers ({scan_type}, {len(open_tickers) if 'open_tickers' in dir() else 0} open positions excluded)...")
     scan_event_id = begin_scan_event(scan_type, job_type="comprehensive", tickers_attempted=len(universe))
+    record_nn_scan_status(
+        status="running",
+        scan_type=scan_type,
+        source="shared_comprehensive_scan",
+        started=True,
+        already_running=False,
+        total_scanned=0,
+        qualified=0,
+        picks=0,
+        phase="fetching_prices",
+        scan_event_id=scan_event_id,
+        error=None,
+    )
 
     # Ensure SPY is always fetched — needed for relative strength calculations
     universe_with_spy = list(dict.fromkeys(universe + ["SPY"]))
     price_data = fetch_price_data(universe_with_spy)
+    record_nn_scan_status(
+        status="running",
+        scan_type=scan_type,
+        source="shared_comprehensive_scan",
+        started=True,
+        already_running=False,
+        total_scanned=len(price_data),
+        phase="scoring",
+        scan_event_id=scan_event_id,
+        error=None,
+    )
 
     # During pre/post market hours, override stale daily closes with live prices
     enrich_with_live_prices(universe_with_spy, price_data)
