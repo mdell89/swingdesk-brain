@@ -2213,6 +2213,11 @@ export default function App() {
   const novaUniverseClosed = novaUniverseTrades.filter(t => t.outcome !== "open");
   const novaUniverseBalance = novaUniversePortfolio?.equity != null ? Number(novaUniversePortfolio.equity) : null;
   const novaLeader = variantLeaderboard.find(v => v.id === "swingdesk_nova_0845_all");
+  const novaOpenPnl = novaUniverseOpen.reduce((sum, trade) => {
+    const current = Number(trade.current_value ?? trade.invested_amount ?? 0);
+    const invested = Number(trade.invested_amount ?? 0);
+    return sum + (current - invested);
+  }, 0);
 
   if (!loaded) return <LoadingScreen progress={loadProgress} statusText={loadStatus} />;
 
@@ -2796,9 +2801,9 @@ export default function App() {
 
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 12 }}>
                 {[
-                  ["Balance", novaUniverseBalance != null ? `$${novaUniverseBalance.toFixed(2)}` : (nnStats?.portfolio_value != null ? `$${Number(nnStats.portfolio_value).toFixed(2)}` : "$1,000.00"), T1],
+                  ["Open P&L", `${novaOpenPnl >= 0 ? "+" : "-"}$${Math.abs(novaOpenPnl).toFixed(2)}`, novaOpenPnl >= 0 ? GREEN : RED],
+                  ["Day trades", `${pdtUsed}/3`, pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : GREEN],
                   ["Open", novaUniverseOpen.length || nnStats?.open_positions || nnPositions.filter(t => t.outcome === "open").length, GREEN],
-                  ["Next", nnStats?.next_investment_amount != null ? `$${Number(nnStats.next_investment_amount).toFixed(2)}` : "$10.00", "#a78bfa"],
                 ].map(([label, value, color]) => (
                   <div key={label} style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "8px 10px" }}>
                     <div style={{ fontSize: 8, color: T3, fontWeight: 700, textTransform: "uppercase", letterSpacing: .6, marginBottom: 4 }}>{label}</div>
