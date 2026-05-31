@@ -2748,7 +2748,7 @@ export default function App() {
           {/* ── NEURAL PORTFOLIO ── */}
           {portfolioTab === "neural" && (
             <div style={{ padding: "10px 16px 0" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, minHeight: 24 }}>
                 <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>SwingDesk / Nova / 8:45 / All</div>
                 <div style={{ display: "flex", alignItems: "center", gap: 6, position: "relative" }}>
                   <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
@@ -2787,14 +2787,10 @@ export default function App() {
                 const nnUp = nnChange >= 0;
                 return (
                   <div style={{ marginBottom: 12 }}>
-                    <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 5 }}>
+                    <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 2 }}>
                       <div>
                         <div style={{ fontSize: 32, fontWeight: 600, letterSpacing: "-1px", color: T1, fontFamily: "'DM Mono',monospace", lineHeight: 1 }}>
                           ${nnLast.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                        </div>
-                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
-                          <span style={{ fontSize: 13, fontWeight: 500, color: nnUp ? GREEN : RED }}>{nnUp ? "↑" : "↓"} {Math.abs(nnPercent).toFixed(2)}%</span>
-                          <span style={{ fontSize: 12, color: T3 }}>{nnUp ? "+" : ""}${nnChange.toFixed(2)}</span>
                         </div>
                       </div>
                       <div style={{ textAlign: "right", lineHeight: 1, paddingTop: 6 }}>
@@ -2802,13 +2798,19 @@ export default function App() {
                         <div style={{ fontSize: 16, fontWeight: 600, color: nnUp ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{nnUp ? "+" : ""}${nnChange.toFixed(2)}</div>
                       </div>
                     </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+                      <span style={{ fontSize: 13, fontWeight: 500, color: nnUp ? GREEN : RED }}>{nnUp ? "↑" : "↓"} {Math.abs(nnPercent).toFixed(2)}%</span>
+                      <span style={{ fontSize: 12, color: T3 }}>{nnUp ? "+" : ""}${nnChange.toFixed(2)}</span>
+                    </div>
                     <MiniChart data={nnPerfHistory} timeframe={nnPerfTimeframe} />
-                    <div style={{ display: "flex", justifyContent: "center", gap: 4, marginTop: 8 }}>
+                    <div style={{ display: "flex", alignItems: "center", marginTop: 8, position: "relative" }}>
+                      <div style={{ flex: 1, display: "flex", justifyContent: "center", gap: 4 }}>
                       {["D", "W", "M", "3M", "Y", "ALL"].map(tf => (
                         <button key={tf} onClick={() => setNnPerfTimeframe(tf)} style={{ padding: "5px 12px", borderRadius: 20, fontSize: 11, fontWeight: 500, border: "none", cursor: "pointer", background: nnPerfTimeframe === tf ? "#1e1e24" : BG, color: nnPerfTimeframe === tf ? T1 : T3 }}>
                           {tf === "D" ? "1D" : tf === "W" ? "1W" : tf === "M" ? "1M" : tf === "Y" ? "1Y" : tf}
                         </button>
                       ))}
+                      </div>
                     </div>
                   </div>
                 );
