@@ -2181,6 +2181,15 @@ export default function App() {
   const novaUniverseTrades = Array.isArray(novaUniverse?.trades) ? novaUniverse.trades : [];
   const novaUniverseOpen = novaUniverseTrades.filter(t => t.outcome === "open");
   const novaUniverseClosed = novaUniverseTrades.filter(t => t.outcome !== "open");
+  const novaOpenPositions = novaUniverseOpen.length ? novaUniverseOpen : nnPositions.filter(t => t.outcome === "open");
+  const novaFreshPositions = novaOpenPositions.filter(t => t.buy_date === today);
+  const novaCarryPositions = isWeekendNow ? novaOpenPositions : novaOpenPositions.filter(t => t.buy_date < today);
+  const novaOpenFilteredPositions = openDayFilter === "day2"
+    ? novaCarryPositions
+    : openDayFilter === "day1"
+      ? novaFreshPositions
+      : novaOpenPositions;
+  const sortedNovaOpenFilteredPositions = sortPositions(novaOpenFilteredPositions);
   const novaUniverseBalance = novaUniversePortfolio?.equity != null ? Number(novaUniversePortfolio.equity) : null;
   const novaLeader = variantLeaderboard.find(v => v.id === "swingdesk_nova_0845_all");
   const novaOpenPnl = novaUniverseOpen.reduce((sum, trade) => {
@@ -2595,7 +2604,7 @@ export default function App() {
                   </CardMetricGrid>
                 )}
 
-                {openLongPositions.length > 0 && (
+                {false && openLongPositions.length > 0 && (
                   <div style={{
                     display: "flex", alignItems: "center", justifyContent: "space-between",
                     gap: 8, margin: "0 0 8px", padding: "7px 8px",
@@ -2788,7 +2797,7 @@ export default function App() {
                           <span style={{ fontSize: 12, color: T3 }}>{nnUp ? "+" : ""}${nnChange.toFixed(2)}</span>
                         </div>
                       </div>
-                      <div style={{ textAlign: "right", lineHeight: 1, alignSelf: "flex-end" }}>
+                      <div style={{ textAlign: "right", lineHeight: 1, paddingTop: 6 }}>
                         <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L</div>
                         <div style={{ fontSize: 16, fontWeight: 600, color: nnUp ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{nnUp ? "+" : ""}${nnChange.toFixed(2)}</div>
                       </div>
@@ -2820,8 +2829,8 @@ export default function App() {
                 </div>
                 <div style={{ flex: 1, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
                   <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Open</div>
-                  <div style={{ fontSize: 16, fontWeight: 600, color: (novaUniverseOpen.length || nnStats?.open_positions || nnPositions.filter(t => t.outcome === "open").length) > 0 ? GREEN : T2 }}>
-                    {novaUniverseOpen.length || nnStats?.open_positions || nnPositions.filter(t => t.outcome === "open").length}
+                  <div style={{ fontSize: 16, fontWeight: 600, color: novaOpenPositions.length > 0 ? GREEN : T2 }}>
+                    {novaOpenPositions.length}
                   </div>
                 </div>
               </div>
@@ -2838,7 +2847,7 @@ export default function App() {
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 42px", margin: "0 0 12px", gap: 4, alignItems: "stretch" }}>
                 {[
                   ["buy", `Picks (${nnPicks.recommended_longs?.length || 0})`, BLUE, "#0f1e35", `1px solid ${BLUE}44`],
-                  ["sell", `Open (${novaUniverseOpen.length || nnPositions.filter(t => t.outcome === "open").length})`, GREEN, "#091a0d", `1px solid ${GREEN}44`],
+                  ["sell", `Open (${novaOpenPositions.length})`, GREEN, "#091a0d", `1px solid ${GREEN}44`],
                   ["closed", `Closed (${novaUniverseClosed.length})`, AMBER, "#1a1500", `1px solid ${AMBER}55`]
                 ].map(([id, label, color, activeBg, border]) => (
                   <button key={id} onClick={() => setLongSub(id)} style={{
@@ -2873,8 +2882,28 @@ export default function App() {
               )}
 
               {/* NN Open Positions */}
-              {longSub === "sell" && (novaUniverseOpen.length > 0 || nnPositions.filter(t => t.outcome === "open").length > 0) && (
+              {longSub === "sell" && novaOpenPositions.length > 0 && (
                 <div style={{ marginBottom: 16 }}>
+                  <div style={{ display: "flex", gap: 4, marginBottom: 7 }}>
+                    {[
+                      ["all", `All (${novaOpenPositions.length})`],
+                      ["day1", `Fresh (${novaFreshPositions.length})`],
+                      ["day2", `Carry (${novaCarryPositions.length})`],
+                    ].map(([id, label]) => (
+                      <button key={id} onClick={() => setOpenDayFilter(id)} style={{
+                        flex: 1,
+                        padding: "5px 0",
+                        borderRadius: 5,
+                        border: `1px solid ${openDayFilter === id ? GREEN + "55" : BORDER}`,
+                        background: openDayFilter === id ? GREEN + "12" : "transparent",
+                        color: openDayFilter === id ? GREEN : T3,
+                        fontSize: 9,
+                        fontWeight: 700,
+                        letterSpacing: .3,
+                        cursor: "pointer",
+                      }}>{label}</button>
+                    ))}
+                  </div>
                   <CardMetricGrid style={{ padding: `0 ${CARD_PAD_R} 5px ${CARD_PAD_L}` }}>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "left" }}>Day %</div>
@@ -2883,7 +2912,7 @@ export default function App() {
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right" }}>Conf</div>
                   </CardMetricGrid>
                   <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                    {(novaUniverseOpen.length ? novaUniverseOpen : nnPositions.filter(t => t.outcome === "open")).map(trade => (
+                    {sortedNovaOpenFilteredPositions.map(trade => (
                       <PositionCard key={trade.id} trade={trade} isLong={true}
                         themeKey={themeKey}
                         pdtRemaining={pdtRemaining}
@@ -2894,7 +2923,7 @@ export default function App() {
                   </div>
                 </div>
               )}
-              {longSub === "sell" && novaUniverseOpen.length === 0 && nnPositions.filter(t => t.outcome === "open").length === 0 && (
+              {longSub === "sell" && novaOpenPositions.length === 0 && (
                 <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 20, fontSize: 13, color: T3, textAlign: "center", marginBottom: 16 }}>
                   No open Nova positions.
                 </div>
