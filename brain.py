@@ -156,6 +156,7 @@ MAX_LONG_PICKS       = 20        # Maximum long recommendations per scan
 MAX_SHORT_PICKS      = 10        # Maximum short recommendations per scan
 MIN_VOLUME_RATIO     = 1.2       # Minimum volume activity to confirm a real setup
 MAX_ALL_VARIANT_OPEN_POSITIONS = 10
+ARCHIVED_VARIANT_OUTCOMES = ("archived_excess_open",)
 TIMEZONE_OFFSET      = -5        # CST = UTC-5 (CDT during summer)
 MONITOR_INTERVAL     = 300       # 5 minutes in seconds
 SCAN_BATCH_SIZE      = 100       # Tickers per yfinance batch call
@@ -2649,7 +2650,7 @@ def update_variant_portfolio(database, variant_id, note="snapshot"):
         "SELECT * FROM variant_virtual_trades WHERE variant_id=? AND outcome='open'", [variant_id]
     ).fetchall()]
     closed_rows = [dict(r) for r in database.execute(
-        "SELECT * FROM variant_virtual_trades WHERE variant_id=? AND outcome!='open'", [variant_id]
+        "SELECT * FROM variant_virtual_trades WHERE variant_id=? AND outcome!='open' AND outcome NOT IN ('archived_excess_open')", [variant_id]
     ).fetchall()]
     cash = float(portfolio["cash"] or 0)
     open_value = sum(float(r.get("current_value") or r.get("invested_amount") or 0) for r in open_rows)
@@ -5346,6 +5347,62 @@ def monitor_variant_universes(trigger="manual"):
     finally:
         database.close()
 
+def repair_variant_open_caps(apply_changes=False):
+    """Archive excess open variant trades created before open-position caps existed."""
+    db = get_database()
+    repaired = []
+    now = current_time_cst().isoformat()
+    try:
+        variants = [dict(r) for r in db.execute("""
+            SELECT sv.id, sv.strategy, sv.brain, sv.selection_mode
+            FROM strategy_variants sv
+            JOIN variant_portfolios vp ON vp.variant_id=sv.id
+            WHERE sv.status='active' AND vp.lifecycle_status!='archived'
+        """).fetchall()]
+        for variant in variants:
+            cap = variant_open_position_cap(variant)
+            rows = [dict(r) for r in db.execute("""
+                SELECT *, (COALESCE(current_value, invested_amount, 0) / MAX(COALESCE(invested_amount, 0.01), 0.01)) AS value_ratio
+                FROM variant_virtual_trades
+                WHERE variant_id=? AND outcome='open'
+                ORDER BY value_ratio DESC, created_at DESC
+            """, [variant["id"]]).fetchall()]
+            excess = rows[cap:]
+            restore_cash = round(sum(float(r.get("invested_amount") or 0) for r in excess), 4)
+            repaired.append({
+                "variant_id": variant["id"],
+                "brain": variant["brain"],
+                "strategy": variant["strategy"],
+                "cap": cap,
+                "before_open": len(rows),
+                "archived": len(excess),
+                "restore_cash": restore_cash,
+            })
+            if apply_changes and excess:
+                ids = [r["id"] for r in excess]
+                placeholders = ",".join(["?"] * len(ids))
+                db.execute(f"""
+                    UPDATE variant_virtual_trades
+                    SET outcome='archived_excess_open',
+                        sell_reason='system_repaired_open_cap',
+                        updated_at=?
+                    WHERE id IN ({placeholders})
+                """, [now, *ids])
+                db.execute("""
+                    UPDATE variant_portfolios
+                    SET cash=ROUND(cash + ?, 4), updated_at=?
+                    WHERE variant_id=?
+                """, [restore_cash, now, variant["id"]])
+                update_variant_portfolio(db, variant["id"], note="repair_open_cap")
+        if apply_changes:
+            db.commit()
+        return {"success": True, "applied": bool(apply_changes), "repaired": repaired}
+    except Exception as exc:
+        db.rollback()
+        return {"success": False, "error": str(exc), "applied": False, "repaired": repaired}
+    finally:
+        db.close()
+
 def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soon, scan_type="shared", scan_event_id=None, queue_locked=False):
     """
     Score NN picks from the already-built comprehensive scan snapshot.
@@ -8010,6 +8067,12 @@ def api_variant_run_now():
 def api_variant_monitor_now():
     """Manually refresh all open universe simulations."""
     return jsonify(monitor_variant_universes(trigger="manual"))
+
+@app.route("/api/repair-variant-open-caps", methods=["POST"])
+def api_repair_variant_open_caps():
+    """One-time maintenance: archive excess pre-cap variant opens."""
+    apply_changes = str(request.args.get("apply", "")).lower() in ("1", "true", "yes")
+    return jsonify(repair_variant_open_caps(apply_changes=apply_changes))
 
 @app.route("/api/evidence-stats")
 def api_evidence_stats():
