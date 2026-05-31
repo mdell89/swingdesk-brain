@@ -192,6 +192,7 @@ app = Flask(__name__)
 CORS(app)
 
 _monitor_singleflight_lock = threading.Lock()
+_comprehensive_scan_lock = threading.Lock()
 
 # ── NEURAL NETWORK ────────────────────────────────────────────────────────────
 # SwingDeskNet: feedforward NN for overnight swing trade prediction
@@ -1528,9 +1529,10 @@ def finish_scan_event(event_id, status="success", tickers_updated=0, picks_count
     database.commit()
     database.close()
 
-def mark_stalled_scan_events(max_age_minutes=10):
+def mark_stalled_scan_events(max_age_minutes=10, zero_progress_minutes=3):
     """Mark old running scan/monitor rows as stalled so freshness is never ambiguous."""
     cutoff = (current_time_cst() - timedelta(minutes=max_age_minutes)).isoformat()
+    zero_cutoff = (current_time_cst() - timedelta(minutes=zero_progress_minutes)).isoformat()
     database = get_database()
     database.execute("""
         UPDATE scan_events
@@ -1539,6 +1541,16 @@ def mark_stalled_scan_events(max_age_minutes=10):
             error=COALESCE(error, 'watchdog marked event stalled')
         WHERE status='running' AND started_at < ?
     """, [current_time_cst().isoformat(), cutoff])
+    database.execute("""
+        UPDATE scan_events
+        SET status='stalled',
+            finished_at=COALESCE(finished_at, ?),
+            error=COALESCE(error, 'watchdog marked zero-progress event stalled')
+        WHERE status='running'
+          AND job_type='comprehensive'
+          AND COALESCE(tickers_updated, 0)=0
+          AND started_at < ?
+    """, [current_time_cst().isoformat(), zero_cutoff])
     changed = database.total_changes
     database.commit()
     database.close()
@@ -2146,6 +2158,20 @@ def start_shared_scan_background(scan_type="manual_shared"):
         def worker():
             try:
                 result = run_comprehensive_scan(scan_type=scan_type)
+                if result.get("skipped"):
+                    record_nn_scan_status(
+                        status="stalled",
+                        scan_type=scan_type,
+                        source="shared_comprehensive_scan",
+                        started=False,
+                        already_running=False,
+                        finished_at=current_time_cst().isoformat(),
+                        total_scanned=0,
+                        qualified=0,
+                        picks=0,
+                        error=result.get("reason") or "comprehensive scan skipped",
+                    )
+                    return
                 nn_result = result.get("nn_picks", {}) or {}
                 record_nn_scan_status(
                     status="complete",
@@ -4701,7 +4727,7 @@ def evaluate_sell_decision(trade, current_price, rsi=None, volume_ratio=None):
     return False, "hold", sentiment
 
 # ── COMPREHENSIVE SCAN — Generate Picks ───────────────────────────────────────
-def run_comprehensive_scan(weights=None, scan_type="scheduled"):
+def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
     """
     Run a full scan of the entire ticker universe.
     Scores every stock, filters by confidence floor, caches results.
@@ -4974,6 +5000,24 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
         log.error(f"Variant universe run after scan failed: {variant_error}")
     log.info(f"Scan complete: {len(recommended_longs)} longs, {len(recommended_shorts)} shorts from {len(scored_stocks)} scanned")
     return scan_result
+
+def run_comprehensive_scan(weights=None, scan_type="scheduled"):
+    """Single-flight wrapper around the full comprehensive scan hot path."""
+    if not _comprehensive_scan_lock.acquire(blocking=False):
+        log.warning(f"Comprehensive scan skipped because another scan is active ({scan_type})")
+        return {
+            "longs": [],
+            "shorts": [],
+            "total_scanned": 0,
+            "scan_type": scan_type,
+            "skipped": True,
+            "reason": "comprehensive_scan_already_running",
+            "nn_picks": {"picks": 0, "qualified_count": 0, "source": "shared_comprehensive_scan"},
+        }
+    try:
+        return _run_comprehensive_scan_impl(weights=weights, scan_type=scan_type)
+    finally:
+        _comprehensive_scan_lock.release()
 
 def get_cached_picks():
     """Return cached picks instantly without triggering a new scan."""
