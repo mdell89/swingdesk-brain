@@ -1657,7 +1657,6 @@ export default function App() {
   const [nnStats, setNnStats] = useState(null);
   const [nnPerfHistory, setNnPerfHistory] = useState([]);
   const [nnPerfTimeframe, setNnPerfTimeframe] = useState("M");
-  const [nnAction, setNnAction] = useState(null);
   const [variantStatus, setVariantStatus] = useState(null);
   const [variantLeaderboard, setVariantLeaderboard] = useState([]);
   const [novaUniverse, setNovaUniverse] = useState(null);
@@ -1743,35 +1742,6 @@ export default function App() {
     } catch {}
     setAddingToPersonal(prev => ({ ...prev, [ticker]: false }));
     return false;
-  };
-
-  const refreshNeuralPortfolio = async () => {
-    const [nnPicksData, nnPositionsData, nnStatsData, nnPerfData, variantStatusData, variantBoardData, novaUniverseData] = await Promise.all([
-      apiFetch("/nn-picks").catch(() => ({ recommended_longs: [], recommended_shorts: [] })),
-      apiFetch("/nn-positions").catch(() => []),
-      apiFetch("/nn-stats").catch(() => null),
-      apiFetch("/nn-perf-history").catch(() => []),
-      apiFetch("/variant-status").catch(() => null),
-      apiFetch("/variant-leaderboard").catch(() => []),
-      apiFetch("/variant/swingdesk_nova_0845_all").catch(() => null),
-    ]);
-    setNnPicks(nnPicksData || { recommended_longs: [], recommended_shorts: [] });
-    setNnPositions(nnPositionsData || []);
-    setNnStats(nnStatsData);
-    setNnPerfHistory(nnPerfData || []);
-    setVariantStatus(variantStatusData);
-    setVariantLeaderboard(variantBoardData || []);
-    setNovaUniverse(novaUniverseData);
-  };
-
-  const runNeuralAction = async (kind) => {
-    if (nnAction) return;
-    setNnAction(kind);
-    try {
-      await apiFetch("/nn-open-now", { method: "POST" });
-      await refreshNeuralPortfolio();
-    } catch {}
-    setNnAction(null);
   };
 
   const addManualPersonalTrade = async () => {
@@ -2218,6 +2188,31 @@ export default function App() {
     const invested = Number(trade.invested_amount ?? 0);
     return sum + (current - invested);
   }, 0);
+  const renderPortfolioControls = (padded = true) => (
+    <div style={{ padding: padded ? "0 16px 14px" : "0 0 14px" }}>
+      <label style={{ display: "flex", alignItems: "center", gap: 6, width: "100%", minWidth: 0, height: 32, border: `1px solid ${BORDER}`, borderRadius: 8, background: CARD, padding: "0 9px", marginBottom: 6 }}>
+        <span style={{ fontSize: 9, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6, flexShrink: 0 }}>Strategy:</span>
+        <select value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
+          style={{ minWidth: 0, width: "100%", border: "none", outline: "none", background: "transparent", color: T1, fontSize: 12, fontWeight: 800, cursor: "pointer", appearance: "none" }}>
+          {STRATEGY_OPTIONS.map(name => <option key={name} value={name} style={{ background: "#111", color: T1 }}>{name}</option>)}
+        </select>
+        <span aria-hidden="true" style={{ color: T3, fontSize: 10, flexShrink: 0 }}>▼</span>
+      </label>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
+        {[
+          ["brain", "Vector", BLUE],
+          ["neural", "Nova", "#a78bfa"],
+        ].map(([id, label, color]) => (
+          <button key={id} onClick={() => setPortfolioTab(id)} style={{
+            padding: "7px 0", borderRadius: 7, fontSize: 11, fontWeight: 800,
+            border: `1px solid ${portfolioTab === id ? color + "66" : BORDER}`,
+            cursor: "pointer", letterSpacing: .4, background: portfolioTab === id ? color + "18" : "transparent",
+            color: portfolioTab === id ? color : T3,
+          }}>{label}</button>
+        ))}
+      </div>
+    </div>
+  );
 
   if (!loaded) return <LoadingScreen progress={loadProgress} statusText={loadStatus} />;
 
@@ -2249,7 +2244,7 @@ export default function App() {
         <div className="fadeIn">
 
           {/* ── Portfolio Tab Bar: Brain | Neural | Personal ── */}
-          <div style={{ padding: "10px 16px 0", marginBottom: 2 }}>
+          <div style={{ display: "none" }}>
             <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr) auto", gap: 8, alignItems: "center" }}>
               <label style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, height: 30, border: `1px solid ${BORDER}`, borderRadius: 8, background: CARD, padding: "0 9px" }}>
                 <span style={{ fontSize: 9, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6, flexShrink: 0 }}>Strategy:</span>
@@ -2350,6 +2345,7 @@ export default function App() {
               </div>
             </div>
           </div>
+          {renderPortfolioControls()}
 
           {/* METRIC STRIP */}
           <div style={{ display: "flex", gap: 8, padding: "0 16px 14px" }}>
@@ -2403,7 +2399,7 @@ export default function App() {
             </div>
           </div>
 
-          {variantLeaderboard.length > 0 && (
+          {false && variantLeaderboard.length > 0 && (
             <div style={{ margin: "0 16px 10px", background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "9px 10px" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 7 }}>
                 <div style={{ fontSize: 9, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .7 }}>Universe leaders</div>
@@ -2747,10 +2743,13 @@ export default function App() {
             <div style={{ padding: "10px 16px 0" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
                 <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>Nova / Neural</div>
-                <div style={{ display: "flex", gap: 6 }}>
-                  <button onClick={() => runNeuralAction("open")} disabled={!!nnAction}
-                    style={{ background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 5, color: T3, fontSize: 8, fontWeight: 700, letterSpacing: .4, padding: "4px 7px", cursor: nnAction ? "default" : "pointer", opacity: nnAction ? .55 : .75 }}>
-                    {nnAction === "open" ? "..." : "RECOVER OPEN"}
+                <div style={{ display: "flex", alignItems: "center", gap: 6, position: "relative" }}>
+                  <button onClick={() => setFeeAdjusted(f => !f)} style={{ height: TOOLBAR_CONTROL_H, padding: "0 10px", borderRadius: 20, fontSize: 9, fontWeight: 600, border: `1px solid ${feeAdjusted ? AMBER + "55" : BORDER}`, cursor: "pointer", background: feeAdjusted ? "#1a1500" : "transparent", color: feeAdjusted ? AMBER : T3, letterSpacing: .3, whiteSpace: "nowrap", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    {feeAdjusted ? "● Fees on" : "○ Fees off"}
+                  </button>
+                  <ThemeToggle themeKey={themeKey} onToggle={() => setThemeKey(k => k === "black" ? "navy" : "black")} T3={T3} />
+                  <button onClick={() => setSettingsOpen(true)} style={{ cursor: "pointer", flexShrink: 0, lineHeight: 0, width: TOOLBAR_CONTROL_H, height: TOOLBAR_CONTROL_H, padding: 0, border: "none", background: "transparent", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    <SettingsIcon color={T3} />
                   </button>
                 </div>
               </div>
@@ -2772,7 +2771,7 @@ export default function App() {
                   <div style={{ marginBottom: 12 }}>
                     <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 5 }}>
                       <div>
-                        <div style={{ fontSize: 24, fontWeight: 700, color: T1, fontFamily: "'DM Mono',monospace", lineHeight: 1 }}>
+                        <div style={{ fontSize: 32, fontWeight: 600, letterSpacing: "-1px", color: T1, fontFamily: "'DM Mono',monospace", lineHeight: 1 }}>
                           ${nnLast.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                         </div>
                         <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
@@ -2780,11 +2779,10 @@ export default function App() {
                           <span style={{ fontSize: 11, color: T3 }}>{nnUp ? "+" : ""}${nnChange.toFixed(2)}</span>
                         </div>
                       </div>
-                      <div style={{ textAlign: "right", fontSize: 9, color: T3 }}>
-                        Nova universe
-                        <div style={{ color: "#a78bfa", fontWeight: 800, fontFamily: "'DM Mono',monospace", fontSize: 12, marginTop: 2 }}>
-                          {novaUniverseClosed.length || nnStats?.resolved || 0} closed
-                        </div>
+                      <div style={{ textAlign: "right", lineHeight: 1 }}>
+                        <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L</div>
+                        <div style={{ fontSize: 16, fontWeight: 600, color: nnUp ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{nnUp ? "+" : ""}${nnChange.toFixed(2)}</div>
+                        <div style={{ fontSize: 8, color: T3, marginTop: 3 }}>{novaUniverseClosed.length || nnStats?.resolved || 0} closed</div>
                       </div>
                     </div>
                     <MiniChart data={nnPerfHistory} timeframe={nnPerfTimeframe} />
@@ -2798,6 +2796,7 @@ export default function App() {
                   </div>
                 );
               })()}
+              {renderPortfolioControls(false)}
 
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 12 }}>
                 {[
@@ -2818,7 +2817,7 @@ export default function App() {
                 {variantStatus?.nova_cache_age_minutes != null && ` · Nova cache ${Math.round(variantStatus.nova_cache_age_minutes)}m`}
               </div>
 
-              {novaLeader && (
+              {false && novaLeader && (
                 <div style={{ background: "#140f24", border: "1px solid #a78bfa55", borderRadius: 8, padding: "7px 10px", marginBottom: 12, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
                   {[
                     ["Rank", `#${novaLeader.rank}`, "#a78bfa"],

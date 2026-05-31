@@ -155,7 +155,7 @@ MIN_EXPECTED_MOVE    = 5.0       # Minimum predicted overnight move (%)
 MAX_LONG_PICKS       = 20        # Maximum long recommendations per scan
 MAX_SHORT_PICKS      = 10        # Maximum short recommendations per scan
 MIN_VOLUME_RATIO     = 1.2       # Minimum volume activity to confirm a real setup
-MAX_ALL_VARIANT_OPEN_POSITIONS = 10
+MAX_ALL_VARIANT_OPEN_POSITIONS = 50
 ARCHIVED_VARIANT_OUTCOMES = ("archived_excess_open",)
 TIMEZONE_OFFSET      = -5        # CST = UTC-5 (CDT during summer)
 MONITOR_INTERVAL     = 300       # 5 minutes in seconds
