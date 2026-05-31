@@ -148,16 +148,42 @@ load_dotenv()
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_KEY") or os.getenv("ANTHROPIC_API_KEY")
 ALPHA_VANTAGE_KEY    = os.getenv("ALPHA_VANTAGE_KEY")
 DATABASE_PATH        = Path(os.environ.get("DATABASE_PATH", "/app/data/portfolio_brain.db"))
-FEE_PER_TRADE        = 0.02      # Cash App sell fee
 DEFAULT_INVESTMENT   = 10.00     # Fallback when queue is empty
 STARTING_PORTFOLIO_VALUE = 1000.0
 CONFIDENCE_FLOOR     = 65        # Minimum confidence to recommend/trade
 MIN_EXPECTED_MOVE    = 5.0       # Minimum predicted overnight move (%)
 MAX_LONG_PICKS       = 20        # Maximum long recommendations per scan
 MAX_SHORT_PICKS      = 10        # Maximum short recommendations per scan
+MIN_VOLUME_RATIO     = 1.2       # Minimum volume activity to confirm a real setup
 TIMEZONE_OFFSET      = -5        # CST = UTC-5 (CDT during summer)
 MONITOR_INTERVAL     = 300       # 5 minutes in seconds
 SCAN_BATCH_SIZE      = 100       # Tickers per yfinance batch call
+
+STOCK_FEE_MODEL_VERSION = "sd_stock_conservative_stress_v1"
+STOCK_BUY_FRICTION_RATE = 0.001      # 0.10% buy-side spread/slippage buffer
+STOCK_SELL_FRICTION_RATE = 0.001     # 0.10% sell-side spread/slippage buffer
+SEC_SECTION_31_RATE = 20.60 / 1_000_000.0  # Sell-side notional fee, as of 2026-04-04.
+FINRA_TAF_PER_SHARE = 0.000195       # Sell-side equity TAF.
+FINRA_TAF_CAP = 9.79
+
+CRYPTO_FEE_MODEL_VERSION = "sd_crypto_conservative_stress_v1"
+CRYPTO_BUY_FRICTION_RATE = 0.01      # Pinned for SDCrypto: 1.00% buy-side friction.
+CRYPTO_SELL_FRICTION_RATE = 0.01     # Pinned for SDCrypto: 1.00% sell-side friction.
+
+FEE_MODEL_COLUMN_DEFINITIONS = [
+    "fee_model_version TEXT",
+    "entry_fee REAL DEFAULT 0.0",
+    "entry_slippage REAL DEFAULT 0.0",
+    "exit_fee REAL DEFAULT 0.0",
+    "exit_slippage REAL DEFAULT 0.0",
+    "total_fees REAL DEFAULT 0.0",
+    "gross_current_value REAL",
+    "share_quantity REAL",
+]
+FEE_MODEL_COLUMNS = [column_definition.split()[0] for column_definition in FEE_MODEL_COLUMN_DEFINITIONS]
+FEE_MODEL_INSERT_COLUMNS = ", ".join(FEE_MODEL_COLUMNS)
+FEE_MODEL_INSERT_PLACEHOLDERS = ", ".join(["?"] * len(FEE_MODEL_COLUMNS))
+FEE_MODEL_UPDATE_SET = ", ".join([f"{column}=?" for column in FEE_MODEL_COLUMNS])
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -497,7 +523,103 @@ def minutes_until_forced_close():
     close_time = now.replace(hour=14, minute=45, second=0)
     return int((close_time - now).total_seconds() / 60)
 
+def stock_regulatory_sell_fee(sell_notional, share_quantity):
+    """Return SEC + FINRA sell-side regulatory fees for a stock liquidation."""
+    sell_notional = max(float(sell_notional or 0), 0.0)
+    share_quantity = max(float(share_quantity or 0), 0.0)
+    sec_fee = sell_notional * SEC_SECTION_31_RATE
+    finra_taf = min(share_quantity * FINRA_TAF_PER_SHARE, FINRA_TAF_CAP)
+    return {
+        "sec_fee": round(sec_fee, 6),
+        "finra_taf": round(finra_taf, 6),
+        "regulatory_fee": round(sec_fee + finra_taf, 6),
+    }
+
+def calculate_stock_fee_model(invested_amount, buy_price, mark_price=None, direction="long"):
+    """
+    Conservative mark-to-liquidation model for SwingDesk stocks.
+
+    Gross values show pure price movement. Net values include 0.10% entry
+    friction, 0.10% exit friction, and sell-side SEC/FINRA fees.
+    """
+    invested = max(float(invested_amount or 0), 0.0)
+    buy = max(float(buy_price or 0), 0.0001)
+    mark = max(float(mark_price if mark_price is not None else buy), 0.0001)
+    direction = (direction or "long").lower()
+
+    entry_friction = invested * STOCK_BUY_FRICTION_RATE
+    net_entry_notional = max(invested - entry_friction, 0.0)
+    share_quantity = net_entry_notional / buy
+
+    if direction == "short":
+        gross_pnl = invested * ((buy - mark) / buy)
+        gross_value = invested + gross_pnl
+        pre_exit_value = net_entry_notional * (1 + ((buy - mark) / buy))
+    else:
+        gross_value = invested * (mark / buy)
+        gross_pnl = gross_value - invested
+        pre_exit_value = share_quantity * mark
+
+    pre_exit_value = max(pre_exit_value, 0.0)
+    exit_friction = pre_exit_value * STOCK_SELL_FRICTION_RATE
+    reg = stock_regulatory_sell_fee(pre_exit_value, share_quantity)
+    exit_fee = exit_friction + reg["regulatory_fee"]
+    net_value = max(pre_exit_value - exit_fee, 0.0)
+    net_pnl = net_value - invested
+
+    return {
+        "fee_model_version": STOCK_FEE_MODEL_VERSION,
+        "gross_current_value": round(gross_value, 4),
+        "net_current_value": round(net_value, 4),
+        "gross_pnl": round(gross_pnl, 4),
+        "net_pnl": round(net_pnl, 4),
+        "entry_fee": 0.0,
+        "entry_slippage": round(entry_friction, 6),
+        "exit_fee": round(reg["regulatory_fee"], 6),
+        "exit_slippage": round(exit_friction, 6),
+        "total_fees": round(entry_friction + exit_fee, 6),
+        "share_quantity": round(share_quantity, 8),
+        "sec_fee": reg["sec_fee"],
+        "finra_taf": reg["finra_taf"],
+    }
+
+def calculate_crypto_fee_model(invested_amount, buy_price, mark_price=None, direction="long"):
+    """Pinned SDCrypto conservative stress model for later crypto universes."""
+    invested = max(float(invested_amount or 0), 0.0)
+    buy = max(float(buy_price or 0), 0.00000001)
+    mark = max(float(mark_price if mark_price is not None else buy), 0.00000001)
+    direction = (direction or "long").lower()
+    entry_cost = invested * CRYPTO_BUY_FRICTION_RATE
+    net_entry = max(invested - entry_cost, 0.0)
+    if direction == "short":
+        gross_pnl = invested * ((buy - mark) / buy)
+        gross_value = invested + gross_pnl
+        pre_exit_value = net_entry * (1 + ((buy - mark) / buy))
+    else:
+        gross_value = invested * (mark / buy)
+        gross_pnl = gross_value - invested
+        pre_exit_value = net_entry * (mark / buy)
+    pre_exit_value = max(pre_exit_value, 0.0)
+    exit_cost = pre_exit_value * CRYPTO_SELL_FRICTION_RATE
+    net_value = max(pre_exit_value - exit_cost, 0.0)
+    return {
+        "fee_model_version": CRYPTO_FEE_MODEL_VERSION,
+        "gross_current_value": round(gross_value, 4),
+        "net_current_value": round(net_value, 4),
+        "gross_pnl": round(gross_pnl, 4),
+        "net_pnl": round(net_value - invested, 4),
+        "entry_fee": 0.0,
+        "entry_slippage": round(entry_cost, 6),
+        "exit_fee": 0.0,
+        "exit_slippage": round(exit_cost, 6),
+        "total_fees": round(entry_cost + exit_cost, 6),
+    }
+
 # ── TICKER UNIVERSE ───────────────────────────────────────────────────────────
+def fee_model_values(fee_quote):
+    """Return fee model fields in database column order."""
+    return [fee_quote.get(column) for column in FEE_MODEL_COLUMNS]
+
 def fetch_sp500_tickers():
     """
     Fetch S&P 500 ticker list from a GitHub-hosted CSV.
@@ -673,7 +795,15 @@ def initialize_database():
             actual_move REAL,
             gross_pnl REAL,
             net_pnl REAL,
-            fee REAL DEFAULT 0.02,
+            fee REAL DEFAULT 0.0,
+            fee_model_version TEXT,
+            entry_fee REAL DEFAULT 0.0,
+            entry_slippage REAL DEFAULT 0.0,
+            exit_fee REAL DEFAULT 0.0,
+            exit_slippage REAL DEFAULT 0.0,
+            total_fees REAL DEFAULT 0.0,
+            gross_current_value REAL,
+            share_quantity REAL,
             outcome TEXT DEFAULT 'open',
             sector TEXT,
             reasoning TEXT,
@@ -839,6 +969,14 @@ def initialize_database():
             actual_move REAL,
             gross_pnl REAL,
             net_pnl REAL,
+            fee_model_version TEXT,
+            entry_fee REAL DEFAULT 0.0,
+            entry_slippage REAL DEFAULT 0.0,
+            exit_fee REAL DEFAULT 0.0,
+            exit_slippage REAL DEFAULT 0.0,
+            total_fees REAL DEFAULT 0.0,
+            gross_current_value REAL,
+            share_quantity REAL,
             sell_reason TEXT,
             sector TEXT,
             reasoning TEXT,
@@ -871,6 +1009,18 @@ def initialize_database():
             reasons TEXT DEFAULT '[]',
             metrics_json TEXT DEFAULT '{}',
             applied INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS variant_learning_events (
+            id TEXT PRIMARY KEY,
+            variant_id TEXT NOT NULL,
+            trade_id TEXT,
+            timestamp TEXT NOT NULL,
+            outcome TEXT,
+            actual_move REAL,
+            weights_before TEXT NOT NULL,
+            weights_after TEXT NOT NULL,
+            reasoning TEXT DEFAULT '[]'
         );
 
         CREATE TABLE IF NOT EXISTS provider_health (
@@ -925,7 +1075,15 @@ def initialize_database():
             actual_move REAL,
             gross_pnl REAL,
             net_pnl REAL,
-            fee REAL DEFAULT 0.02,
+            fee REAL DEFAULT 0.0,
+            fee_model_version TEXT,
+            entry_fee REAL DEFAULT 0.0,
+            entry_slippage REAL DEFAULT 0.0,
+            exit_fee REAL DEFAULT 0.0,
+            exit_slippage REAL DEFAULT 0.0,
+            total_fees REAL DEFAULT 0.0,
+            gross_current_value REAL,
+            share_quantity REAL,
             outcome TEXT DEFAULT 'open',
             sector TEXT,
             reasoning TEXT,
@@ -1106,7 +1264,7 @@ def initialize_database():
         "pct_change_premarket REAL",
         "pct_change_regular_open REAL",
         "pct_change_entry REAL",
-    ]:
+    ] + FEE_MODEL_COLUMN_DEFINITIONS:
         try:
             column_name = column_definition.split()[0]
             database.execute(f"ALTER TABLE virtual_trades ADD COLUMN {column_definition}")
@@ -1126,9 +1284,15 @@ def initialize_database():
         "day_change_percent REAL",
         "news_sentiment_score REAL",
         "news_article_count INTEGER DEFAULT 0",
-    ]:
+    ] + FEE_MODEL_COLUMN_DEFINITIONS:
         try:
             database.execute(f"ALTER TABLE nn_virtual_trades ADD COLUMN {column_definition}")
+        except:
+            pass  # Column already exists
+
+    for column_definition in FEE_MODEL_COLUMN_DEFINITIONS:
+        try:
+            database.execute(f"ALTER TABLE variant_virtual_trades ADD COLUMN {column_definition}")
         except:
             pass  # Column already exists
 
@@ -1146,10 +1310,6 @@ def initialize_database():
         ("gap_go_nova_reg_all", "Gap & Go", "Nova", "reg", "All", "strategy_exit", "Gap & Go / Nova / Reg / All"),
         ("vwap_reclaim_vector_reg_all", "VWAP Reclaim", "Vector", "reg", "All", "strategy_exit", "VWAP Reclaim / Vector / Reg / All"),
         ("vwap_reclaim_nova_reg_all", "VWAP Reclaim", "Nova", "reg", "All", "strategy_exit", "VWAP Reclaim / Nova / Reg / All"),
-        ("bullish_mean_reversion_vector_reg_all", "Bullish Mean Reversion", "Vector", "reg", "All", "strategy_exit", "Bullish Mean Reversion / Vector / Reg / All"),
-        ("bullish_mean_reversion_nova_reg_all", "Bullish Mean Reversion", "Nova", "reg", "All", "strategy_exit", "Bullish Mean Reversion / Nova / Reg / All"),
-        ("donchian_vector_reg_all", "Donchian", "Vector", "reg", "All", "strategy_exit", "Donchian / Vector / Reg / All"),
-        ("donchian_nova_reg_all", "Donchian", "Nova", "reg", "All", "strategy_exit", "Donchian / Nova / Reg / All"),
         ("inside_day_vector_reg_all", "Inside Day", "Vector", "reg", "All", "strategy_exit", "Inside Day / Vector / Reg / All"),
         ("inside_day_nova_reg_all", "Inside Day", "Nova", "reg", "All", "strategy_exit", "Inside Day / Nova / Reg / All"),
         ("nr7_vector_reg_all", "NR7", "Vector", "reg", "All", "strategy_exit", "NR7 / Vector / Reg / All"),
@@ -1158,11 +1318,29 @@ def initialize_database():
         ("bull_flag_nova_reg_all", "Bull Flag", "Nova", "reg", "All", "strategy_exit", "Bull Flag / Nova / Reg / All"),
         ("pocket_pivot_vector_reg_all", "Pocket Pivot", "Vector", "reg", "All", "strategy_exit", "Pocket Pivot / Vector / Reg / All"),
         ("pocket_pivot_nova_reg_all", "Pocket Pivot", "Nova", "reg", "All", "strategy_exit", "Pocket Pivot / Nova / Reg / All"),
-        ("sr_breakout_vector_reg_all", "S&R Breakout", "Vector", "reg", "All", "strategy_exit", "S&R Breakout / Vector / Reg / All"),
-        ("sr_breakout_nova_reg_all", "S&R Breakout", "Nova", "reg", "All", "strategy_exit", "S&R Breakout / Nova / Reg / All"),
         ("vol_squeeze_breakout_vector_reg_all", "Vol Squeeze Breakout", "Vector", "reg", "All", "strategy_exit", "Vol Squeeze Breakout / Vector / Reg / All"),
         ("vol_squeeze_breakout_nova_reg_all", "Vol Squeeze Breakout", "Nova", "reg", "All", "strategy_exit", "Vol Squeeze Breakout / Nova / Reg / All"),
+        ("relative_strength_pullback_vector_reg_all", "Relative Strength Pullback", "Vector", "reg", "All", "strategy_exit", "Relative Strength Pullback / Vector / Reg / All"),
+        ("relative_strength_pullback_nova_reg_all", "Relative Strength Pullback", "Nova", "reg", "All", "strategy_exit", "Relative Strength Pullback / Nova / Reg / All"),
+        ("ema_trend_pullback_vector_reg_all", "EMA Trend Pullback", "Vector", "reg", "All", "strategy_exit", "EMA Trend Pullback / Vector / Reg / All"),
+        ("ema_trend_pullback_nova_reg_all", "EMA Trend Pullback", "Nova", "reg", "All", "strategy_exit", "EMA Trend Pullback / Nova / Reg / All"),
+        ("opening_range_hold_vector_reg_all", "Opening Range Hold", "Vector", "reg", "All", "strategy_exit", "Opening Range Hold / Vector / Reg / All"),
+        ("opening_range_hold_nova_reg_all", "Opening Range Hold", "Nova", "reg", "All", "strategy_exit", "Opening Range Hold / Nova / Reg / All"),
     ]
+    retired_strategies = ("Bullish Mean Reversion", "Donchian", "S&R Breakout")
+    database.execute(
+        f"UPDATE strategy_variants SET status='retired', updated_at=? WHERE strategy IN ({','.join(['?'] * len(retired_strategies))})",
+        [now_iso, *retired_strategies],
+    )
+    database.execute(
+        f"""UPDATE variant_portfolios
+            SET lifecycle_status='archived', recommended_status='retired',
+                lifecycle_reasons=?, updated_at=?
+            WHERE variant_id IN (
+                SELECT id FROM strategy_variants WHERE strategy IN ({','.join(['?'] * len(retired_strategies))})
+            )""",
+        [json.dumps(["retired_strategy_family_replaced_for_locked_swingdesk_12"]), now_iso, *retired_strategies],
+    )
     for variant in default_variants:
         try:
             database.execute("""
@@ -1178,7 +1356,7 @@ def initialize_database():
         "INSERT OR IGNORE INTO app_state VALUES ('canonical_signal_weights', ?)",
         [json.dumps(baseline_weights)]
     )
-    variant_rows = database.execute("SELECT id, brain FROM strategy_variants").fetchall()
+    variant_rows = database.execute("SELECT id, brain FROM strategy_variants WHERE status='active'").fetchall()
     for row in variant_rows:
         try:
             database.execute("""
@@ -2125,6 +2303,71 @@ def canonical_signal_weights():
         "volatility_squeeze": 0.05,
     }
 
+def normalize_signal_weights(weights):
+    baseline = canonical_signal_weights()
+    merged = {k: float((weights or {}).get(k, v) or v) for k, v in baseline.items()}
+    total = sum(max(v, 0.03) for v in merged.values())
+    return {k: round(max(v, 0.03) / total, 4) for k, v in merged.items()}
+
+def get_variant_signal_weights(database, variant_id):
+    row = database.execute("SELECT weights_json FROM variant_signal_weights WHERE variant_id=?", [variant_id]).fetchone()
+    if not row:
+        return canonical_signal_weights()
+    try:
+        return normalize_signal_weights(json.loads(row["weights_json"] or "{}"))
+    except Exception:
+        return canonical_signal_weights()
+
+def variant_weighted_signal_score(pick, weights):
+    scores = pick.get("signal_scores_for_observation") or pick.get("signal_scores") or {}
+    if isinstance(scores, str):
+        try:
+            scores = json.loads(scores)
+        except Exception:
+            scores = {}
+    if isinstance(scores, dict) and "scores" in scores:
+        scores = scores.get("scores") or {}
+    base_conf, _ = pick_confidence_and_move(pick)
+    if not isinstance(scores, dict) or not scores:
+        return float(base_conf)
+    weighted = sum(float(scores.get(k, 0.5) or 0.5) * float(weights.get(k, 0)) for k in canonical_signal_weights())
+    return round(base_conf * 0.65 + weighted * 100 * 0.35, 4)
+
+def learn_variant_from_closed_trade(database, trade_row, outcome, actual_move):
+    variant_id = trade_row.get("variant_id")
+    before = get_variant_signal_weights(database, variant_id)
+    try:
+        scores_blob = json.loads(trade_row.get("signal_scores") or "{}")
+    except Exception:
+        scores_blob = {}
+    scores = scores_blob.get("scores") if isinstance(scores_blob, dict) else {}
+    if not isinstance(scores, dict):
+        scores = scores_blob if isinstance(scores_blob, dict) else {}
+    if not scores:
+        return
+    direction = 1 if outcome == "hit" else -1
+    strength = min(abs(float(actual_move or 0)) / 10.0, 1.0)
+    after = dict(before)
+    reasoning = []
+    for key in canonical_signal_weights():
+        signal_score = float(scores.get(key, 0.5) or 0.5)
+        delta = direction * strength * (signal_score - 0.5) * 0.02
+        if abs(delta) >= 0.0001:
+            after[key] = after.get(key, before[key]) + delta
+            reasoning.append(f"{key} {'rewarded' if delta > 0 else 'penalized'} from {outcome} trade")
+    after = normalize_signal_weights(after)
+    ts = current_time_cst().isoformat()
+    database.execute("""
+        UPDATE variant_signal_weights
+        SET weights_json=?, learning_revision=COALESCE(learning_revision, 0)+1, updated_at=?
+        WHERE variant_id=?
+    """, [json.dumps(after), ts, variant_id])
+    database.execute("""
+        INSERT OR REPLACE INTO variant_learning_events
+        (id, variant_id, trade_id, timestamp, outcome, actual_move, weights_before, weights_after, reasoning)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [f"{trade_row.get('id')}_{int(time.time())}", variant_id, trade_row.get("id"), ts, outcome, actual_move, json.dumps(before), json.dumps(after), json.dumps(reasoning[:6])])
+
 def build_entry_integrity(position, price_data):
     """Lightweight audit comparing stored entry against quote context."""
     buy_price = float(position.get("buy_price") or 0)
@@ -2290,8 +2533,6 @@ def variant_strategy_matches(strategy, pick):
 
     if strategy == "swingdesk":
         return confidence >= 65 and expected_move >= 3
-    if strategy == "bullish mean reversion":
-        return day_change < 0 and regular_open_change > -4 and 35 <= rsi <= 55 and confidence >= 58
     if strategy == "darvas":
         return (confluence >= 1 or "52" in method_text or "breakout" in method_text) and day_change > 1.5 and volume >= 1.0
     if strategy == "gap & go":
@@ -2304,8 +2545,6 @@ def variant_strategy_matches(strategy, pick):
             except Exception:
                 scores = {}
         return float(scores.get("vwap_reclaim") or 0) >= 0.65 or "vwap" in method_text
-    if strategy == "donchian":
-        return day_change > 2 and confluence >= 1 and confidence >= 62
     if strategy == "inside day":
         return abs(gap) <= 4 and day_change > 0.5 and volume >= 0.8 and 45 <= rsi <= 65
     if strategy == "nr7":
@@ -2314,8 +2553,6 @@ def variant_strategy_matches(strategy, pick):
         return day_change > 1 and regular_open_change > -2 and 45 <= rsi <= 70 and confidence >= 62
     if strategy == "pocket pivot":
         return volume >= 1.4 and day_change > 0.5 and confidence >= 60
-    if strategy == "s&r breakout":
-        return confluence >= 1 and day_change > 1 and confidence >= 60
     if strategy == "vol squeeze breakout":
         scores = pick.get("signal_scores_for_observation") or pick.get("signal_scores") or {}
         if isinstance(scores, str):
@@ -2324,10 +2561,18 @@ def variant_strategy_matches(strategy, pick):
             except Exception:
                 scores = {}
         return float(scores.get("volatility_squeeze") or 0) >= 0.5 and day_change > 1
+    if strategy == "relative strength pullback":
+        return confidence >= 62 and day_change > 0 and regular_open_change <= 1.5 and 42 <= rsi <= 62 and volume >= 1.0
+    if strategy == "ema trend pullback":
+        return confidence >= 62 and -2.5 <= regular_open_change <= 1.0 and day_change >= -1.0 and 45 <= rsi <= 60 and volume >= 0.9
+    if strategy == "opening range hold":
+        return confidence >= 62 and gap >= 1.0 and regular_open_change >= -0.5 and day_change > 0 and 45 <= rsi <= 68
     return confidence >= 65
 
-def filter_variant_strategy_picks(picks, variant):
+def filter_variant_strategy_picks(picks, variant, weights=None):
     filtered = [p for p in picks if variant_strategy_matches(variant.get("strategy"), p)]
+    if weights:
+        filtered.sort(key=lambda p: variant_weighted_signal_score(p, weights), reverse=True)
     return filtered
 
 def pick_confidence_and_move(pick, brain="Vector"):
@@ -2342,6 +2587,23 @@ def pick_confidence_and_move(pick, brain="Vector"):
     except Exception:
         expected_move = 0.0
     return confidence, expected_move
+
+def is_long_pick_eligible(pick, open_tickers=None, confidence_floor=CONFIDENCE_FLOOR):
+    """Shared Vector/Nova long-pick gate before ranking or variant selection."""
+    if not pick or not pick.get("ticker"):
+        return False
+    if open_tickers and pick.get("ticker") in open_tickers:
+        return False
+    confidence, expected_move = pick_confidence_and_move(pick)
+    volume = float(pick.get("vol_ratio") or pick.get("volume_ratio") or 1)
+    price = float(pick.get("open_price") or pick.get("price") or pick.get("buy_price") or 0)
+    return (
+        price > 0
+        and confidence >= confidence_floor
+        and expected_move >= MIN_EXPECTED_MOVE
+        and volume >= MIN_VOLUME_RATIO
+        and not pick.get("earnings_soon")
+    )
 
 def variant_investment_amount(portfolio):
     """Small starting allocation that compounds independently per universe."""
@@ -4593,13 +4855,8 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
     # Shorts are disabled: current signals (RSI momentum, volume surge, gap probability)
     # are optimized for long setups. Short-specific signals (RSI overbought, failed
     # breakout, sector weakness) will be added in a future session before re-enabling.
-    MIN_VOLUME_RATIO = 1.2  # Minimum volume activity to confirm a real setup
     recommended_longs = sorted(
-        [s for s in scored_stocks
-         if s["long_conf"] >= CONFIDENCE_FLOOR
-         and s["long_move"] >= MIN_EXPECTED_MOVE
-         and s["vol_ratio"] >= MIN_VOLUME_RATIO
-         and s["ticker"] not in open_short_tickers],
+        [s for s in scored_stocks if is_long_pick_eligible(s, open_short_tickers)],
         key=lambda x: x["long_conf"], reverse=True
     )
     recommended_shorts = []  # Disabled until short-specific signals are implemented
@@ -4786,7 +5043,8 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None):
             source_picks = nova_picks if brain == "Nova" else vector_picks
             if brain == "Nova":
                 source_picks = [p for p in source_picks if p.get("nn_executable", True)]
-            strategy_filtered = filter_variant_strategy_picks(source_picks, variant)
+            variant_weights = get_variant_signal_weights(database, variant["id"])
+            strategy_filtered = filter_variant_strategy_picks(source_picks, variant, variant_weights)
             if not strategy_filtered:
                 status["skipped"].append({"variant_id": variant["id"], "reason": "no strategy-qualified picks"})
                 status["skipped_count"] += 1
@@ -4850,16 +5108,19 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None):
                 if not isinstance(signal_scores, str):
                     signal_scores = json.dumps(signal_scores)
                 reasoning = pick.get("long_reasoning") or f"{brain} variant simulation"
-                database.execute("""
+                fee_quote = calculate_stock_fee_model(invested, buy_price, buy_price, "long")
+                database.execute(f"""
                     INSERT INTO variant_virtual_trades
                     (id, variant_id, strategy, brain, ticker, direction, buy_date, buy_time,
                      buy_price, invested_amount, current_value, confidence, expected_move,
+                     {FEE_MODEL_INSERT_COLUMNS},
                      outcome, sector, reasoning, signal_scores, source_scan_time, source_rank,
                      created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 'long', ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, 'long', ?, ?, ?, ?, ?, ?, ?, {FEE_MODEL_INSERT_PLACEHOLDERS}, 'open', ?, ?, ?, ?, ?, ?, ?)
                 """, [
                     trade_id, variant["id"], variant["strategy"], brain, ticker, today, buy_time,
-                    float(buy_price), round(invested, 4), round(invested, 4), confidence, expected_move,
+                    float(buy_price), round(invested, 4), fee_quote["net_current_value"], confidence, expected_move,
+                    *fee_model_values(fee_quote),
                     pick.get("sector") or get_sector(ticker), reasoning, signal_scores, scan_time, rank,
                     status["ran_at"], status["ran_at"],
                 ])
@@ -4942,7 +5203,8 @@ def monitor_variant_universes(trigger="manual"):
             pnl_pct = (price - buy_price) / max(buy_price, 0.01) * 100
             if row.get("direction") == "short":
                 pnl_pct = -pnl_pct
-            current_value = invested + invested * pnl_pct / 100
+            fee_quote = calculate_stock_fee_model(invested, buy_price, price, row.get("direction") or "long")
+            current_value = fee_quote["net_current_value"]
             should_close = False
             sell_reason = None
 
@@ -4955,17 +5217,20 @@ def monitor_variant_universes(trigger="manual"):
                 sell_reason = "stop_loss"
 
             if should_close:
-                gross_pnl = current_value - invested
-                database.execute("""
+                outcome = "hit" if pnl_pct > 0 else "miss"
+                database.execute(f"""
                     UPDATE variant_virtual_trades
                     SET current_value=?, sell_date=?, sell_time=?, sell_price=?,
-                        actual_move=?, gross_pnl=?, net_pnl=?, outcome=?, sell_reason=?, updated_at=?
+                        actual_move=?, gross_pnl=?, net_pnl=?, {FEE_MODEL_UPDATE_SET},
+                        outcome=?, sell_reason=?, updated_at=?
                     WHERE id=?
                 """, [
                     round(current_value, 4), today, now.strftime("%H:%M:%S"), price,
-                    round(pnl_pct, 2), round(gross_pnl, 4), round(gross_pnl, 4),
-                    "hit" if pnl_pct > 0 else "miss", sell_reason, status["ran_at"], row["id"],
+                    round(pnl_pct, 2), fee_quote["gross_pnl"], fee_quote["net_pnl"],
+                    *fee_model_values(fee_quote),
+                    outcome, sell_reason, status["ran_at"], row["id"],
                 ])
+                learn_variant_from_closed_trade(database, row, outcome, round(pnl_pct, 2))
                 database.execute("""
                     UPDATE variant_portfolios
                     SET cash=ROUND(cash + ?, 4), updated_at=?
@@ -4973,11 +5238,14 @@ def monitor_variant_universes(trigger="manual"):
                 """, [round(current_value, 4), status["ran_at"], row["variant_id"]])
                 status["closed_count"] += 1
             else:
-                database.execute("""
+                database.execute(f"""
                     UPDATE variant_virtual_trades
-                    SET current_value=?, actual_move=?, updated_at=?
+                    SET current_value=?, actual_move=?, {FEE_MODEL_UPDATE_SET}, updated_at=?
                     WHERE id=?
-                """, [round(current_value, 4), round(pnl_pct, 2), status["ran_at"], row["id"]])
+                """, [
+                    round(current_value, 4), round(pnl_pct, 2), *fee_model_values(fee_quote),
+                    status["ran_at"], row["id"],
+                ])
 
             status["updated_count"] += 1
             touched_variants.add(row["variant_id"])
@@ -5045,21 +5313,27 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
             }
 
             nn_conf = nn_score_ticker(synthetic, "long")
-            scored.append({
+            nova_pick = {
                 **base,
                 "long_conf": nn_conf,
                 "long_reasoning": f"NN confidence {nn_conf}% from shared scan",
                 "crude_conf": base.get("long_conf"),
                 "nn_score": nn_conf,
-                "nn_executable": nn_conf >= NN_CONFIDENCE_FLOOR,
                 "signal_scores_for_observation": sig_scores,
                 "signal_values_for_observation": sig_values,
                 "fired_signals_for_observation": fired,
+            }
+            nova_pick["nn_executable"] = is_long_pick_eligible(
+                nova_pick,
+                confidence_floor=NN_CONFIDENCE_FLOOR,
+            )
+            scored.append({
+                **nova_pick,
             })
 
         scored.sort(key=lambda x: x["long_conf"], reverse=True)
         qualified = [s for s in scored if s.get("nn_executable")]
-        top_picks = (qualified or scored)[:MAX_LONG_PICKS]
+        top_picks = qualified[:MAX_LONG_PICKS]
         attach_confidence_evidence(top_picks, "long_conf")
         observations_logged = log_nova_signal_observations(scan_event_id, scan_type, scored, price_data, queue_locked)
         result = {
@@ -5073,7 +5347,7 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
             "picks": len(top_picks),
             "source": "shared_comprehensive_scan",
             "observations_logged": observations_logged,
-            "message": "No NN picks qualified above threshold; showing top Nova-ranked shared-snapshot candidates" if top_picks and not qualified else ("No shared-snapshot candidates available for Nova" if not top_picks else None),
+            "message": "No Nova picks qualified above the shared executable gate" if not top_picks else None,
         }
 
         db = get_database()
@@ -5366,18 +5640,21 @@ def _execute_opening_positions_legacy():
         except:
             pass
 
-        existing.execute("""
+        fee_quote = calculate_stock_fee_model(invested_amount, buy_price, buy_price, direction)
+        existing.execute(f"""
             INSERT INTO virtual_trades
             (id, ticker, direction, buy_date, buy_time, buy_price, invested_amount,
              confidence, lock_in_confidence, expected_move, outcome, sector, reasoning, closed_days,
              status, current_value, intraday_high_pct, intraday_low_pct, queue_position,
-             signal_scores, news_sentiment_score, news_article_count, broke_52w_high_days_ago)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             signal_scores, news_sentiment_score, news_article_count, broke_52w_high_days_ago,
+             {FEE_MODEL_INSERT_COLUMNS})
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,{FEE_MODEL_INSERT_PLACEHOLDERS})
         """, [trade_id, ticker, direction, today, "08:45:00", buy_price,
               round(invested_amount, 4), confidence, confidence, expected_move, "open",
               get_sector(ticker), reasoning, closed_days,
-              "open", round(invested_amount, 4), 0.0, 0.0, queue_id,
-              _signal_scores_json, _news_sentiment, _news_count, _52w_days_ago])
+              "open", fee_quote["net_current_value"], 0.0, 0.0, queue_id,
+              _signal_scores_json, _news_sentiment, _news_count, _52w_days_ago,
+              *fee_model_values(fee_quote)])
         existing.commit()
         existing.close()
 
@@ -5497,18 +5774,21 @@ def execute_opening_positions(trigger="scheduled", buy_time="08:45:00"):
                 pass
 
             try:
-                existing.execute("""
+                fee_quote = calculate_stock_fee_model(invested_amount, buy_price, buy_price, direction)
+                existing.execute(f"""
                     INSERT INTO virtual_trades
                     (id, ticker, direction, buy_date, buy_time, buy_price, invested_amount,
                      confidence, lock_in_confidence, expected_move, outcome, sector, reasoning, closed_days,
                      status, current_value, intraday_high_pct, intraday_low_pct, queue_position,
-                     signal_scores, news_sentiment_score, news_article_count, broke_52w_high_days_ago)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     signal_scores, news_sentiment_score, news_article_count, broke_52w_high_days_ago,
+                     {FEE_MODEL_INSERT_COLUMNS})
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,{FEE_MODEL_INSERT_PLACEHOLDERS})
                 """, [trade_id, ticker, direction, today, buy_time, buy_price,
                       round(invested_amount, 4), confidence, confidence, expected_move, "open",
                       get_sector(ticker), reasoning, closed_days,
-                      "open", round(invested_amount, 4), 0.0, 0.0, queue_id,
-                      _signal_scores_json, _news_sentiment, _news_count, _52w_days_ago])
+                      "open", fee_quote["net_current_value"], 0.0, 0.0, queue_id,
+                      _signal_scores_json, _news_sentiment, _news_count, _52w_days_ago,
+                      *fee_model_values(fee_quote)])
                 existing.commit()
                 existing.close()
                 consume_queue_amount(queue_id, trade_id)
@@ -5647,24 +5927,26 @@ def execute_nn_opening_positions(trigger="scheduled", buy_time="08:45:00"):
                 confluence_methods = "[]"
 
             try:
-                existing.execute("""
+                fee_quote = calculate_stock_fee_model(invested_amount, buy_price, buy_price, direction)
+                existing.execute(f"""
                     INSERT INTO nn_virtual_trades
                     (id, ticker, direction, buy_date, buy_time, buy_price, invested_amount,
                      current_value, confidence, nn_confidence, lock_in_confidence, expected_move,
                      outcome, sector, reasoning, intraday_high_pct, intraday_low_pct,
                      dynamic_confidence, dynamic_estimate, confluence_count, confluence_methods,
                      signal_scores, day_change_percent, news_sentiment_score, news_article_count,
-                     last_price_updated)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     {FEE_MODEL_INSERT_COLUMNS}, last_price_updated)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,{FEE_MODEL_INSERT_PLACEHOLDERS},?)
                 """, [
                     trade_id, ticker, direction, today, buy_time, buy_price,
-                    round(invested_amount, 4), round(invested_amount, 4),
+                    round(invested_amount, 4), fee_quote["net_current_value"],
                     crude_confidence, nn_confidence, nn_confidence, expected_move,
                     "open", get_sector(ticker), reasoning, 0.0, 0.0,
                     nn_confidence, expected_move, int(pick.get("confluence_count") or 0),
                     confluence_methods, signal_scores_json, pick.get("day_change_pct", 0),
                     float(pick.get("news_sentiment_score") or 0),
                     int(pick.get("news_article_count") or len(pick.get("news", []) or [])),
+                    *fee_model_values(fee_quote),
                     current_time_cst().isoformat()
                 ])
                 existing.commit()
@@ -5730,7 +6012,8 @@ def monitor_nn_open_positions():
         if position["direction"] == "short":
             pnl_percent = -pnl_percent
         pnl_dollars = invested * (pnl_percent / 100)
-        current_value = invested + pnl_dollars
+        fee_quote = calculate_stock_fee_model(invested, buy_price, price, position["direction"])
+        current_value = fee_quote["net_current_value"]
         high_pct = max(position.get("intraday_high_pct") or 0, pnl_percent)
         low_pct = min(position.get("intraday_low_pct") or 0, pnl_percent)
 
@@ -5775,14 +6058,16 @@ def monitor_nn_open_positions():
         except Exception as dynamic_error:
             log.debug(f"NN dynamic update skipped for {ticker}: {dynamic_error}")
 
-        database.execute("""
+        database.execute(f"""
             UPDATE nn_virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?,
             dynamic_confidence=?, dynamic_estimate=?, confluence_count=?, confluence_methods=?,
-            signal_scores=?, last_price_updated=?, day_change_percent=?
+            signal_scores=?, last_price_updated=?, day_change_percent=?,
+            {FEE_MODEL_UPDATE_SET}
             WHERE id=?
         """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2),
               dyn_conf, round(float(dyn_est or 0), 1), conf_count, conf_methods,
-              signal_scores_json, now.isoformat(), day_change_pct, position["id"]])
+              signal_scores_json, now.isoformat(), day_change_pct,
+              *fee_model_values(fee_quote), position["id"]])
         updated_count += 1
 
         if not is_market_open():
@@ -5792,16 +6077,16 @@ def monitor_nn_open_positions():
         if is_sell_day and now.hour >= 8 and now.hour < 15:
             should_sell, reason, sentiment = evaluate_sell_decision(position, price)
             if should_sell:
-                net_pnl = pnl_dollars - FEE_PER_TRADE
                 outcome = "hit" if pnl_percent >= MIN_EXPECTED_MOVE else ("partial" if pnl_percent > 0 else "miss")
-                database.execute("""
+                database.execute(f"""
                     UPDATE nn_virtual_trades SET
                         sell_date=?, sell_time=?, sell_price=?, current_value=?,
-                        actual_move=?, gross_pnl=?, net_pnl=?, outcome=?, sell_reason=?
+                        actual_move=?, gross_pnl=?, net_pnl=?, {FEE_MODEL_UPDATE_SET},
+                        outcome=?, sell_reason=?
                     WHERE id=?
                 """, [today, now.strftime("%H:%M:%S"), price,
                       round(current_value, 4), round(pnl_percent, 2),
-                      round(pnl_dollars, 4), round(net_pnl, 4),
+                      fee_quote["gross_pnl"], fee_quote["net_pnl"], *fee_model_values(fee_quote),
                       outcome, reason, position["id"]])
                 closed_count += 1
                 log.info(f"NN CLOSED {ticker} | {reason} | {pnl_percent:+.1f}% | ${pnl_dollars:+.2f}")
@@ -5955,6 +6240,7 @@ def _monitor_open_positions_impl():
         if position["direction"] == "short":
             pnl_percent = -pnl_percent
         pnl_dollars = invested * (pnl_percent / 100)
+        fee_quote = calculate_stock_fee_model(invested, buy_price, price, position["direction"])
         baseline_data = monitor_baselines(position, price_data, pnl_percent)
         pct_prev_close = baseline_data["pct_prev_close"]
         pct_regular_open = baseline_data["pct_regular_open"]
@@ -5962,7 +6248,7 @@ def _monitor_open_positions_impl():
         entry_integrity_status, entry_integrity_note = baseline_data["entry_integrity"]
 
         # Update current value, intraday extremes, and dynamic scores
-        current_value = invested + pnl_dollars
+        current_value = fee_quote["net_current_value"]
         high_pct = max(position.get("intraday_high_pct") or 0, pnl_percent)
         low_pct = min(position.get("intraday_low_pct") or 0, pnl_percent)
 
@@ -6024,13 +6310,14 @@ def _monitor_open_positions_impl():
             _signal_scores_json = position.get("signal_scores") or json.dumps({"scores": {}, "fired": []})
 
         try:
-            database.execute("""
+            database.execute(f"""
                 UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?,
                 dynamic_confidence=?, dynamic_estimate=?, confluence_count=?, confluence_methods=?,
                 signal_scores=?, last_price_updated=?, day_change_percent=?,
                 pct_change_prev_close=?, pct_change_regular_open=?, pct_change_entry=?,
                 entry_price_source=COALESCE(entry_price_source, ?),
-                entry_integrity_status=?, entry_integrity_note=?
+                entry_integrity_status=?, entry_integrity_note=?,
+                {FEE_MODEL_UPDATE_SET}
                 WHERE id=?
             """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2),
                   dyn_conf, round(dyn_est, 1), conf_count, conf_methods,
@@ -6040,14 +6327,15 @@ def _monitor_open_positions_impl():
                   round(pct_entry, 4),
                   price_data.get("source", "unknown"),
                   entry_integrity_status, entry_integrity_note,
-                  position["id"]])
+                  *fee_model_values(fee_quote), position["id"]])
         except:
-            database.execute("""
+            database.execute(f"""
                 UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?,
                 last_price_updated=?, day_change_percent=?,
                 pct_change_prev_close=?, pct_change_regular_open=?, pct_change_entry=?,
                 entry_price_source=COALESCE(entry_price_source, ?),
-                entry_integrity_status=?, entry_integrity_note=?
+                entry_integrity_status=?, entry_integrity_note=?,
+                {FEE_MODEL_UPDATE_SET}
                 WHERE id=?
             """, [round(current_value, 4), round(high_pct, 2), round(low_pct, 2),
                   now.isoformat(), day_change_pct,
@@ -6056,7 +6344,7 @@ def _monitor_open_positions_impl():
                   round(pct_entry, 4),
                   price_data.get("source", "unknown"),
                   entry_integrity_status, entry_integrity_note,
-                  position["id"]])
+                  *fee_model_values(fee_quote), position["id"]])
 
         # Refresh news for open positions — once per monitor cycle, rate-limited
         # Only refresh if news is stale (>30 min old) to stay within Alpha Vantage limits
@@ -6116,17 +6404,17 @@ def _monitor_open_positions_impl():
             """, [position["id"], now.isoformat(), price, round(pnl_percent, 2), sentiment, ticker])
 
             if should_sell:
-                net_pnl = pnl_dollars - FEE_PER_TRADE
                 outcome = "hit" if pnl_percent >= MIN_EXPECTED_MOVE else ("partial" if pnl_percent > 0 else "miss")
 
-                database.execute("""
+                database.execute(f"""
                     UPDATE virtual_trades SET
                         sell_date=?, sell_time=?, sell_price=?, current_value=?,
-                        actual_move=?, gross_pnl=?, net_pnl=?, outcome=?, sell_reason=?
+                        actual_move=?, gross_pnl=?, net_pnl=?, {FEE_MODEL_UPDATE_SET},
+                        outcome=?, sell_reason=?
                     WHERE id=?
                 """, [today, now.strftime("%H:%M:%S"), price,
                       round(current_value, 4), round(pnl_percent, 2),
-                      round(pnl_dollars, 4), round(net_pnl, 4),
+                      fee_quote["gross_pnl"], fee_quote["net_pnl"], *fee_model_values(fee_quote),
                       outcome, reason, position["id"]])
 
                 # Record as day trade if opened and closed same day
@@ -6264,17 +6552,19 @@ def force_close_previous_session():
         if position["direction"] == "short":
             pnl_percent = -pnl_percent
         pnl_dollars = invested * (pnl_percent / 100)
-        net_pnl = pnl_dollars - FEE_PER_TRADE
-        ending_value = invested + pnl_dollars
+        fee_quote = calculate_stock_fee_model(invested, buy_price, price, position["direction"])
+        ending_value = fee_quote["net_current_value"]
         outcome = "hit" if pnl_percent >= MIN_EXPECTED_MOVE else ("partial" if pnl_percent > 0 else "miss")
 
-        database.execute("""
+        database.execute(f"""
             UPDATE virtual_trades SET
                 sell_date=?, sell_time=?, sell_price=?, current_value=?,
-                actual_move=?, gross_pnl=?, net_pnl=?, outcome=?, sell_reason=?
+                actual_move=?, gross_pnl=?, net_pnl=?, {FEE_MODEL_UPDATE_SET},
+                outcome=?, sell_reason=?
             WHERE id=?
         """, [today, "14:45:00", price, round(ending_value, 4),
-              round(pnl_percent, 2), round(pnl_dollars, 4), round(net_pnl, 4),
+              round(pnl_percent, 2), fee_quote["gross_pnl"], fee_quote["net_pnl"],
+              *fee_model_values(fee_quote),
               outcome, "forced_close", position["id"]])
 
         database.execute("""
@@ -6333,17 +6623,19 @@ def force_close_nn_previous_session():
         if position["direction"] == "short":
             pnl_percent = -pnl_percent
         pnl_dollars = invested * (pnl_percent / 100)
-        net_pnl = pnl_dollars - FEE_PER_TRADE
-        ending_value = invested + pnl_dollars
+        fee_quote = calculate_stock_fee_model(invested, buy_price, price, position["direction"])
+        ending_value = fee_quote["net_current_value"]
         outcome = "hit" if pnl_percent >= MIN_EXPECTED_MOVE else ("partial" if pnl_percent > 0 else "miss")
 
-        database.execute("""
+        database.execute(f"""
             UPDATE nn_virtual_trades SET
                 sell_date=?, sell_time=?, sell_price=?, current_value=?,
-                actual_move=?, gross_pnl=?, net_pnl=?, outcome=?, sell_reason=?
+                actual_move=?, gross_pnl=?, net_pnl=?, {FEE_MODEL_UPDATE_SET},
+                outcome=?, sell_reason=?
             WHERE id=?
         """, [today, "14:45:00", price, round(ending_value, 4),
-              round(pnl_percent, 2), round(pnl_dollars, 4), round(net_pnl, 4),
+              round(pnl_percent, 2), fee_quote["gross_pnl"], fee_quote["net_pnl"],
+              *fee_model_values(fee_quote),
               outcome, "forced_close", position["id"]])
         closed_count += 1
 
@@ -7008,12 +7300,14 @@ def api_performance_history():
     - Always emits a $1,000 seed point so the chart has something to draw from
       day one.
     """
+    fees_on = request.args.get("fees", "on").lower() != "off"
+    pnl_expr = "COALESCE(net_pnl, gross_pnl, 0)" if fees_on else "COALESCE(gross_pnl, net_pnl, 0)"
     database = get_database()
 
     # ── Settled (closed) daily P&L ────────────────────────────────────────────
-    daily_results = database.execute("""
+    daily_results = database.execute(f"""
         SELECT sell_date AS date,
-               SUM(COALESCE(gross_pnl, 0)) AS daily_pnl,
+               SUM({pnl_expr}) AS daily_pnl,
                COUNT(*) AS trade_count
         FROM virtual_trades
         WHERE outcome != 'open' AND sell_date IS NOT NULL
@@ -7105,16 +7399,16 @@ def api_performance_history():
     # run today (e.g. no positions were open during market hours).
     try:
         open_trades = database.execute(
-            "SELECT invested_amount, current_value FROM virtual_trades WHERE outcome='open'"
+            "SELECT invested_amount, current_value, gross_current_value FROM virtual_trades WHERE outcome='open'"
         ).fetchall() if not database else None
         # Re-open db since we closed it above
         _db2 = get_database()
         open_trades = _db2.execute(
-            "SELECT invested_amount, current_value FROM virtual_trades WHERE outcome='open'"
+            "SELECT invested_amount, current_value, gross_current_value FROM virtual_trades WHERE outcome='open'"
         ).fetchall()
         _db2.close()
         live_pnl = sum(
-            float(t["current_value"] or t["invested_amount"] or 10) - float(t["invested_amount"] or 10)
+            float((t["current_value"] if fees_on else t["gross_current_value"]) or t["current_value"] or t["invested_amount"] or 10) - float(t["invested_amount"] or 10)
             for t in open_trades
         )
         if live_pnl != 0:
@@ -7138,19 +7432,21 @@ def api_performance_history():
 def api_day_pnl():
     """Current main account value vs previous settled session close baseline."""
     try:
+        fees_on = request.args.get("fees", "on").lower() != "off"
+        pnl_expr = "COALESCE(net_pnl, gross_pnl, 0)" if fees_on else "COALESCE(gross_pnl, net_pnl, 0)"
         now = current_time_cst()
         today = now.strftime("%Y-%m-%d")
         db = get_database()
-        settled_rows = [dict(r) for r in db.execute("""
+        settled_rows = [dict(r) for r in db.execute(f"""
             SELECT sell_date AS date,
-                   SUM(COALESCE(gross_pnl, 0)) AS daily_pnl
+                   SUM({pnl_expr}) AS daily_pnl
             FROM virtual_trades
             WHERE outcome != 'open' AND sell_date IS NOT NULL
             GROUP BY sell_date
             ORDER BY sell_date ASC
         """).fetchall()]
         open_rows = [dict(r) for r in db.execute("""
-            SELECT invested_amount, current_value
+            SELECT invested_amount, current_value, gross_current_value
             FROM virtual_trades
             WHERE outcome='open'
         """).fetchall()]
@@ -7170,7 +7466,7 @@ def api_day_pnl():
                 today_settled += daily
 
         open_pnl = sum(
-            float(r.get("current_value") or r.get("invested_amount") or 10) -
+            float((r.get("current_value") if fees_on else r.get("gross_current_value")) or r.get("current_value") or r.get("invested_amount") or 10) -
             float(r.get("invested_amount") or 10)
             for r in open_rows
         )
@@ -7189,10 +7485,38 @@ def api_day_pnl():
             "open_count": len(open_rows),
             "as_of": now.isoformat(),
             "basis": "previous settled session close plus today's settled and open P&L",
+            "fees_on": fees_on,
+            "fee_model_version": STOCK_FEE_MODEL_VERSION if fees_on else "gross",
         })
     except Exception as e:
         log.error(f"day-pnl error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/fee-model")
+def api_fee_model():
+    """Expose the pinned fee/slippage assumptions used by SwingDesk simulations."""
+    stock_qa = calculate_stock_fee_model(100.0, 100.0, 100.0, "long")
+    crypto_qa = calculate_crypto_fee_model(100.0, 100.0, 100.0, "long")
+    return jsonify({
+        "success": True,
+        "stocks": {
+            "version": STOCK_FEE_MODEL_VERSION,
+            "mode": "conservative_stress",
+            "buy_friction_pct": STOCK_BUY_FRICTION_RATE * 100,
+            "sell_friction_pct": STOCK_SELL_FRICTION_RATE * 100,
+            "sec_section_31_rate_per_million": SEC_SECTION_31_RATE * 1_000_000,
+            "finra_taf_per_share": FINRA_TAF_PER_SHARE,
+            "finra_taf_cap": FINRA_TAF_CAP,
+            "qa_no_move_round_trip_100": stock_qa,
+        },
+        "crypto": {
+            "version": CRYPTO_FEE_MODEL_VERSION,
+            "mode": "conservative_stress_pinned_for_sdcrypto",
+            "buy_friction_pct": CRYPTO_BUY_FRICTION_RATE * 100,
+            "sell_friction_pct": CRYPTO_SELL_FRICTION_RATE * 100,
+            "qa_no_move_round_trip_100": crypto_qa,
+        },
+    })
 
 @app.route("/api/ping")
 def api_ping():
@@ -7237,13 +7561,14 @@ def api_stats():
     virtual_trade_count = database.execute("SELECT COUNT(*) as n FROM virtual_trades").fetchone()["n"]
     open_position_count = database.execute("SELECT COUNT(*) as n FROM virtual_trades WHERE outcome='open'").fetchone()["n"]
     closed_rows = database.execute(
-        "SELECT outcome, actual_move, gross_pnl FROM virtual_trades WHERE outcome != 'open'"
+        "SELECT outcome, actual_move, gross_pnl, net_pnl FROM virtual_trades WHERE outcome != 'open'"
     ).fetchall()
     resolved_count = len(closed_rows)
     hit_count = sum(1 for t in closed_rows if t["outcome"] == "hit")
     partial_count = sum(1 for t in closed_rows if t["outcome"] == "partial")
     miss_count = sum(1 for t in closed_rows if t["outcome"] == "miss")
     total_gross_pnl = sum(float(t["gross_pnl"] or 0) for t in closed_rows)
+    total_net_pnl = sum(float(t["net_pnl"] if t["net_pnl"] is not None else t["gross_pnl"] or 0) for t in closed_rows)
     win_rate = round(hit_count / resolved_count * 100, 1) if resolved_count else None
 
     # predictions table used only for audit/weight system — not for performance stats
@@ -7261,6 +7586,8 @@ def api_stats():
         "misses": miss_count,
         "win_rate": win_rate,
         "total_gross_pnl": round(total_gross_pnl, 2),
+        "total_net_pnl": round(total_net_pnl, 2),
+        "fee_model_version": STOCK_FEE_MODEL_VERSION,
         "virtual_trades": virtual_trade_count,
         "virtual_open": open_position_count,
         "last_audit": last_audit["value"] if last_audit else None,
@@ -7332,6 +7659,7 @@ def api_strategy_variants():
                    MAX(so.scan_time) AS last_observed_at
             FROM strategy_variants sv
             LEFT JOIN signal_observations so ON so.variant_id = sv.id
+            WHERE sv.status='active'
             GROUP BY sv.id
             ORDER BY sv.strategy, sv.brain, sv.execution_time, sv.selection_mode
         """).fetchall()]
@@ -7352,6 +7680,7 @@ def api_variant_portfolios():
                    vp.*
             FROM strategy_variants sv
             JOIN variant_portfolios vp ON vp.variant_id = sv.id
+            WHERE sv.status='active' AND vp.lifecycle_status!='archived'
             ORDER BY sv.strategy, sv.brain, sv.selection_mode
         """).fetchall()]
         db.close()
@@ -7380,6 +7709,7 @@ def api_variant_leaderboard():
             FROM strategy_variants sv
             JOIN variant_portfolios vp ON vp.variant_id = sv.id
             LEFT JOIN variant_virtual_trades vt ON vt.variant_id = sv.id
+            WHERE sv.status='active' AND vp.lifecycle_status!='archived'
             GROUP BY sv.id
             ORDER BY vp.equity DESC, vp.win_count DESC, vp.max_drawdown_pct ASC
         """).fetchall()]
@@ -7422,6 +7752,7 @@ def api_variant_status():
                 MAX(equity) AS best_equity,
                 MIN(equity) AS worst_equity
             FROM variant_portfolios
+            WHERE lifecycle_status!='archived'
         """).fetchone()
         db.close()
         payload = {
@@ -7561,6 +7892,33 @@ def api_variant_detail(variant_id):
     except Exception as e:
         log.error(f"variant detail error: {e}")
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/variant-learning-events")
+def api_variant_learning_events():
+    """Recent per-universe weight updates for Vector/Nova QA."""
+    try:
+        limit = min(max(int(request.args.get("limit", 100)), 1), 500)
+        variant_id = request.args.get("variant_id")
+        where = "WHERE variant_id=?" if variant_id else ""
+        params = [variant_id] if variant_id else []
+        db = get_database()
+        rows = [dict(r) for r in db.execute(f"""
+            SELECT * FROM variant_learning_events
+            {where}
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, params + [limit]).fetchall()]
+        db.close()
+        for row in rows:
+            for key in ("weights_before", "weights_after", "reasoning"):
+                try:
+                    row[key] = json.loads(row[key] or "{}")
+                except Exception:
+                    row[key] = [] if key == "reasoning" else {}
+        return jsonify(rows)
+    except Exception as e:
+        log.error(f"variant-learning-events error: {e}")
+        return jsonify([]), 500
 
 @app.route("/api/variant-run-now", methods=["POST"])
 def api_variant_run_now():
@@ -8051,16 +8409,27 @@ def api_seed_friday():
                   pick["reasoning"], get_sector(pick["ticker"]), 50.0, pick["volume_ratio"],
                   json.dumps(weights), f"{friday_date}T08:15:00"])
             
+            fee_quote = calculate_stock_fee_model(
+                DEFAULT_INVESTMENT,
+                pick["open_price"],
+                pick["open_price"],
+                "long",
+            )
             database.execute("""
                 INSERT INTO virtual_trades
                 (id, ticker, direction, buy_date, buy_time, buy_price, invested_amount,
                  confidence, expected_move, outcome, sector, reasoning, closed_days,
-                 status, current_value, intraday_high_pct, intraday_low_pct)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 status, current_value, intraday_high_pct, intraday_low_pct,
+                 fee_model_version, entry_fee, entry_slippage, exit_fee, exit_slippage,
+                 total_fees, gross_current_value, share_quantity)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, [trade_id, pick["ticker"], "long", friday_date, "08:45:00", pick["open_price"],
                   DEFAULT_INVESTMENT, pick["confidence"], pick["expected_move"],
                   "open", get_sector(pick["ticker"]), pick["reasoning"], 4,
-                  "open", DEFAULT_INVESTMENT, 0.0, 0.0])
+                  "open", fee_quote["net_current_value"], 0.0, 0.0,
+                  fee_quote["fee_model_version"], fee_quote["entry_fee"], fee_quote["entry_slippage"],
+                  fee_quote["exit_fee"], fee_quote["exit_slippage"], fee_quote["total_fees"],
+                  fee_quote["gross_current_value"], fee_quote["share_quantity"]])
             opened += 1
         
         # Backfill 5-minute position checks
@@ -8094,11 +8463,21 @@ def api_seed_friday():
                     
                     if all_pcts:
                         last_pct = all_pcts[-1]
-                        final_value = DEFAULT_INVESTMENT + DEFAULT_INVESTMENT * (last_pct/100)
+                        final_price = buy_price * (1 + last_pct / 100)
+                        fee_quote = calculate_stock_fee_model(DEFAULT_INVESTMENT, buy_price, final_price, "long")
                         database.execute("""
-                            UPDATE virtual_trades SET current_value=?, intraday_high_pct=?, intraday_low_pct=?
+                            UPDATE virtual_trades
+                            SET current_value=?, intraday_high_pct=?, intraday_low_pct=?,
+                                fee_model_version=?, entry_fee=?, entry_slippage=?,
+                                exit_fee=?, exit_slippage=?, total_fees=?,
+                                gross_current_value=?, share_quantity=?
                             WHERE id=?
-                        """, [round(final_value,4), round(max(all_pcts),2), round(min(all_pcts),2), trade["id"]])
+                        """, [
+                            fee_quote["net_current_value"], round(max(all_pcts), 2), round(min(all_pcts), 2),
+                            fee_quote["fee_model_version"], fee_quote["entry_fee"], fee_quote["entry_slippage"],
+                            fee_quote["exit_fee"], fee_quote["exit_slippage"], fee_quote["total_fees"],
+                            fee_quote["gross_current_value"], fee_quote["share_quantity"], trade["id"],
+                        ])
                 except: continue
         
         database.commit()
@@ -8218,12 +8597,20 @@ def api_backfill_close_prices():
             pnl_pct = (close - buy_price) / buy_price * 100
             if position["direction"] == "short":
                 pnl_pct = -pnl_pct
-            current_value = invested * (1 + pnl_pct / 100)
+            fee_quote = calculate_stock_fee_model(invested, buy_price, close, position["direction"])
+            current_value = fee_quote["net_current_value"]
 
-            database.execute(
-                "UPDATE virtual_trades SET current_value=? WHERE id=?",
-                [round(current_value, 4), position["id"]]
-            )
+            database.execute("""
+                UPDATE virtual_trades
+                SET current_value=?, fee_model_version=?, entry_fee=?, entry_slippage=?,
+                    exit_fee=?, exit_slippage=?, total_fees=?, gross_current_value=?, share_quantity=?
+                WHERE id=?
+            """, [
+                round(current_value, 4), fee_quote["fee_model_version"],
+                fee_quote["entry_fee"], fee_quote["entry_slippage"],
+                fee_quote["exit_fee"], fee_quote["exit_slippage"], fee_quote["total_fees"],
+                fee_quote["gross_current_value"], fee_quote["share_quantity"], position["id"],
+            ])
             updated += 1
             results.append({
                 "ticker": ticker,
@@ -8282,12 +8669,20 @@ def api_fix_buy_prices():
                 pnl_pct = -pnl_pct
             if abs(pnl_pct) < 0.005:
                 pnl_pct = 0.0
-            current_value = invested * (1 + pnl_pct / 100)
+            fee_quote = calculate_stock_fee_model(invested, correct_price, close_price, position["direction"])
+            current_value = fee_quote["net_current_value"]
 
-            database.execute(
-                "UPDATE virtual_trades SET buy_price=?, current_value=? WHERE id=?",
-                [correct_price, round(current_value, 4), position["id"]]
-            )
+            database.execute("""
+                UPDATE virtual_trades
+                SET buy_price=?, current_value=?, fee_model_version=?, entry_fee=?, entry_slippage=?,
+                    exit_fee=?, exit_slippage=?, total_fees=?, gross_current_value=?, share_quantity=?
+                WHERE id=?
+            """, [
+                correct_price, round(current_value, 4), fee_quote["fee_model_version"],
+                fee_quote["entry_fee"], fee_quote["entry_slippage"],
+                fee_quote["exit_fee"], fee_quote["exit_slippage"], fee_quote["total_fees"],
+                fee_quote["gross_current_value"], fee_quote["share_quantity"], position["id"],
+            ])
             updated += 1
             results.append({
                 "ticker": ticker,
@@ -8804,9 +9199,10 @@ def api_force_close_now():
         for position in stuck:
             invested = position["invested_amount"] or DEFAULT_INVESTMENT
             ending_value = position["current_value"] or invested
-            pnl_dollars = ending_value - invested
-            pnl_percent = (pnl_dollars / invested) * 100 if invested else 0
-            net_pnl = pnl_dollars - FEE_PER_TRADE
+            gross_value = position.get("gross_current_value") or ending_value
+            gross_pnl = float(gross_value or invested) - float(invested or 0)
+            net_pnl = float(ending_value or invested) - float(invested or 0)
+            pnl_percent = (gross_pnl / invested) * 100 if invested else 0
             outcome = "hit" if pnl_percent >= MIN_EXPECTED_MOVE else ("partial" if pnl_percent > 0 else "miss")
             db.execute("""
                 UPDATE virtual_trades SET
@@ -8815,7 +9211,7 @@ def api_force_close_now():
                 WHERE id=?
             """, [position["buy_date"], "14:45:00", position["buy_price"],
                   round(ending_value, 4), round(pnl_percent, 2),
-                  round(pnl_dollars, 4), round(net_pnl, 4),
+                  round(gross_pnl, 4), round(net_pnl, 4),
                   outcome, "forced_close", position["id"]])
             db.execute("""
                 UPDATE predictions SET outcome=?, actual_move=?, resolved_at=?
@@ -9264,7 +9660,7 @@ def api_nn_stats():
     try:
         db = get_database()
         closed = [dict(r) for r in db.execute(
-            "SELECT outcome, actual_move, gross_pnl FROM nn_virtual_trades WHERE outcome != 'open'"
+            "SELECT outcome, actual_move, gross_pnl, net_pnl FROM nn_virtual_trades WHERE outcome != 'open'"
         ).fetchall()]
         open_count = db.execute(
             "SELECT COUNT(*) as n FROM nn_virtual_trades WHERE outcome='open'"
@@ -9274,14 +9670,17 @@ def api_nn_stats():
         hits = sum(1 for t in closed if t["outcome"] == "hit")
         misses = sum(1 for t in closed if t["outcome"] == "miss")
         partials = sum(1 for t in closed if t["outcome"] == "partial")
-        total_pnl = sum(float(t["gross_pnl"] or 0) for t in closed)
+        total_gross_pnl = sum(float(t["gross_pnl"] or 0) for t in closed)
+        total_net_pnl = sum(float(t["net_pnl"] if t["net_pnl"] is not None else t["gross_pnl"] or 0) for t in closed)
         return jsonify({
             "resolved": resolved,
             "hits": hits,
             "misses": misses,
             "partials": partials,
             "win_rate": round(hits / resolved * 100, 1) if resolved else None,
-            "total_gross_pnl": round(total_pnl, 2),
+            "total_gross_pnl": round(total_gross_pnl, 2),
+            "total_net_pnl": round(total_net_pnl, 2),
+            "fee_model_version": STOCK_FEE_MODEL_VERSION,
             "open_positions": open_count,
             "portfolio_value": round(get_nn_portfolio_value(), 2),
             "next_investment_amount": round(get_nn_investment_amount(), 2),
@@ -9569,9 +9968,10 @@ def backfill_missed_closes():
         for position in stuck:
             invested = position["invested_amount"] or DEFAULT_INVESTMENT
             ending_value = position["current_value"] or invested
-            pnl_dollars = ending_value - invested
-            pnl_percent = (pnl_dollars / invested) * 100 if invested else 0
-            net_pnl = pnl_dollars - FEE_PER_TRADE
+            gross_value = position.get("gross_current_value") or ending_value
+            gross_pnl = float(gross_value or invested) - float(invested or 0)
+            net_pnl = float(ending_value or invested) - float(invested or 0)
+            pnl_percent = (gross_pnl / invested) * 100 if invested else 0
             outcome = "hit" if pnl_percent >= MIN_EXPECTED_MOVE else ("partial" if pnl_percent > 0 else "miss")
             db.execute("""
                 UPDATE virtual_trades SET
@@ -9580,7 +9980,7 @@ def backfill_missed_closes():
                 WHERE id=?
             """, [position["buy_date"], "14:45:00", position["buy_price"],
                   round(ending_value, 4), round(pnl_percent, 2),
-                  round(pnl_dollars, 4), round(net_pnl, 4),
+                  round(gross_pnl, 4), round(net_pnl, 4),
                   outcome, "forced_close", position["id"]])
             db.execute("""
                 UPDATE predictions SET outcome=?, actual_move=?, resolved_at=?
@@ -9620,9 +10020,10 @@ def backfill_nn_missed_closes():
         for position in stuck:
             invested = position["invested_amount"] or DEFAULT_INVESTMENT
             ending_value = position["current_value"] or invested
-            pnl_dollars = ending_value - invested
-            pnl_percent = (pnl_dollars / invested) * 100 if invested else 0
-            net_pnl = pnl_dollars - FEE_PER_TRADE
+            gross_value = position.get("gross_current_value") or ending_value
+            gross_pnl = float(gross_value or invested) - float(invested or 0)
+            net_pnl = float(ending_value or invested) - float(invested or 0)
+            pnl_percent = (gross_pnl / invested) * 100 if invested else 0
             outcome = "hit" if pnl_percent >= MIN_EXPECTED_MOVE else ("partial" if pnl_percent > 0 else "miss")
             db.execute("""
                 UPDATE nn_virtual_trades SET
@@ -9631,7 +10032,7 @@ def backfill_nn_missed_closes():
                 WHERE id=?
             """, [position["buy_date"], "14:45:00", position["buy_price"],
                   round(ending_value, 4), round(pnl_percent, 2),
-                  round(pnl_dollars, 4), round(net_pnl, 4),
+                  round(gross_pnl, 4), round(net_pnl, 4),
                   outcome, "forced_close", position["id"]])
             closed_count += 1
         db.commit()

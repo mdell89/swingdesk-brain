@@ -620,7 +620,7 @@ function MiniChart({ data, timeframe, feeAdjusted = false }) {
     </div>
   );
 
-  const values = filteredData.map((point, index) => feeAdjusted ? Math.max(point.virtual - index * 0.02, 0) : point.virtual);
+  const values = filteredData.map(point => point.virtual);
   const minVal = Math.min(...values) * 0.997, maxVal = Math.max(...values) * 1.003, range = maxVal - minVal || 1;
   const toX = index => PAD_LEFT + (index / (filteredData.length - 1)) * (WIDTH - PAD_LEFT - PAD_RIGHT);
   const toY = value => PAD_TOP + (1 - (value - minVal) / range) * (HEIGHT - PAD_TOP - PAD_BOTTOM);
@@ -1710,7 +1710,8 @@ export default function App() {
   const [queueLogOpen, setQueueLogOpen] = useState(false);
 
   const [perfTimeframe, setPerfTimeframe] = useState("M");
-  const [feeAdjusted, setFeeAdjusted] = useState(false);
+  const [feeAdjusted, setFeeAdjusted] = useState(true);
+  const feeQuery = feeAdjusted ? "?fees=on" : "?fees=off";
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [showNetInfo, setShowNetInfo] = useState(false);
 
@@ -1806,7 +1807,7 @@ export default function App() {
       setOpenExecution(result);
       const [positions, perfData, statsData] = await Promise.all([
         apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
-        apiFetch("/perf-history").catch(() => []),
+        apiFetch(`/perf-history${feeQuery}`).catch(() => []),
         apiFetch("/stats").catch(() => null),
       ]);
       setOpenPositions(positions);
@@ -1870,7 +1871,7 @@ export default function App() {
           apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
           apiFetch("/stats").catch(() => ({})),
           apiFetch("/extended-runners").catch(() => []),
-          apiFetch("/perf-history").catch(() => []),
+          apiFetch(`/perf-history${feeQuery}`).catch(() => []),
           apiFetch("/today-closed").catch(() => []),
           apiFetch("/nn-picks").catch(() => ({ recommended_longs: [], recommended_shorts: [] })),
           apiFetch("/nn-positions").catch(() => []),
@@ -1878,7 +1879,7 @@ export default function App() {
           apiFetch("/nn-perf-history").catch(() => []),
           apiFetch("/personal-trades").catch(() => []),
           apiFetch("/monitor-open-status").catch(() => null),
-          apiFetch("/day-pnl").catch(() => null),
+          apiFetch(`/day-pnl${feeQuery}`).catch(() => null),
           apiFetch("/variant-status").catch(() => null),
           apiFetch("/variant-leaderboard").catch(() => []),
           apiFetch("/variant/swingdesk_nova_0845_all").catch(() => null),
@@ -1970,6 +1971,20 @@ export default function App() {
 
   function round2(n) { return Math.round(n * 100) / 100; }
 
+  useEffect(() => {
+    if (!loaded) return;
+    (async () => {
+      const [positions, perfData, dayPnlData] = await Promise.all([
+        apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
+        apiFetch(`/perf-history${feeQuery}`).catch(() => []),
+        apiFetch(`/day-pnl${feeQuery}`).catch(() => null),
+      ]);
+      setOpenPositions(positions);
+      setDayPnlStatus(dayPnlData);
+      buildPerfHistory(perfData, positions);
+    })();
+  }, [feeAdjusted, loaded]);
+
   // ── Lazy load tab data ──
   useEffect(() => {
     if (!loaded) return;
@@ -2007,14 +2022,14 @@ export default function App() {
                nnPicksData, nnPositionsData, nnStatsData, nnPerfData,
                dayPnlData, variantStatusData, variantBoardData, novaUniverseData] = await Promise.all([
           apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
-          apiFetch("/perf-history").catch(() => []),
+          apiFetch(`/perf-history${feeQuery}`).catch(() => []),
           apiFetch("/today-closed").catch(() => []),
           apiFetch("/stats").catch(() => null),
           apiFetch("/nn-picks").catch(() => ({ recommended_longs: [], recommended_shorts: [] })),
           apiFetch("/nn-positions").catch(() => []),
           apiFetch("/nn-stats").catch(() => null),
           apiFetch("/nn-perf-history").catch(() => []),
-          apiFetch("/day-pnl").catch(() => null),
+          apiFetch(`/day-pnl${feeQuery}`).catch(() => null),
           apiFetch("/variant-status").catch(() => null),
           apiFetch("/variant-leaderboard").catch(() => []),
           apiFetch("/variant/swingdesk_nova_0845_all").catch(() => null),
@@ -2273,12 +2288,12 @@ export default function App() {
                     style={{ background: "transparent", border: "none", cursor: "pointer", color: T3, fontSize: 11, padding: "0 2px", lineHeight: 1, display: "flex", alignItems: "center" }}>ⓘ</button>
                   {showNetInfo && (
                     <div style={{ position: "absolute", right: 0, top: 20, width: 200, background: "#1a1a1e", border: `1px solid ${BORDER}`, borderRadius: 8, padding: "8px 10px", zIndex: 50 }}>
-                      <div style={{ fontSize: 10, color: T2, lineHeight: 1.5 }}>Deducts an estimated $0.02 fee per position to reflect real-world trading costs. Toggle off to see gross P&L.</div>
+                      <div style={{ fontSize: 10, color: T2, lineHeight: 1.5 }}>Shows the backend fee/slippage model. On uses conservative stress math; off shows gross research P&amp;L.</div>
                     </div>
                   )}
                 </div>
                 <button onClick={() => setFeeAdjusted(f => !f)} style={{ height: TOOLBAR_CONTROL_H, padding: "0 10px", borderRadius: 20, fontSize: 9, fontWeight: 600, border: `1px solid ${feeAdjusted ? AMBER + "55" : BORDER}`, cursor: "pointer", background: feeAdjusted ? "#1a1500" : "transparent", color: feeAdjusted ? AMBER : T3, letterSpacing: .3, whiteSpace: "nowrap", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                  {feeAdjusted ? "● Net view" : "○ Net view"}
+                  {feeAdjusted ? "● Fees on" : "○ Fees off"}
                 </button>
                 <div style={{ flex: 1, display: "flex", justifyContent: "center", alignItems: "center" }}>
                   <ThemeToggle themeKey={themeKey} onToggle={() => setThemeKey(k => k === "black" ? "navy" : "black")} T3={T3} />
@@ -2292,7 +2307,7 @@ export default function App() {
             {/* Big balance + Day's P&L baseline-aligned */}
             <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 2 }}>
               <div style={{ fontSize: 32, fontWeight: 600, letterSpacing: "-1px", color: T1, fontFamily: "'DM Mono',monospace", lineHeight: 1 }}>
-                ${(feeAdjusted ? Math.max(perfLast - openPositions.filter(t=>t.outcome==="open").length * 0.02, 0) : perfLast).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                ${perfLast.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
               </div>
               {(() => {
                 // Day's P&L: today's portfolio value vs yesterday's closing balance
@@ -2335,7 +2350,7 @@ export default function App() {
           <div style={{ display: "flex", gap: 8, padding: "0 16px 14px" }}>
             <div style={{ flex: 1, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
               <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Open P&L</div>
-              <div style={{ fontSize: 16, fontWeight: 600, color: livePnl >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{livePnl >= 0 ? "+" : ""}${Math.abs(feeAdjusted ? livePnl - openPositions.filter(t=>t.outcome==="open").length * 0.02 : livePnl).toFixed(2)}</div>
+              <div style={{ fontSize: 16, fontWeight: 600, color: livePnl >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{livePnl >= 0 ? "+" : ""}${Math.abs(livePnl).toFixed(2)}</div>
             </div>
             <div style={{ flex: 1, background: CARD, border: `1px solid ${pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
               <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Day trades</div>
