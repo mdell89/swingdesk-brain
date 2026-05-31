@@ -2786,7 +2786,7 @@ export default function App() {
                 const nnPercent = nnFirst > 0 ? (nnChange / nnFirst * 100) : 0;
                 const nnUp = nnChange >= 0;
                 return (
-                  <div style={{ marginBottom: 12 }}>
+                  <div style={{ marginBottom: 14 }}>
                     <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 2 }}>
                       <div>
                         <div style={{ fontSize: 32, fontWeight: 600, letterSpacing: "-1px", color: T1, fontFamily: "'DM Mono',monospace", lineHeight: 1 }}>
