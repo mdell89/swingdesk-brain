@@ -2293,7 +2293,7 @@ export default function App() {
                   )}
                 </div>
                 <button onClick={() => setFeeAdjusted(f => !f)} style={{ height: TOOLBAR_CONTROL_H, padding: "0 10px", borderRadius: 20, fontSize: 9, fontWeight: 600, border: `1px solid ${feeAdjusted ? AMBER + "55" : BORDER}`, cursor: "pointer", background: feeAdjusted ? "#1a1500" : "transparent", color: feeAdjusted ? AMBER : T3, letterSpacing: .3, whiteSpace: "nowrap", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                  {feeAdjusted ? "● Fees on" : "○ Fees off"}
+                  {feeAdjusted ? "● Net view on" : "○ Net view"}
                 </button>
                 <div style={{ flex: 1, display: "flex", justifyContent: "center", alignItems: "center" }}>
                   <ThemeToggle themeKey={themeKey} onToggle={() => setThemeKey(k => k === "black" ? "navy" : "black")} T3={T3} />
@@ -2319,12 +2319,10 @@ export default function App() {
                 const dayPnl = backendDayPnl == null ? (perfLast - baseline) : backendDayPnl;
                 const dayUp2 = dayPnl >= 0;
                 return (
-                  <div style={{ textAlign: "right", lineHeight: 1 }}>
+                  <div style={{ textAlign: "right", lineHeight: 1, paddingTop: 6 }}>
                     <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L</div>
                     <div style={{ fontSize: 16, fontWeight: 600, color: dayUp2 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{dayUp2 ? "+" : ""}${dayPnl.toFixed(2)}</div>
-                    <div style={{ fontSize: 8, color: T3, marginTop: 3 }}>
-                      {dayPnlStatus?.previous_close_value != null ? `vs $${Number(dayPnlStatus.previous_close_value).toFixed(2)}` : `age: ${Math.floor((Date.now() - new Date("2026-05-22T00:00:00").getTime()) / 86400000)}d`}
-                    </div>
+
                   </div>
                 );
               })()}
@@ -2744,10 +2742,21 @@ export default function App() {
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
                 <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>Nova / Neural</div>
                 <div style={{ display: "flex", alignItems: "center", gap: 6, position: "relative" }}>
+                  <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
+                    <button onClick={() => setShowNetInfo(v => !v)}
+                      style={{ background: "transparent", border: "none", cursor: "pointer", color: T3, fontSize: 11, padding: "0 2px", lineHeight: 1, display: "flex", alignItems: "center" }}>ⓘ</button>
+                    {showNetInfo && (
+                      <div style={{ position: "absolute", right: 0, top: 20, width: 200, background: "#1a1a1e", border: `1px solid ${BORDER}`, borderRadius: 8, padding: "8px 10px", zIndex: 50 }}>
+                        <div style={{ fontSize: 10, color: T2, lineHeight: 1.5 }}>Shows the backend fee/slippage model. On uses conservative stress math; off shows gross research P&amp;L.</div>
+                      </div>
+                    )}
+                  </div>
                   <button onClick={() => setFeeAdjusted(f => !f)} style={{ height: TOOLBAR_CONTROL_H, padding: "0 10px", borderRadius: 20, fontSize: 9, fontWeight: 600, border: `1px solid ${feeAdjusted ? AMBER + "55" : BORDER}`, cursor: "pointer", background: feeAdjusted ? "#1a1500" : "transparent", color: feeAdjusted ? AMBER : T3, letterSpacing: .3, whiteSpace: "nowrap", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                    {feeAdjusted ? "● Fees on" : "○ Fees off"}
+                    {feeAdjusted ? "● Net view on" : "○ Net view"}
                   </button>
-                  <ThemeToggle themeKey={themeKey} onToggle={() => setThemeKey(k => k === "black" ? "navy" : "black")} T3={T3} />
+                  <div style={{ flex: 1, display: "flex", justifyContent: "center", alignItems: "center" }}>
+                    <ThemeToggle themeKey={themeKey} onToggle={() => setThemeKey(k => k === "black" ? "navy" : "black")} T3={T3} />
+                  </div>
                   <button onClick={() => setSettingsOpen(true)} style={{ cursor: "pointer", flexShrink: 0, lineHeight: 0, width: TOOLBAR_CONTROL_H, height: TOOLBAR_CONTROL_H, padding: 0, border: "none", background: "transparent", display: "flex", alignItems: "center", justifyContent: "center" }}>
                     <SettingsIcon color={T3} />
                   </button>
@@ -2775,11 +2784,11 @@ export default function App() {
                           ${nnLast.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                         </div>
                         <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
-                          <span style={{ fontSize: 12, fontWeight: 700, color: nnUp ? GREEN : RED }}>{nnUp ? "↑" : "↓"} {Math.abs(nnPercent).toFixed(2)}%</span>
-                          <span style={{ fontSize: 11, color: T3 }}>{nnUp ? "+" : ""}${nnChange.toFixed(2)}</span>
+                          <span style={{ fontSize: 13, fontWeight: 500, color: nnUp ? GREEN : RED }}>{nnUp ? "↑" : "↓"} {Math.abs(nnPercent).toFixed(2)}%</span>
+                          <span style={{ fontSize: 12, color: T3 }}>{nnUp ? "+" : ""}${nnChange.toFixed(2)}</span>
                         </div>
                       </div>
-                      <div style={{ textAlign: "right", lineHeight: 1 }}>
+                      <div style={{ textAlign: "right", lineHeight: 1, paddingTop: 6 }}>
                         <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L</div>
                         <div style={{ fontSize: 16, fontWeight: 600, color: nnUp ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{nnUp ? "+" : ""}${nnChange.toFixed(2)}</div>
                         <div style={{ fontSize: 8, color: T3, marginTop: 3 }}>{novaUniverseClosed.length || nnStats?.resolved || 0} closed</div>
@@ -2798,17 +2807,24 @@ export default function App() {
               })()}
               {renderPortfolioControls(false)}
 
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 12 }}>
-                {[
-                  ["Open P&L", `${novaOpenPnl >= 0 ? "+" : "-"}$${Math.abs(novaOpenPnl).toFixed(2)}`, novaOpenPnl >= 0 ? GREEN : RED],
-                  ["Day trades", `${pdtUsed}/3`, pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : GREEN],
-                  ["Open", novaUniverseOpen.length || nnStats?.open_positions || nnPositions.filter(t => t.outcome === "open").length, GREEN],
-                ].map(([label, value, color]) => (
-                  <div key={label} style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "8px 10px" }}>
-                    <div style={{ fontSize: 8, color: T3, fontWeight: 700, textTransform: "uppercase", letterSpacing: .6, marginBottom: 4 }}>{label}</div>
-                    <div style={{ fontSize: 13, color, fontWeight: 800, fontFamily: "'DM Mono',monospace", lineHeight: 1 }}>{value}</div>
+              <div style={{ display: "flex", gap: 8, padding: "0 0 14px" }}>
+                <div style={{ flex: 1, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
+                  <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Open P&L</div>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: novaOpenPnl >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{novaOpenPnl >= 0 ? "+" : "-"}${Math.abs(novaOpenPnl).toFixed(2)}</div>
+                </div>
+                <div style={{ flex: 1, background: CARD, border: `1px solid ${pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
+                  <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Day trades</div>
+                  <div style={{ display: "flex", alignItems: "baseline", gap: 4 }}>
+                    <span style={{ fontSize: 16, fontWeight: 600, color: pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : GREEN, fontFamily: "'DM Mono',monospace" }}>{pdtUsed}/3</span>
+                    <span style={{ fontSize: 8, color: pdtRemaining === 0 ? RED : T3 }}>{pdtRemaining === 0 ? "limit reached" : `${pdtRemaining} left`}</span>
                   </div>
-                ))}
+                </div>
+                <div style={{ flex: 1, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
+                  <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Open</div>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: (novaUniverseOpen.length || nnStats?.open_positions || nnPositions.filter(t => t.outcome === "open").length) > 0 ? GREEN : T2 }}>
+                    {novaUniverseOpen.length || nnStats?.open_positions || nnPositions.filter(t => t.outcome === "open").length}
+                  </div>
+                </div>
               </div>
               <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "7px 10px", marginBottom: 12, fontSize: 10, color: T3 }}>
                 Shared snapshot: <span style={{ color: "#a78bfa", fontWeight: 800 }}>{nnPicks?.source || "comprehensive_scan"}</span>
