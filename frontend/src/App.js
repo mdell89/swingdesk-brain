@@ -2180,7 +2180,6 @@ export default function App() {
   const novaUniversePortfolio = novaUniverse?.portfolio || null;
   const novaUniverseTrades = Array.isArray(novaUniverse?.trades) ? novaUniverse.trades : [];
   const novaUniverseOpen = novaUniverseTrades.filter(t => t.outcome === "open");
-  const novaUniverseClosed = novaUniverseTrades.filter(t => t.outcome !== "open");
   const novaUniverseBalance = novaUniversePortfolio?.equity != null ? Number(novaUniversePortfolio.equity) : null;
   const novaLeader = variantLeaderboard.find(v => v.id === "swingdesk_nova_0845_all");
   const novaOpenPnl = novaUniverseOpen.reduce((sum, trade) => {
@@ -2293,7 +2292,7 @@ export default function App() {
                   )}
                 </div>
                 <button onClick={() => setFeeAdjusted(f => !f)} style={{ height: TOOLBAR_CONTROL_H, padding: "0 10px", borderRadius: 20, fontSize: 9, fontWeight: 600, border: `1px solid ${feeAdjusted ? AMBER + "55" : BORDER}`, cursor: "pointer", background: feeAdjusted ? "#1a1500" : "transparent", color: feeAdjusted ? AMBER : T3, letterSpacing: .3, whiteSpace: "nowrap", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                  {feeAdjusted ? "● Net view on" : "○ Net view"}
+                  {feeAdjusted ? "● Net view" : "○ Net view"}
                 </button>
                 <div style={{ flex: 1, display: "flex", justifyContent: "center", alignItems: "center" }}>
                   <ThemeToggle themeKey={themeKey} onToggle={() => setThemeKey(k => k === "black" ? "navy" : "black")} T3={T3} />
@@ -2379,7 +2378,7 @@ export default function App() {
             </div>
           )}
 
-          {!openExecution?.missed_open_alert && openExecution?.last_error && (
+          {!openExecution?.missed_open_alert && openExecution?.last_error && openExecution.last_error !== "Cached picks contained zero long picks" && (
             <div style={{ margin: "0 16px 10px", background: "#160909", border: `1px solid ${RED}55`, borderRadius: 8, padding: "8px 10px", fontSize: 9, color: RED }}>
               Open execution issue: {openExecution.last_error}
             </div>
@@ -2752,7 +2751,7 @@ export default function App() {
                     )}
                   </div>
                   <button onClick={() => setFeeAdjusted(f => !f)} style={{ height: TOOLBAR_CONTROL_H, padding: "0 10px", borderRadius: 20, fontSize: 9, fontWeight: 600, border: `1px solid ${feeAdjusted ? AMBER + "55" : BORDER}`, cursor: "pointer", background: feeAdjusted ? "#1a1500" : "transparent", color: feeAdjusted ? AMBER : T3, letterSpacing: .3, whiteSpace: "nowrap", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                    {feeAdjusted ? "● Net view on" : "○ Net view"}
+                    {feeAdjusted ? "● Net view" : "○ Net view"}
                   </button>
                   <div style={{ flex: 1, display: "flex", justifyContent: "center", alignItems: "center" }}>
                     <ThemeToggle themeKey={themeKey} onToggle={() => setThemeKey(k => k === "black" ? "navy" : "black")} T3={T3} />
@@ -2788,10 +2787,9 @@ export default function App() {
                           <span style={{ fontSize: 12, color: T3 }}>{nnUp ? "+" : ""}${nnChange.toFixed(2)}</span>
                         </div>
                       </div>
-                      <div style={{ textAlign: "right", lineHeight: 1, paddingTop: 6 }}>
+                      <div style={{ textAlign: "right", lineHeight: 1, alignSelf: "flex-end" }}>
                         <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L</div>
                         <div style={{ fontSize: 16, fontWeight: 600, color: nnUp ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{nnUp ? "+" : ""}${nnChange.toFixed(2)}</div>
-                        <div style={{ fontSize: 8, color: T3, marginTop: 3 }}>{novaUniverseClosed.length || nnStats?.resolved || 0} closed</div>
                       </div>
                     </div>
                     <MiniChart data={nnPerfHistory} timeframe={nnPerfTimeframe} />
