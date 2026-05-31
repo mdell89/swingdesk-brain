@@ -155,6 +155,7 @@ MIN_EXPECTED_MOVE    = 5.0       # Minimum predicted overnight move (%)
 MAX_LONG_PICKS       = 20        # Maximum long recommendations per scan
 MAX_SHORT_PICKS      = 10        # Maximum short recommendations per scan
 MIN_VOLUME_RATIO     = 1.2       # Minimum volume activity to confirm a real setup
+MAX_ALL_VARIANT_OPEN_POSITIONS = 10
 TIMEZONE_OFFSET      = -5        # CST = UTC-5 (CDT during summer)
 MONITOR_INTERVAL     = 300       # 5 minutes in seconds
 SCAN_BATCH_SIZE      = 100       # Tickers per yfinance batch call
@@ -1810,15 +1811,8 @@ def get_nn_portfolio_value():
 def get_nn_investment_amount():
     """
     Independent NN position sizing.
-    Starts at $10, then uses 1% of the NN portfolio once it has trade history.
+    Uses 1% of the NN portfolio with a $1 floor.
     """
-    database = get_database()
-    closed_count = database.execute(
-        "SELECT COUNT(*) as n FROM nn_virtual_trades WHERE outcome != 'open'"
-    ).fetchone()["n"]
-    database.close()
-    if closed_count < 10:
-        return DEFAULT_INVESTMENT
     return max(round(get_nn_portfolio_value() * 0.01, 2), 1.00)
 
 def record_nn_open_execution_status(status):
@@ -2635,8 +2629,16 @@ def variant_investment_amount(portfolio):
     """Small starting allocation that compounds independently per universe."""
     equity = float(portfolio.get("equity") or 1000.0)
     cash = float(portfolio.get("cash") or equity)
-    amount = max(10.0, round(equity * 0.01, 2))
+    amount = max(1.0, round(equity * 0.01, 2))
     return min(amount, max(cash, 0.0))
+
+def variant_open_position_cap(variant):
+    mode = (variant.get("selection_mode") or "All").lower().replace(" ", "")
+    if mode in ("top1", "1"):
+        return 1
+    if mode in ("top3", "3"):
+        return 3
+    return MAX_ALL_VARIANT_OPEN_POSITIONS
 
 def update_variant_portfolio(database, variant_id, note="snapshot"):
     """Recalculate portfolio equity and lifecycle recommendation for one universe."""
@@ -5017,11 +5019,10 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         picks_count=len(scan_result["longs"]) + len(scan_result["shorts"]),
         provider_summary=get_app_state_json("last_price_provider_summary", {}) or {},
     )
-    try:
-        scan_result["variant_run"] = run_variant_universes_from_cache(trigger=f"scan_{scan_type}")
-    except Exception as variant_error:
-        scan_result["variant_run"] = {"success": False, "errors": [str(variant_error)]}
-        log.error(f"Variant universe run after scan failed: {variant_error}")
+    scan_result["variant_run"] = {
+        "auto_open_disabled": True,
+        "message": "Comprehensive scans update caches only; variant trades open via scheduled 8:45/manual runner.",
+    }
     log.info(f"Scan complete: {len(recommended_longs)} longs, {len(recommended_shorts)} shorts from {len(scored_stocks)} scanned")
     return scan_result
 
@@ -5135,9 +5136,21 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None):
                 continue
             variant_opened = 0
             variant_skipped = 0
+            open_cap = variant_open_position_cap(variant)
+            existing_open_count = int(database.execute(
+                "SELECT COUNT(*) AS n FROM variant_virtual_trades WHERE variant_id=? AND outcome='open'",
+                [variant["id"]]
+            ).fetchone()["n"] or 0)
+            if existing_open_count >= open_cap:
+                status["skipped"].append({"variant_id": variant["id"], "reason": "variant open-position cap reached", "open_count": existing_open_count, "cap": open_cap})
+                status["skipped_count"] += 1
+                update_variant_portfolio(database, variant["id"], note="open_cap_reached")
+                continue
             scan_time = snapshot["nova_cache_time"] if brain == "Nova" else snapshot["vector_cache_time"]
 
             for rank, pick in enumerate(selected, start=1):
+                if existing_open_count + variant_opened >= open_cap:
+                    break
                 ticker = pick.get("ticker")
                 if not ticker:
                     continue
