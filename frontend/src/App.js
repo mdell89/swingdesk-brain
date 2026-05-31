@@ -2180,6 +2180,7 @@ export default function App() {
   const novaUniversePortfolio = novaUniverse?.portfolio || null;
   const novaUniverseTrades = Array.isArray(novaUniverse?.trades) ? novaUniverse.trades : [];
   const novaUniverseOpen = novaUniverseTrades.filter(t => t.outcome === "open");
+  const novaUniverseClosed = novaUniverseTrades.filter(t => t.outcome !== "open");
   const novaUniverseBalance = novaUniversePortfolio?.equity != null ? Number(novaUniversePortfolio.equity) : null;
   const novaLeader = variantLeaderboard.find(v => v.id === "swingdesk_nova_0845_all");
   const novaOpenPnl = novaUniverseOpen.reduce((sum, trade) => {
@@ -2739,7 +2740,7 @@ export default function App() {
           {portfolioTab === "neural" && (
             <div style={{ padding: "10px 16px 0" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-                <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>Nova / Neural</div>
+                <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>SwingDesk / Nova / 8:45 / All</div>
                 <div style={{ display: "flex", alignItems: "center", gap: 6, position: "relative" }}>
                   <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
                     <button onClick={() => setShowNetInfo(v => !v)}
@@ -2824,13 +2825,38 @@ export default function App() {
                   </div>
                 </div>
               </div>
-              <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "7px 10px", marginBottom: 12, fontSize: 10, color: T3 }}>
-                Shared snapshot: <span style={{ color: "#a78bfa", fontWeight: 800 }}>{nnPicks?.source || "comprehensive_scan"}</span>
-                {nnPicks?.cache_time && ` · ${new Date(nnPicks.cache_time).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`}
-                {nnPicks?.qualified_count != null && ` · ${nnPicks.qualified_count} qualified`}
-                {variantStatus?.nova_cache_age_minutes != null && ` · Nova cache ${Math.round(variantStatus.nova_cache_age_minutes)}m`}
+              <div style={{ margin: "0 0 10px", background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 14px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  {[[AMBER, "85%+ elite"], [GREEN, "75-84 strong"], [BLUE, "65-74 decent"], [T3, "<65 skip"]].map(([color, label]) => (
+                    <div key={label} style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                      <div style={{ width: 10, height: 10, borderRadius: 3, background: color, flexShrink: 0 }} />
+                      <span style={{ fontSize: 9, color: color, fontWeight: 600 }}>{label}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
-
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 42px", margin: "0 0 12px", gap: 4, alignItems: "stretch" }}>
+                {[
+                  ["buy", `Picks (${nnPicks.recommended_longs?.length || 0})`, BLUE, "#0f1e35", `1px solid ${BLUE}44`],
+                  ["sell", `Open (${novaUniverseOpen.length || nnPositions.filter(t => t.outcome === "open").length})`, GREEN, "#091a0d", `1px solid ${GREEN}44`],
+                  ["closed", `Closed (${novaUniverseClosed.length})`, AMBER, "#1a1500", `1px solid ${AMBER}55`]
+                ].map(([id, label, color, activeBg, border]) => (
+                  <button key={id} onClick={() => setLongSub(id)} style={{
+                    padding: "7px 0", borderRadius: 6, fontSize: 9.5, fontWeight: 700,
+                    border: longSub === id ? border : border,
+                    cursor: "pointer", transition: ".15s",
+                    background: longSub === id ? activeBg : "transparent", color: color,
+                    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                  }}>{label}</button>
+                ))}
+                <div title="Sort" style={{ display: "flex", alignItems: "center", justifyContent: "center", background: "transparent", borderRadius: 6, padding: 7, gap: 2, border: `1px solid ${BORDER}`, minWidth: 0, position: "relative" }}>
+                  <span aria-hidden="true" style={{ fontSize: 11, color: T3, lineHeight: 1 }}>↕</span>
+                  <select value={sortMode} onChange={e => setSortMode(e.target.value)}
+                    style={{ border: "none", cursor: "pointer", background: "transparent", color: T1, fontSize: 0, fontWeight: 600, appearance: "none", outline: "none", margin: 0, padding: 0, lineHeight: "1", textAlign: "center", textAlignLast: "center", display: "block", position: "absolute", inset: 0, opacity: 0 }}>
+                    {SORT_OPTIONS.map(o => <option key={o.id} value={o.id} style={{ background: "#111", color: T1 }}>{o.label}</option>)}
+                  </select>
+                </div>
+              </div>
               {false && novaLeader && (
                 <div style={{ background: "#140f24", border: "1px solid #a78bfa55", borderRadius: 8, padding: "7px 10px", marginBottom: 12, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
                   {[
@@ -2847,9 +2873,15 @@ export default function App() {
               )}
 
               {/* NN Open Positions */}
-              {(novaUniverseOpen.length > 0 || nnPositions.filter(t => t.outcome === "open").length > 0) && (
+              {longSub === "sell" && (novaUniverseOpen.length > 0 || nnPositions.filter(t => t.outcome === "open").length > 0) && (
                 <div style={{ marginBottom: 16 }}>
-                  <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 6 }}>Open positions</div>
+                  <CardMetricGrid style={{ padding: `0 ${CARD_PAD_R} 5px ${CARD_PAD_L}` }}>
+                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
+                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "left" }}>Day %</div>
+                    <SpineCell><div style={{ width: SPINE_VALUE_W, fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center", whiteSpace: "nowrap" }}>Open P&L</div></SpineCell>
+                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right", paddingRight: 6 }}>+$</div>
+                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right" }}>Conf</div>
+                  </CardMetricGrid>
                   <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                     {(novaUniverseOpen.length ? novaUniverseOpen : nnPositions.filter(t => t.outcome === "open")).map(trade => (
                       <PositionCard key={trade.id} trade={trade} isLong={true}
@@ -2862,11 +2894,22 @@ export default function App() {
                   </div>
                 </div>
               )}
+              {longSub === "sell" && novaUniverseOpen.length === 0 && nnPositions.filter(t => t.outcome === "open").length === 0 && (
+                <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 20, fontSize: 13, color: T3, textAlign: "center", marginBottom: 16 }}>
+                  No open Nova positions.
+                </div>
+              )}
 
               {/* NN Picks */}
-              {nnPicks.recommended_longs && nnPicks.recommended_longs.length > 0 ? (
+              {longSub === "buy" && nnPicks.recommended_longs && nnPicks.recommended_longs.length > 0 ? (
                 <div>
-                  <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 6 }}>NN Picks</div>
+                  <CardMetricGrid style={{ padding: `0 ${CARD_PAD_R} 5px ${CARD_PAD_L}` }}>
+                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
+                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center" }}>% Chg</div>
+                    <SpineCell><div style={{ width: SPINE_VALUE_W, fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center", whiteSpace: "nowrap" }}>Move</div></SpineCell>
+                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}></div>
+                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right" }}>Conf</div>
+                  </CardMetricGrid>
                   <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                     {nnPicks.recommended_longs.map(pick => (
                       <PickCard key={pick.ticker + "_nn"} pick={mapPickFields(pick)} isLong={true}
@@ -2877,9 +2920,27 @@ export default function App() {
                     ))}
                   </div>
                 </div>
-              ) : (
+              ) : longSub === "buy" ? (
                 <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 20, textAlign: "center", fontSize: 12, color: T3 }}>
                   {nnPicks.message || "No neural picks are currently cached above threshold."}
+                </div>
+              ) : null}
+              {longSub === "closed" && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  {novaUniverseClosed.length === 0 ? (
+                    <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 20, fontSize: 13, color: T3, textAlign: "center" }}>
+                      No Nova trades closed yet.
+                    </div>
+                  ) : (
+                    novaUniverseClosed.map(trade => (
+                      <TodayClosedCard key={trade.id || trade.ticker}
+                        trade={trade}
+                        themeKey={themeKey}
+                        expanded={expandedCards["nova_closed_" + (trade.id || trade.ticker)]}
+                        onToggle={key => setExpandedCards(prev => ({ ...prev, ["nova_closed_" + key]: !prev["nova_closed_" + key] }))}
+                      />
+                    ))
+                  )}
                 </div>
               )}
             </div>
