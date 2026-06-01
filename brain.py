@@ -4987,7 +4987,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
     scanned_tickers = []
     for idx, ticker in enumerate(universe, start=1):
         scanned_tickers.append(ticker)
-        if idx == 1 or idx % 5 == 0 or idx == len(universe):
+        if idx == 1 or idx % 2 == 0 or idx == len(universe):
             record_nn_scan_status(
                 status="running",
                 phase="scoring",
@@ -4995,7 +4995,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
                 total_scanned=idx,
                 total_expected=len(universe),
                 current_ticker=ticker,
-                scanned_tickers=scanned_tickers[-40:],
+                scanned_tickers=scanned_tickers[-12:],
             )
         if ticker not in price_data:
             continue
@@ -7264,7 +7264,7 @@ def run_scheduler():
     """
     Background scheduler for all automated tasks.
     
-    All times are specified in UTC (CST + 5 hours).
+    All times are specified in UTC. Current Central daylight schedule uses UTC + 5 hours.
     
     Comprehensive scans run every 30 minutes during pre-market and post-market.
     8:30 AM CST market open scan fires after queue lock-in for fresh open-market scores.
@@ -7273,7 +7273,7 @@ def run_scheduler():
     import schedule
 
     # ── Pre-market comprehensive scans (every 30 min, 4:00-8:00 AM CST) ──
-    # CST + 5 = UTC
+    # Central daylight time + 5 = UTC
     for hour_utc, label in [(9,"4:00am"),(9.5,"4:30am"),(10,"5:00am"),(10.5,"5:30am"),
                              (11,"6:00am"),(11.5,"6:30am"),(12,"7:00am"),(12.5,"7:30am"),
                              (13,"8:00am")]:
@@ -7321,7 +7321,7 @@ def run_scheduler():
     # 4:00 AM CST = 09:00 UTC — Unlock queue for new pre-market session
     schedule.every().day.at("09:00").do(unlock_pick_queue)
 
-    # Self-audit at 7:00 PM CST = 00:00 UTC (midnight) — end of trading day
+    # Self-audit at 7:00 PM Central during daylight time = 00:00 UTC.
     # Runs after post-market closes so brain has full day of data to learn from
     # Skip weekends — no trading data on Sat/Sun
     def run_audit_if_weekday():
@@ -7332,7 +7332,7 @@ def run_scheduler():
                 train_neural_network()
             except Exception as nn_err:
                 log.error(f"NN training failed: {nn_err}")
-    schedule.every().day.at("23:55").do(run_audit_if_weekday)
+    schedule.every().day.at("00:00").do(run_audit_if_weekday)
 
     # NN scoring now runs from each comprehensive scan snapshot.
     for hour, minute, label in [

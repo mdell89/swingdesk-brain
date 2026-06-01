@@ -1831,7 +1831,6 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
   const [finishedAt, setFinishedAt] = React.useState(null);
   const [errorMsg, setErrorMsg] = React.useState("");
   const pollRef = React.useRef(null);
-  const scrollRef = React.useRef(null);
 
   const stopPolling = () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
 
@@ -1849,7 +1848,7 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
       if (d.started_at) setStartedAt(d.started_at);
       if (d.status === "running") {
         setState("running");
-      } else if (d.status === "success" || d.status === "degraded") {
+      } else if (d.status === "success" || d.status === "degraded" || d.status === "complete") {
         setState("done");
         setFinishedAt(d.finished_at || new Date().toISOString());
         stopPolling();
@@ -1862,7 +1861,6 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
   }, [API]);
 
   React.useEffect(() => { poll(); }, []);
-  React.useEffect(() => { if (scrollRef.current) scrollRef.current.scrollLeft = scrollRef.current.scrollWidth; }, [scannedTickers]);
   React.useEffect(() => () => stopPolling(), []);
 
   const trigger = async () => {
@@ -1878,6 +1876,12 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
   const elapsed = startedAt ? Math.round((new Date(finishedAt || Date.now()) - new Date(startedAt)) / 1000) : 0;
   const pct = totalExpected > 0 ? Math.min(98, Math.round(totalScanned / totalExpected * 100)) : 0;
   const accent = state === "done" ? GREEN : state === "error" ? RED : BLUE;
+  const recentTickers = scannedTickers.slice(-8).join(", ");
+  const liveScanText = state === "running"
+    ? `${totalScanned}/${totalExpected} scanned${currentTicker ? ` | now: ${currentTicker}` : ""}${recentTickers ? ` | recent: ${recentTickers}` : ""}`
+    : state === "done"
+      ? `${totalScanned}/${totalExpected} scanned | ${qualified} qualified | ${picks} picks`
+      : "No scan running";
   const phaseLabel = { starting: "Initializing…", fetching_prices: "Fetching price data…", scoring: "Scoring tickers…" }[phase] || (state === "running" ? "Scanning…" : "");
 
   return (
@@ -1910,32 +1914,19 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
           </div>
         )}
 
-        {/* Phase + current ticker */}
-        {state === "running" && (
-          <div style={{ padding: "5px 14px 3px", display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ fontSize: 9, color: T3, fontFamily: "'DM Mono',monospace" }}>{phaseLabel}</span>
-            {currentTicker && <span style={{ fontSize: 9, color: BLUE, fontFamily: "'DM Mono',monospace", fontWeight: 700 }}>→ {currentTicker}</span>}
-          </div>
-        )}
-
-        {/* Ticker chip stream */}
-        {scannedTickers.length > 0 && (
-          <div ref={scrollRef} style={{ display: "flex", gap: 5, padding: "5px 14px 11px", overflowX: "auto", scrollbarWidth: "none" }}>
-            {scannedTickers.map((t, i) => {
-              const latest = i === scannedTickers.length - 1 && state === "running";
-              return (
-                <div key={t + i} style={{ flexShrink: 0, padding: "3px 7px", borderRadius: 5, fontSize: 9, fontWeight: latest ? 700 : 500, fontFamily: "'DM Mono',monospace", background: latest ? `${BLUE}22` : BORDER, color: latest ? BLUE : T3, border: `1px solid ${latest ? BLUE : "transparent"}`, transition: "all .2s" }}>
-                  {t}
-                </div>
-              );
-            })}
+        {/* Live scan text row */}
+        {(state === "running" || state === "done") && (
+          <div style={{ padding: "7px 14px 11px" }}>
+            <div style={{ fontSize: 9, color: state === "running" ? BLUE : T2, fontFamily: "'DM Mono',monospace", fontWeight: state === "running" ? 700 : 500, lineHeight: 1.45, whiteSpace: "normal", overflowWrap: "anywhere" }}>
+              {state === "running" && phaseLabel ? `${phaseLabel} | ` : ""}{liveScanText}
+            </div>
           </div>
         )}
       </div>
 
       {/* Warning */}
       <div style={{ fontSize: 9, color: T3, marginTop: 5, paddingLeft: 2, lineHeight: 1.5 }}>
-        ⚠️ Scans consume API quota. Avoid triggering more than once per hour during market hours — the scheduler runs automatically at 8:15 AM and throughout the session.
+        Scans consume API quota. Avoid triggering more than once per hour during market hours — the scheduler runs automatically at 8:15 AM and throughout the session.
       </div>
     </div>
   );
@@ -2088,7 +2079,7 @@ function AuditButton({ API, T1, T2, T3, BORDER, CARD, GREEN, AMBER, RED, onCompl
         )}
       </div>
       <div style={{ fontSize: 9, color: T3, marginTop: 5, paddingLeft: 2, lineHeight: 1.5 }}>
-        ⚠️ Audit consumes LLM API credits. Runs automatically at 11:55 PM — only trigger manually to test changes or after a significant batch of new trades resolves.
+        Audit consumes LLM API credits. Runs automatically at 7:00 PM Central as a read-only recap of ML changes already made when trades closed.
       </div>
     </div>
   );
