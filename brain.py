@@ -146,6 +146,13 @@ load_dotenv()
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_KEY") or os.getenv("ANTHROPIC_API_KEY")
+OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY")
+GROQ_API_KEY         = os.getenv("GROQ_API_KEY")
+MISTRAL_API_KEY      = os.getenv("MISTRAL_API_KEY")
+TOGETHER_API_KEY     = os.getenv("TOGETHER_API_KEY")
+OPENROUTER_API_KEY   = os.getenv("OPENROUTER_API_KEY")
+XAI_API_KEY          = os.getenv("XAI_API_KEY")
+PERPLEXITY_API_KEY   = os.getenv("PERPLEXITY_API_KEY")
 ALPHA_VANTAGE_KEY    = os.getenv("ALPHA_VANTAGE_KEY")
 DATABASE_PATH        = Path(os.environ.get("DATABASE_PATH", "/app/data/portfolio_brain.db"))
 DEFAULT_INVESTMENT   = 10.00     # Fallback when queue is empty
@@ -6853,8 +6860,128 @@ def force_close_nn_previous_session():
     database.close()
     log.info(f"Force-closed {closed_count} NN positions at 2:45 PM CST")
 
+def extract_json_payload(text):
+    """Extract the first JSON object from an LLM response."""
+    cleaned = (text or "").replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(cleaned[start:end + 1])
+        raise
+
+def build_audit_prompt(current_weights, total_predictions, resolved_predictions,
+                       hit_predictions, miss_predictions, win_rate, closed_days_summary):
+    return (
+        "Self-audit for overnight swing trading brain. Analyze and return updated weights.\n"
+        f"CURRENT WEIGHTS: {json.dumps(current_weights)}\n"
+        f"PERFORMANCE: {json.dumps({'total': total_predictions, 'resolved': len(resolved_predictions), 'hits': len(hit_predictions), 'misses': len(miss_predictions), 'win_rate': win_rate})}\n"
+        f"HOLD DURATION BREAKDOWN: {json.dumps(closed_days_summary)}\n"
+        "Indicators: rsi_momentum, volume_surge, overnight_gap_probability, earnings_catalyst, "
+        "support_resistance, relative_strength, sector_relative_strength, vwap_reclaim, volatility_squeeze.\n"
+        "support_resistance: open-air setups score high, resistance-capped setups score low.\n"
+        "relative_strength: stock outperforming SPY 5-day scores high.\n"
+        "sector_relative_strength: sector ETF outperforming SPY 5-day scores high.\n"
+        "vwap_reclaim: closing above VWAP shows institutional buy-side conviction.\n"
+        "volatility_squeeze: low HV ratio (compression) scores high -- coiled spring setup.\n"
+        "Rules: weights must sum to 1.0, each between 0.03-0.35.\n"
+        "Respond ONLY with valid JSON: {\"weights\":{...},\"reasoning\":[\"...\"],\"summary\":\"...\",\"confidence\":\"low|medium|high\"}"
+    )
+
+def call_anthropic_audit(prompt):
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("ANTHROPIC_API_KEY not configured")
+    import anthropic
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    response = client.messages.create(
+        model=os.getenv("ANTHROPIC_AUDIT_MODEL", "claude-sonnet-4-20250514"),
+        max_tokens=800,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.content[0].text
+
+def call_openai_compatible_audit(provider):
+    def _call(prompt):
+        if not provider["api_key"]:
+            raise RuntimeError(f"{provider['key_name']} not configured")
+        import requests
+        headers = {
+            "Authorization": f"Bearer {provider['api_key']}",
+            "Content-Type": "application/json",
+        }
+        if provider["name"] == "openrouter":
+            headers["HTTP-Referer"] = os.getenv("APP_PUBLIC_URL", "https://swingdeskapp.netlify.app")
+            headers["X-Title"] = "SwingDesk"
+        response = requests.post(
+            provider["url"],
+            headers=headers,
+            json={
+                "model": os.getenv(provider["model_env"], provider["model"]),
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": 900,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=45,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+    return _call
+
+def audit_llm_chain(prompt):
+    providers = [
+        ("anthropic", call_anthropic_audit),
+        ("openai", call_openai_compatible_audit({
+            "name": "openai", "api_key": OPENAI_API_KEY, "key_name": "OPENAI_API_KEY",
+            "url": "https://api.openai.com/v1/chat/completions",
+            "model_env": "OPENAI_AUDIT_MODEL", "model": "gpt-4o-mini",
+        })),
+        ("groq", call_openai_compatible_audit({
+            "name": "groq", "api_key": GROQ_API_KEY, "key_name": "GROQ_API_KEY",
+            "url": "https://api.groq.com/openai/v1/chat/completions",
+            "model_env": "GROQ_AUDIT_MODEL", "model": "llama-3.3-70b-versatile",
+        })),
+        ("mistral", call_openai_compatible_audit({
+            "name": "mistral", "api_key": MISTRAL_API_KEY, "key_name": "MISTRAL_API_KEY",
+            "url": "https://api.mistral.ai/v1/chat/completions",
+            "model_env": "MISTRAL_AUDIT_MODEL", "model": "mistral-large-latest",
+        })),
+        ("together", call_openai_compatible_audit({
+            "name": "together", "api_key": TOGETHER_API_KEY, "key_name": "TOGETHER_API_KEY",
+            "url": "https://api.together.xyz/v1/chat/completions",
+            "model_env": "TOGETHER_AUDIT_MODEL", "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        })),
+        ("openrouter", call_openai_compatible_audit({
+            "name": "openrouter", "api_key": OPENROUTER_API_KEY, "key_name": "OPENROUTER_API_KEY",
+            "url": "https://openrouter.ai/api/v1/chat/completions",
+            "model_env": "OPENROUTER_AUDIT_MODEL", "model": "anthropic/claude-3.5-sonnet",
+        })),
+        ("xai", call_openai_compatible_audit({
+            "name": "xai", "api_key": XAI_API_KEY, "key_name": "XAI_API_KEY",
+            "url": "https://api.x.ai/v1/chat/completions",
+            "model_env": "XAI_AUDIT_MODEL", "model": "grok-3-mini",
+        })),
+        ("perplexity", call_openai_compatible_audit({
+            "name": "perplexity", "api_key": PERPLEXITY_API_KEY, "key_name": "PERPLEXITY_API_KEY",
+            "url": "https://api.perplexity.ai/chat/completions",
+            "model_env": "PERPLEXITY_AUDIT_MODEL", "model": "sonar-pro",
+        })),
+    ]
+    attempts = []
+    for name, caller in providers:
+        try:
+            result = extract_json_payload(caller(prompt))
+            return name, result, attempts
+        except Exception as error:
+            attempts.append({"provider": name, "error": str(error)[:220]})
+            log.warning(f"Audit provider {name} failed: {error}")
+    raise RuntimeError(json.dumps(attempts))
+
 def run_self_audit():
-    """Call Claude API to analyze prediction history and update signal weights."""
+    """Run the signal-weight audit through a real LLM provider chain."""
     log.info("Running self-audit...")
     database = get_database()
     resolved_predictions = [dict(p) for p in database.execute(
@@ -6868,7 +6995,6 @@ def run_self_audit():
     win_rate = len(hit_predictions) / len(resolved_predictions) if resolved_predictions else None
     current_weights = get_signal_weights()
 
-    # Gather closed_days distribution to help brain learn from extended holds
     database = get_database()
     closed_days_rows = database.execute("""
         SELECT closed_days, COUNT(*) as count,
@@ -6881,53 +7007,33 @@ def run_self_audit():
     database.close()
     closed_days_summary = [dict(row) for row in closed_days_rows]
 
+    prompt = build_audit_prompt(
+        current_weights, total_predictions, resolved_predictions,
+        hit_predictions, miss_predictions, win_rate, closed_days_summary
+    )
+    provider_attempts = []
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514", max_tokens=800,
-            messages=[{"role": "user", "content":
-                f"Self-audit for overnight swing trading brain. Analyze and return updated weights.\n"
-                f"CURRENT WEIGHTS: {json.dumps(current_weights)}\n"
-                f"PERFORMANCE: {json.dumps({'total': total_predictions, 'resolved': len(resolved_predictions), 'hits': len(hit_predictions), 'misses': len(miss_predictions), 'win_rate': win_rate})}\n"
-                f"HOLD DURATION BREAKDOWN: {json.dumps(closed_days_summary)}\n"
-                f"Indicators: rsi_momentum, volume_surge, overnight_gap_probability, earnings_catalyst, "
-                f"support_resistance, relative_strength, sector_relative_strength, vwap_reclaim, volatility_squeeze.\n"
-                f"support_resistance: open-air setups score high, resistance-capped setups score low.\n"
-                f"relative_strength: stock outperforming SPY 5-day scores high.\n"
-                f"sector_relative_strength: sector ETF outperforming SPY 5-day scores high.\n"
-                f"vwap_reclaim: closing above VWAP shows institutional buy-side conviction.\n"
-                f"volatility_squeeze: low HV ratio (compression) scores high — coiled spring setup.\n"
-                f"Rules: weights must sum to 1.0, each between 0.03-0.35.\n"
-                f"Respond ONLY with valid JSON: {{\"weights\":{{...}},\"reasoning\":[\"...\"],\"summary\":\"...\",\"confidence\":\"low|medium|high\"}}"
-            }]
-        )
-        result = json.loads(response.content[0].text.replace("```json", "").replace("```", "").strip())
-        new_weights = result["weights"]
-        weight_sum = sum(new_weights.values())
-        if 0.85 < weight_sum < 1.15:
-            new_weights = {k: round(v / weight_sum, 4) for k, v in new_weights.items()}
-            save_signal_weights(new_weights)
-        else:
-            new_weights = current_weights
+        provider, result, provider_attempts = audit_llm_chain(prompt)
+        new_weights = normalize_signal_weights(result["weights"])
+        save_signal_weights(new_weights)
 
+        ts = current_time_cst().isoformat()
         database = get_database()
         database.execute("""
             INSERT INTO audit_log (timestamp, weights_before, weights_after, reasoning, summary,
             total_predictions, resolved_count, hit_count, miss_count, win_rate)
             VALUES (?,?,?,?,?,?,?,?,?,?)
-        """, [current_time_cst().isoformat(), json.dumps(current_weights), json.dumps(new_weights),
+        """, [ts, json.dumps(current_weights), json.dumps(new_weights),
               json.dumps(result.get("reasoning", [])), result.get("summary", ""),
               total_predictions, len(resolved_predictions), len(hit_predictions),
               len(miss_predictions), win_rate])
-        # Also write to weights_history for chart visualization
         database.execute("""
             INSERT INTO weights_history (timestamp, rsi_momentum, volume_surge,
             overnight_gap_probability, earnings_catalyst, support_resistance,
             relative_strength, sector_relative_strength, vwap_reclaim, volatility_squeeze,
             win_rate, total_resolved)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """, [current_time_cst().isoformat(),
+        """, [ts,
               new_weights.get("rsi_momentum", 0),
               new_weights.get("volume_surge", 0),
               new_weights.get("overnight_gap_probability", 0),
@@ -6938,57 +7044,46 @@ def run_self_audit():
               new_weights.get("vwap_reclaim", 0),
               new_weights.get("volatility_squeeze", 0),
               win_rate, len(resolved_predictions)])
-        database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_audit',?)",
-                         [current_time_cst().isoformat()])
-        database.commit()
-        database.close()
-        return {"success": True, "weights": new_weights,
-                "reasoning": result.get("reasoning", []),
-                "summary": result.get("summary", ""),
-                "confidence": result.get("confidence", "medium")}
-    except Exception as error:
-        log.error(f"Claude audit error, using deterministic local audit fallback: {error}")
-        fallback_summary = "Local audit recorded because Claude was unavailable; weights held steady until the next successful LLM audit."
-        database = get_database()
-        ts = current_time_cst().isoformat()
-        database.execute("""
-            INSERT INTO audit_log (timestamp, weights_before, weights_after, reasoning, summary,
-            total_predictions, resolved_count, hit_count, miss_count, win_rate)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-        """, [ts, json.dumps(current_weights), json.dumps(current_weights),
-              json.dumps([fallback_summary, f"Claude audit unavailable: {str(error)[:160]}"]),
-              fallback_summary, total_predictions, len(resolved_predictions), len(hit_predictions),
-              len(miss_predictions), win_rate])
-        database.execute("""
-            INSERT INTO weights_history (timestamp, rsi_momentum, volume_surge,
-            overnight_gap_probability, earnings_catalyst, support_resistance,
-            relative_strength, sector_relative_strength, vwap_reclaim, volatility_squeeze,
-            win_rate, total_resolved)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """, [ts,
-              current_weights.get("rsi_momentum", 0),
-              current_weights.get("volume_surge", 0),
-              current_weights.get("overnight_gap_probability", 0),
-              current_weights.get("earnings_catalyst", 0),
-              current_weights.get("support_resistance", 0),
-              current_weights.get("relative_strength", 0),
-              current_weights.get("sector_relative_strength", 0),
-              current_weights.get("vwap_reclaim", 0),
-              current_weights.get("volatility_squeeze", 0),
-              win_rate, len(resolved_predictions)])
         database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_audit',?)", [ts])
         database.commit()
         database.close()
         return {
             "success": True,
-            "fallback": True,
-            "weights": current_weights,
-            "reasoning": [fallback_summary],
-            "summary": fallback_summary,
-            "confidence": "low",
-            "llm_error": str(error),
+            "weights": new_weights,
+            "reasoning": result.get("reasoning", []),
+            "summary": result.get("summary", ""),
+            "confidence": result.get("confidence", "medium"),
+            "provider": provider,
+            "provider_attempts": provider_attempts,
         }
-
+    except Exception as error:
+        log.error(f"All audit LLM providers failed: {error}")
+        try:
+            provider_attempts = json.loads(str(error))
+        except Exception:
+            provider_attempts = [{"provider": "audit_chain", "error": str(error)[:220]}]
+        failure_summary = "Audit failed: no configured LLM provider returned a usable weight update."
+        ts = current_time_cst().isoformat()
+        database = get_database()
+        database.execute("""
+            INSERT INTO audit_log (timestamp, weights_before, weights_after, reasoning, summary,
+            total_predictions, resolved_count, hit_count, miss_count, win_rate)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, [ts, json.dumps(current_weights), json.dumps(current_weights),
+              json.dumps(provider_attempts), failure_summary,
+              total_predictions, len(resolved_predictions), len(hit_predictions),
+              len(miss_predictions), win_rate])
+        database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_audit',?)", [ts])
+        database.commit()
+        database.close()
+        return {
+            "success": False,
+            "weights": current_weights,
+            "reasoning": provider_attempts,
+            "summary": failure_summary,
+            "confidence": "low",
+            "provider_attempts": provider_attempts,
+        }
 # ── SCHEDULER ─────────────────────────────────────────────────────────────────
 def run_scheduler():
     """
