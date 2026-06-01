@@ -158,6 +158,7 @@ DATABASE_PATH        = Path(os.environ.get("DATABASE_PATH", "/app/data/portfolio
 DEFAULT_INVESTMENT   = 10.00     # Fallback when queue is empty
 STARTING_PORTFOLIO_VALUE = 1000.0
 CONFIDENCE_FLOOR     = 65        # Minimum confidence to recommend/trade
+PREMARKET_VECTOR_CONFIDENCE_FLOOR = 60  # Extended-hours fallback when volume/RS inputs are sparse
 MIN_EXPECTED_MOVE    = 5.0       # Minimum predicted overnight move (%)
 MAX_LONG_PICKS       = 20        # Maximum long recommendations per scan
 MAX_SHORT_PICKS      = 10        # Maximum short recommendations per scan
@@ -2669,9 +2670,16 @@ def is_long_pick_eligible(pick, open_tickers=None, confidence_floor=CONFIDENCE_F
     confidence, expected_move = pick_confidence_and_move(pick)
     volume = float(pick.get("vol_ratio") or pick.get("volume_ratio") or 1)
     price = float(pick.get("open_price") or pick.get("price") or pick.get("buy_price") or 0)
+    effective_floor = confidence_floor
+    try:
+        extended, premarket = is_extended_hours()
+        if confidence_floor == CONFIDENCE_FLOOR and extended and premarket:
+            effective_floor = PREMARKET_VECTOR_CONFIDENCE_FLOOR
+    except Exception:
+        pass
     return (
         price > 0
-        and confidence >= confidence_floor
+        and confidence >= effective_floor
         and expected_move >= MIN_EXPECTED_MOVE
         and not pick.get("earnings_soon")
     )
@@ -2706,10 +2714,17 @@ def explain_long_pick_gate(row, open_tickers=None, confidence_floor=CONFIDENCE_F
         reasons.append("No valid price was available.")
     else:
         passes.append(f"Valid price: ${price:.2f}.")
-    if confidence < confidence_floor:
-        reasons.append(f"Confidence {confidence}% is below the {confidence_floor}% pick floor.")
+    effective_floor = confidence_floor
+    try:
+        extended, premarket = is_extended_hours()
+        if confidence_floor == CONFIDENCE_FLOOR and extended and premarket:
+            effective_floor = PREMARKET_VECTOR_CONFIDENCE_FLOOR
+    except Exception:
+        pass
+    if confidence < effective_floor:
+        reasons.append(f"Confidence {confidence}% is below the {effective_floor}% pick floor.")
     else:
-        passes.append(f"Confidence {confidence}% clears the {confidence_floor}% floor.")
+        passes.append(f"Confidence {confidence}% clears the {effective_floor}% floor.")
     if expected_move < MIN_EXPECTED_MOVE:
         reasons.append(f"Expected move {expected_move:.1f}% is below the {MIN_EXPECTED_MOVE:.1f}% minimum.")
     else:
@@ -2735,7 +2750,7 @@ def explain_long_pick_gate(row, open_tickers=None, confidence_floor=CONFIDENCE_F
         "reasons": reasons,
         "passes": passes,
         "confidence": confidence,
-        "confidence_floor": confidence_floor,
+        "confidence_floor": effective_floor,
         "expected_move": expected_move,
         "expected_move_floor": MIN_EXPECTED_MOVE,
         "volume_ratio": volume,
