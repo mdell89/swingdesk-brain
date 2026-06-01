@@ -554,6 +554,13 @@ function normalizeStrategyName(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function displayStrategyName(value) {
+  const raw = String(value || "").trim();
+  const norm = normalizeStrategyName(raw);
+  if (norm === "swingdesk") return "SwingDesk";
+  return raw;
+}
+
 function parseList(value) {
   if (Array.isArray(value)) return value.filter(Boolean);
   if (typeof value === "string") {
@@ -574,7 +581,7 @@ function uniqueList(values = []) {
     if (!key || seen.has(key)) return false;
     seen.add(key);
     return true;
-  });
+  }).map(displayStrategyName);
 }
 
 function avg(values = []) {
@@ -1970,7 +1977,7 @@ function WhyNotPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED })
         <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 9 }}>
           <div>
             <div style={{ fontSize: 13, fontWeight: 700, color: T1, letterSpacing: .3 }}>Why Not?</div>
-            <div style={{ fontSize: 9, color: T3, marginTop: 2 }}>Explain why a ticker did or did not make the pick list.</div>
+            <div style={{ fontSize: 9, color: T3, marginTop: 2 }}>Type a ticker to explain why it did or did not make the pick list. e.g. DELL</div>
           </div>
           <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
             <input value={ticker} onChange={e => setTicker(e.target.value.toUpperCase())} onKeyDown={e => { if (e.key === "Enter") lookup(); }}
@@ -2079,7 +2086,7 @@ function AuditButton({ API, T1, T2, T3, BORDER, CARD, GREEN, AMBER, RED, onCompl
         )}
       </div>
       <div style={{ fontSize: 9, color: T3, marginTop: 5, paddingLeft: 2, lineHeight: 1.5 }}>
-        Audit consumes LLM API credits. Runs automatically at 7:00 PM Central as a read-only recap of ML changes already made when trades closed.
+        Audit recap runs automatically at 7:00 PM Central after daily batch learning.
       </div>
     </div>
   );
@@ -2749,6 +2756,10 @@ export default function App() {
   const activePortfolioBalance = selectedVariantMatchesTab && activeVariantBrain === "Vector" && novaUniversePortfolio?.equity != null
     ? Number(novaUniversePortfolio.equity)
     : perfLast;
+  const activeStartingCash = Number(novaUniversePortfolio?.starting_cash || 1000);
+  const activeRealizedPnl = novaUniversePortfolio?.realized_pnl != null
+    ? Number(novaUniversePortfolio.realized_pnl)
+    : round2(activePortfolioBalance - activeStartingCash - activeOpenPnl);
 
   // perfFirst: baseline for percent gain calculation
   // 1D → yesterday's last settled balance (what we started today with)
@@ -2790,6 +2801,10 @@ export default function App() {
   const novaUniverseBalance = novaUniversePortfolio?.equity != null ? Number(novaUniversePortfolio.equity) : null;
   const novaLeader = variantLeaderboard.find(v => v.id === "swingdesk_nova_0845_all");
   const novaOpenPnl = novaOpenPositions.reduce((sum, trade) => sum + getTradeOpenPnlDollars(trade), 0);
+  const novaStartingCash = Number(novaUniversePortfolio?.starting_cash || 1000);
+  const novaRealizedPnl = novaUniversePortfolio?.realized_pnl != null && activeVariantBrain === "Nova"
+    ? Number(novaUniversePortfolio.realized_pnl)
+    : round2((novaUniverseBalance ?? Number(nnStats?.portfolio_value || 1000)) - novaStartingCash - novaOpenPnl);
   const novaSessionPnl = (() => {
     const points = Array.isArray(novaUniverse?.equity_points) ? [...novaUniverse.equity_points] : [];
     if (!points.length) return null;
@@ -2975,6 +2990,7 @@ export default function App() {
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
               <span style={{ fontSize: 13, fontWeight: 500, color: backendDayUp ? GREEN : RED }}>{perfUp ? "↑" : "↓"} {Math.abs(perfPercent).toFixed(2)}%</span>
               <span style={{ fontSize: 12, color: T3 }}>{formatSignedCurrency(perfChange)}</span>
+              <span style={{ fontSize: 10, color: T3 }}>realized {formatSignedCurrency(activeRealizedPnl)} + open {formatSignedCurrency(activeOpenPnl)}</span>
             </div>
             <MiniChart data={perfHistory} timeframe={perfTimeframe} feeAdjusted={feeAdjusted} />
             <div style={{ display: "flex", alignItems: "center", marginTop: 8, position: "relative" }}>
@@ -2994,6 +3010,10 @@ export default function App() {
             <div style={{ flex: 1, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
               <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Open P&L</div>
               <div style={{ fontSize: 16, fontWeight: 600, color: activeOpenPnl >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{activeOpenPnl >= 0 ? "+" : "-"}${Math.abs(activeOpenPnl).toFixed(2)}</div>
+            </div>
+            <div style={{ flex: 1, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
+              <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Realized</div>
+              <div style={{ fontSize: 16, fontWeight: 600, color: activeRealizedPnl >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(activeRealizedPnl)}</div>
             </div>
             <div style={{ flex: 1, background: CARD, border: `1px solid ${pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
               <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Day trades</div>
@@ -3445,6 +3465,7 @@ export default function App() {
                     <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
                       <span style={{ fontSize: 13, fontWeight: 500, color: nnUp ? GREEN : RED }}>{nnUp ? "↑" : "↓"} {Math.abs(nnPercent).toFixed(2)}%</span>
                       <span style={{ fontSize: 12, color: T3 }}>{formatSignedCurrency(nnChange)}</span>
+                      <span style={{ fontSize: 10, color: T3 }}>realized {formatSignedCurrency(novaRealizedPnl)} + open {formatSignedCurrency(novaOpenPnl)}</span>
                     </div>
                     <MiniChart data={nnPerfHistory} timeframe={nnPerfTimeframe} />
                     <div style={{ display: "flex", alignItems: "center", marginTop: 8, position: "relative" }}>
@@ -3465,6 +3486,10 @@ export default function App() {
                 <div style={{ flex: 1, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
                   <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Open P&L</div>
                   <div style={{ fontSize: 16, fontWeight: 600, color: novaOpenPnl >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{novaOpenPnl >= 0 ? "+" : "-"}${Math.abs(novaOpenPnl).toFixed(2)}</div>
+                </div>
+                <div style={{ flex: 1, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
+                  <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Realized</div>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: novaRealizedPnl >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(novaRealizedPnl)}</div>
                 </div>
                 <div style={{ flex: 1, background: CARD, border: `1px solid ${pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
                   <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Day trades</div>
@@ -3763,6 +3788,10 @@ export default function App() {
             const winRate = closedTrades.length > 0 ? Math.round(hits.length / closedTrades.length * 100) : null;
             const avgWin = hits.length > 0 ? hits.reduce((s, t) => s + (t.actual_move || 0), 0) / hits.length : null;
             const avgLoss = misses.length > 0 ? misses.reduce((s, t) => s + (t.actual_move || 0), 0) / misses.length : null;
+            const expectancy = closedTrades.length && avgWin !== null && avgLoss !== null
+              ? (hits.length / closedTrades.length) * avgWin + (misses.length / closedTrades.length) * avgLoss
+              : null;
+            const avgR = avgWin !== null && avgLoss !== null && Math.abs(avgLoss) > 0 ? avgWin / Math.abs(avgLoss) : null;
 
             const avgHeldDays = rows => {
               const vals = rows.map(t => Number(t.closed_days || 0)).filter(Boolean);
@@ -3781,6 +3810,8 @@ export default function App() {
                     ["Win rate", winRate !== null ? `${winRate}%` : "—", winRate >= 60 ? GREEN : winRate >= 45 ? AMBER : T2],
                     ["Avg win", avgWin !== null ? `+${avgWin.toFixed(1)}%` : "—", GREEN],
                     ["Avg loss", avgLoss !== null ? `${avgLoss.toFixed(1)}%` : "—", RED],
+                    ["Expectancy", expectancy !== null ? `${expectancy >= 0 ? "+" : ""}${expectancy.toFixed(2)}%` : "-", expectancy == null ? T2 : expectancy >= 0 ? GREEN : RED],
+                    ["Avg R", avgR !== null ? `${avgR.toFixed(2)}R` : "-", avgR == null ? T2 : avgR >= 1 ? GREEN : AMBER],
                     ["Total trades", closedTrades.length, T1],
                     ["Hits", hits.length, GREEN],
                     ["Misses", misses.length, RED],
@@ -4172,17 +4203,16 @@ export default function App() {
 
               <ScanPanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} />
               <WhyNotPanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} />
-          <AuditButton API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} AMBER={AMBER} RED={RED} onComplete={() => apiFetch("/audit/log").then(data => setAuditLog(data || [])).catch(() => {})} />
-
           <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
             <div style={{ fontSize: 14, fontWeight: 600, color: T1, marginBottom: 4 }}>Self-audit engine</div>
+            <div style={{ fontSize: 10, color: T2, lineHeight: 1.45, marginBottom: 6 }}>Autopilot: daily 7:00 PM Central batch learning, then a read-only LLM recap.</div>
             <div style={{ fontSize: 10, color: T3 }}>{lastAudit ? `Last audit attempt: ${new Date(lastAudit).toLocaleString()}` : "No audit attempts yet."}</div>
             <div style={{ fontSize: 10, color: lastAuditSuccess === false ? RED : T3, marginTop: 2 }}>
               {lastAuditSuccess === false
                 ? "Last audit failed. No weights were changed."
                 : lastAuditProvider
-                  ? `Last successful provider: ${lastAuditProvider}`
-                  : "LLM-driven only. If every provider fails, weights remain unchanged."}
+                  ? `Last recap provider: ${lastAuditProvider}`
+                  : `${learningEvents.length} ML events recorded. Next audit recap runs automatically.`}
             </div>
           </div>
 
@@ -4300,11 +4330,11 @@ export default function App() {
           <div style={{ marginBottom: 16 }}>
             <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8, marginBottom: 8, display: "flex", alignItems: "center", gap: 8 }}>
               <span style={{ color: GREEN }}>◉</span> ML Weight Adjustments
-              <span style={{ fontSize: 8, color: T3, fontWeight: 400 }}>{learningEvents.length} events</span>
+              <span style={{ fontSize: 8, color: T3, fontWeight: 400 }}>{learningEvents.length} events loaded</span>
             </div>
-            <div style={{ background: "#050e1a", border: `1px solid ${GREEN}33`, borderRadius: 10, maxHeight: 320, overflowY: "auto", fontFamily: "'DM Mono',monospace", fontSize: 8 }}>
+            <div style={{ background: "#050e1a", border: `1px solid ${GREEN}33`, borderRadius: 10, maxHeight: "70vh", overflowY: "auto", fontFamily: "'DM Mono',monospace", fontSize: 8 }}>
               {learningEvents.length === 0 ? (
-                <div style={{ padding: "16px", color: T3, textAlign: "center", fontSize: 9 }}>No learning events yet — weights update automatically when trades close.</div>
+                <div style={{ padding: "16px", color: T3, textAlign: "center", fontSize: 9 }}>No learning events yet - weights update once daily at 7:00 PM Central from closed trades.</div>
               ) : learningEvents.map((ev, i) => {
                 const LABELS = { rsi_momentum:"RSI", volume_surge:"VOL", overnight_gap_probability:"GAP", earnings_catalyst:"EARN", support_resistance:"S&R", relative_strength:"RS", sector_relative_strength:"SECT", vwap_reclaim:"VWAP", volatility_squeeze:"SQZE" };
                 const before = ev.weights_before || {};

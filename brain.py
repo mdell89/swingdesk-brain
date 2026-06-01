@@ -7183,8 +7183,8 @@ def build_variant_summary_prompt(variant_summaries):
 
     return (
         "The following shows recent machine learning weight adjustments made automatically by the "
-        "SwingDesk trading algorithm. Each adjustment happened when a trade closed — "
-        "winning trades rewarded signals that fired, losing trades penalized them.\n\n"
+        "SwingDesk trading algorithm. These adjustments are applied in the daily 7 PM Central "
+        "batch from closed trades; winning trades reward signals that fired, losing trades penalize them.\n\n"
         f"{data_block}\n\n"
         "In 3-5 sentences, explain in plain English what patterns the ML is learning. "
         "Which signals are being consistently rewarded or penalized? What does this suggest "
