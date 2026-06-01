@@ -2443,6 +2443,36 @@ def learn_variant_from_closed_trade(database, trade_row, outcome, actual_move):
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [f"{trade_row.get('id')}_{int(time.time())}", variant_id, trade_row.get("id"), ts, outcome, actual_move, json.dumps(before), json.dumps(after), json.dumps(reasoning[:6])])
 
+def run_daily_variant_learning():
+    """Apply variant ML once per day from closed trades that have not been learned yet."""
+    database = get_database()
+    try:
+        rows = [dict(r) for r in database.execute("""
+            SELECT t.*
+            FROM variant_virtual_trades t
+            LEFT JOIN variant_learning_events e ON e.trade_id = t.id
+            WHERE t.outcome != 'open'
+              AND t.sell_date IS NOT NULL
+              AND e.trade_id IS NULL
+            ORDER BY t.sell_date ASC, COALESCE(t.sell_time, '') ASC, t.id ASC
+        """).fetchall()]
+        learned = 0
+        for row in rows:
+            outcome = row.get("outcome")
+            actual_move = row.get("actual_move")
+            if not row.get("variant_id") or outcome == "open":
+                continue
+            learn_variant_from_closed_trade(database, row, outcome, actual_move)
+            learned += 1
+        database.commit()
+        return {"success": True, "learned": learned, "eligible_closed_trades": len(rows)}
+    except Exception as exc:
+        database.rollback()
+        log.error(f"Daily variant learning failed: {exc}")
+        return {"success": False, "error": str(exc), "learned": 0}
+    finally:
+        database.close()
+
 def build_entry_integrity(position, price_data):
     """Lightweight audit comparing stored entry against quote context."""
     buy_price = float(position.get("buy_price") or 0)
@@ -5478,7 +5508,6 @@ def monitor_variant_universes(trigger="manual"):
                     *fee_model_values(fee_quote),
                     outcome, sell_reason, status["ran_at"], row["id"],
                 ])
-                learn_variant_from_closed_trade(database, row, outcome, round(pnl_pct, 2))
                 database.execute("""
                     UPDATE variant_portfolios
                     SET cash=ROUND(cash + ?, 4), updated_at=?
@@ -7217,7 +7246,7 @@ def run_self_audit():
     ts = current_time_cst().isoformat()
 
     if not variant_summaries:
-        summary_text = "No ML learning events recorded yet. Weights will update automatically as trades close."
+        summary_text = "No ML learning events recorded yet. Weights update once daily at 7 PM Central from closed trades."
         provider = None
         result_summary = summary_text
         confidence = "low"
@@ -7257,7 +7286,7 @@ def run_self_audit():
         "provider": provider,
         "confidence": confidence,
         "variants_summarized": len(variant_summaries),
-        "note": "Read-only. ML weight updates happen automatically on trade close via learn_variant_from_closed_trade.",
+        "note": "Read-only. ML weight updates happen in the daily 7 PM Central batch from closed variant trades.",
     }
 
 def run_scheduler():
@@ -7326,6 +7355,8 @@ def run_scheduler():
     # Skip weekends — no trading data on Sat/Sun
     def run_audit_if_weekday():
         if current_time_cst().weekday() < 5:
+            learning_result = run_daily_variant_learning()
+            log.info(f"Daily variant learning result: {learning_result}")
             run_self_audit()
             # Train NN after audit — fresh data available
             try:
@@ -8411,15 +8442,19 @@ def api_variant_detail(variant_id):
 def api_variant_learning_events():
     """Recent per-universe weight updates for Vector/Nova QA."""
     try:
-        limit = min(max(int(request.args.get("limit", 100)), 1), 500)
+        limit = min(max(int(request.args.get("limit", 100)), 1), 5000)
         variant_id = request.args.get("variant_id")
-        where = "WHERE variant_id=?" if variant_id else ""
+        where = "WHERE e.variant_id=?" if variant_id else ""
         params = [variant_id] if variant_id else []
         db = get_database()
         rows = [dict(r) for r in db.execute(f"""
-            SELECT * FROM variant_learning_events
+            SELECT e.*,
+                   t.ticker, t.buy_date, t.sell_date, t.sell_time,
+                   t.sell_reason, t.outcome AS trade_outcome
+            FROM variant_learning_events e
+            LEFT JOIN variant_virtual_trades t ON t.id = e.trade_id
             {where}
-            ORDER BY timestamp DESC
+            ORDER BY e.timestamp DESC
             LIMIT ?
         """, params + [limit]).fetchall()]
         db.close()
@@ -8433,6 +8468,11 @@ def api_variant_learning_events():
     except Exception as e:
         log.error(f"variant-learning-events error: {e}")
         return jsonify([]), 500
+
+@app.route("/api/run-daily-variant-learning", methods=["POST"])
+def api_run_daily_variant_learning():
+    """Manually run the same closed-trade learning batch used by the 7 PM job."""
+    return jsonify(run_daily_variant_learning())
 
 @app.route("/api/variant-run-now", methods=["POST"])
 def api_variant_run_now():

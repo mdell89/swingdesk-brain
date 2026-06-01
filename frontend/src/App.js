@@ -2469,7 +2469,7 @@ export default function App() {
     }
     if (tab === "intel" && auditLog.length === 0) {
       apiFetch("/audit/log").then(data => setAuditLog(data || [])).catch(() => {});
-      apiFetch("/variant-learning-events?limit=200").then(data => setLearningEvents(data || [])).catch(() => {});
+      apiFetch("/variant-learning-events?limit=5000").then(data => setLearningEvents(data || [])).catch(() => {});
     }
     if (tab === "intel" && predictions.length === 0) {
       setTabLoading(true);
@@ -4339,7 +4339,9 @@ export default function App() {
                     </div>
                     {/* Variant */}
                     <div style={{ flexShrink: 0, width: 70, color: T3, fontSize: 7, lineHeight: 1.5, paddingTop: 1 }}>
+                      {ev.ticker && <div style={{ color: T2, fontWeight: 700 }}>{ev.ticker}</div>}
                       {(ev.variant_id||"").replace(/_/g," ").replace("swingdesk ","").replace("all","").trim()}
+                      {ev.sell_date && <div style={{ color: T3 }}>closed {ev.sell_date}</div>}
                     </div>
                     {/* Weight diffs */}
                     <div style={{ flex: 1 }}>
