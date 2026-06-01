@@ -193,9 +193,10 @@ function EvidenceValue({ evidence }) {
   const level = evidence?.level || "New";
   const color = evidenceColor(level);
   const title = evidence?.description || `Evidence: ${level}`;
+  const glowClass = level === "New" ? "" : "tag-glow";
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontFamily: "'DM Mono',monospace" }}>
-      <span className="tag-glow" title={title} style={{
+      <span className={glowClass} title={title} style={{
         width: 13, height: 13, borderRadius: "50%", border: `1px solid ${color}77`,
         color, display: "inline-flex", alignItems: "center", justifyContent: "center",
         fontSize: 8, fontWeight: 900, lineHeight: 1, background: color + "12",
@@ -525,13 +526,135 @@ function getCompanyContext(item = {}) {
 
 function getTradeOpenPnlDollars(trade = {}) {
   const invested = Number(trade.invested_amount || 10);
-  if (trade.current_pnl_dollars != null) return Number(trade.current_pnl_dollars);
-  if (trade.gross_pnl != null) return Number(trade.gross_pnl);
-  const current = Number(trade.current_value ?? trade.gross_current_value ?? invested);
+  const current = Number(trade.current_value ?? invested);
   const valuePnl = current - invested;
   if (Math.abs(valuePnl) > 0.005) return valuePnl;
+  if (trade.net_pnl != null) return Number(trade.net_pnl);
+  if (trade.current_pnl_dollars != null) return Number(trade.current_pnl_dollars);
   const pct = Number(trade.current_pnl_percent ?? trade.actual_move ?? 0);
   return invested * (pct / 100);
+}
+
+function normalizeStrategyName(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function parseList(value) {
+  if (Array.isArray(value)) return value.filter(Boolean);
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+    } catch {
+      return value.split(",").map(v => v.trim()).filter(Boolean);
+    }
+  }
+  return [];
+}
+
+function uniqueList(values = []) {
+  const seen = new Set();
+  return values.filter(value => {
+    const key = normalizeStrategyName(value);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function avg(values = []) {
+  const nums = values.map(Number).filter(Number.isFinite);
+  return nums.length ? nums.reduce((sum, value) => sum + value, 0) / nums.length : 0;
+}
+
+function getSignalCount(item = {}) {
+  const fired = parseList(item.signal_fired);
+  if (fired.length) return fired.length;
+  const scores = item.signal_scores && typeof item.signal_scores === "object" ? item.signal_scores : null;
+  if (!scores) return 0;
+  return Object.values(scores).filter(value => Number(value) > 0).length;
+}
+
+function strategyTagList(item = {}) {
+  return uniqueList([
+    ...parseList(item.confluence_methods),
+    ...parseList(item.strategy_methods),
+    item.strategy,
+  ]).filter(method => normalizeStrategyName(method) !== "all");
+}
+
+function visibleStrategyTags(methods = [], selectedStrategy = "") {
+  const list = uniqueList(methods);
+  if (normalizeStrategyName(selectedStrategy) === "all") return list;
+  return list.filter(method => normalizeStrategyName(method) !== normalizeStrategyName(selectedStrategy));
+}
+
+function averageTradesByTicker(trades = [], brain = "") {
+  const groups = new Map();
+  trades.forEach(trade => {
+    if (!trade?.ticker) return;
+    const key = `${trade.ticker}_${trade.direction || "long"}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(trade);
+  });
+  return Array.from(groups.values()).map(group => {
+    const base = group[0] || {};
+    const methods = uniqueList(group.flatMap(strategyTagList));
+    const invested = avg(group.map(t => Number(t.invested_amount || 0)));
+    const current = avg(group.map(t => Number(t.current_value ?? t.invested_amount ?? 0)));
+    return {
+      ...base,
+      id: `all_${brain}_${base.ticker}_${base.direction || "long"}`,
+      strategy: "All",
+      confluence_methods: methods,
+      confluence_count: methods.length,
+      signal_fired: uniqueList(group.flatMap(t => parseList(t.signal_fired))),
+      invested_amount: invested,
+      current_value: current,
+      gross_current_value: avg(group.map(t => Number(t.gross_current_value ?? t.current_value ?? t.invested_amount ?? 0))),
+      current_pnl_dollars: current - invested,
+      net_pnl: current - invested,
+      current_pnl_percent: invested > 0 ? ((current - invested) / invested) * 100 : avg(group.map(t => Number(t.current_pnl_percent || t.actual_move || 0))),
+      actual_move: avg(group.map(t => Number(t.actual_move || t.current_pnl_percent || 0))),
+      confidence: Math.round(avg(group.map(t => Number(t.confidence || 0)))),
+      dynamic_confidence: Math.round(avg(group.map(t => Number(t.dynamic_confidence || t.confidence || 0)))),
+      dynamic_estimate: avg(group.map(t => Number(t.dynamic_estimate || t.expected_move || 0))),
+      expected_move: avg(group.map(t => Number(t.expected_move || 0))),
+      source_variant_count: group.length,
+    };
+  });
+}
+
+function averagePicksByTicker(rows = [], brain = "") {
+  const groups = new Map();
+  rows
+    .filter(row => row?.brain === brain && String(row.selection_mode || "").toLowerCase() === "all")
+    .forEach(row => {
+      (row.qualified_preview || []).forEach(pick => {
+        if (!pick?.ticker) return;
+        if (!groups.has(pick.ticker)) groups.set(pick.ticker, []);
+        groups.get(pick.ticker).push({ ...pick, strategy: row.strategy });
+      });
+    });
+  return Array.from(groups.entries()).map(([ticker, group]) => {
+    const methods = uniqueList(group.map(p => p.strategy));
+    const confidence = Math.round(avg(group.map(p => Number(p.confidence || 0))));
+    const move = avg(group.map(p => Number(p.move || 0)));
+    const dayChange = avg(group.map(p => Number(p.day_change_pct ?? p.gap_pct ?? 0)));
+    return mapPickFields({
+      ticker,
+      strategy: "All",
+      confluence_methods: methods,
+      confluence_count: methods.length,
+      signal_fired: [],
+      long_conf: confidence,
+      long_move: move,
+      long_reasoning: `${methods.length} ${brain} strategies currently agree on ${ticker}.`,
+      day_change_pct: dayChange,
+      overnight_gap_pct: avg(group.map(p => Number(p.gap_pct ?? p.day_change_pct ?? 0))),
+      source_variant_count: group.length,
+    });
+  }).sort((a, b) => (b.lc || 0) - (a.lc || 0));
 }
 
 function formatSignedCurrency(value = 0) {
@@ -545,8 +668,8 @@ function JournalButton() {
 
 function StrategyBadge({ strategy, selectedStrategy, color = BLUE }) {
   if (!strategy) return null;
-  const normalize = value => String(value || "").trim().toLowerCase();
-  if (normalize(strategy) === normalize(selectedStrategy)) return null;
+  if (normalizeStrategyName(strategy) === "all") return null;
+  if (normalizeStrategyName(strategy) === normalizeStrategyName(selectedStrategy)) return null;
   return (
     <span style={{
       fontSize: 7,
@@ -567,8 +690,8 @@ function StrategyBadge({ strategy, selectedStrategy, color = BLUE }) {
   );
 }
 
-function CompactMethodTags({ methods = [], glowing = false }) {
-  const list = Array.isArray(methods) ? methods : [];
+function CompactMethodTags({ methods = [], glowing = false, selectedStrategy = "" }) {
+  const list = visibleStrategyTags(methods, selectedStrategy);
   return list.slice(0, 3).map(method => (
     <span key={method} className={glowing ? "tag-glow" : ""} style={{
       fontSize: 7,
@@ -765,7 +888,7 @@ const METHOD_DEFINITIONS = {
   "Vol Squeeze": "Historical Volatility Ratio measures compression. When a stock's recent volatility shrinks relative to its 20-day average, it's coiling. Volatility compression historically precedes explosive directional moves — the tighter the squeeze, the stronger the breakout.",
 };
 
-function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black", strategyName, cardKeyOverride, onAddToPersonal }) {
+function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black", strategyName, strategyTotal = 10, cardKeyOverride, onAddToPersonal }) {
   const [expandedMethod, setExpandedMethod] = React.useState(null);
   const [glowing, setGlowing] = React.useState(false);
   const [journalAdded, setJournalAdded] = React.useState(false);
@@ -784,7 +907,9 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
   const borderColor = confidenceColor(confidence, themeKey);
   const dayChange = pick.dayChg || 0;
   const dayUp = dayChange >= 0;
-  const confluenceMethods = Array.isArray(pick.confluence_methods) ? pick.confluence_methods : [];
+  const confluenceMethods = strategyTagList(pick);
+  const visibleMethods = visibleStrategyTags(confluenceMethods, strategyName);
+  const signalCount = getSignalCount(pick);
   const cardKey = cardKeyOverride || (pick.ticker + "_" + (isLong ? "l" : "s"));
 
   return (
@@ -813,14 +938,13 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
         borderColor={BORDER}
         actions={<>
           <StrategyBadge strategy={pick.strategy || strategyName} selectedStrategy={strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
-          <CompactMethodTags methods={confluenceMethods} glowing={glowing} />
+          <CompactMethodTags methods={confluenceMethods} glowing={glowing} selectedStrategy={strategyName} />
           <EvidenceBadgeCompact evidence={pick.evidence} />
           {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 && (
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
           )}
-          {pick.confluence_count > 0 && (
-            <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center", flexShrink: 0 }}>{pick.confluence_count}/10</span>
-          )}
+          <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center", flexShrink: 0 }}>{confluenceMethods.length}/{strategyTotal}</span>
+          <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: BLUE, letterSpacing: .3, padding: "1px 4px", background: "#0a1020", borderRadius: 3, border: "1px solid #1a2a40", textAlign: "center", flexShrink: 0 }}>{signalCount}/9</span>
           {false && onAddToPersonal && <JournalButton
             compact
             state={journalAdded}
@@ -866,11 +990,11 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
             <div style={{ padding: "6px 10px", background: "#0e0e10", borderRadius: 7 }}>
               <span style={{ fontSize: 10, color: T2, fontStyle: "italic" }}>{reasoningText}</span>
             </div>
-            {confluenceMethods.length > 0 && (
+            {visibleMethods.length > 0 && (
               <div style={{ padding: "6px 10px 6px 4px", background: "#000", borderRadius: 7, marginBottom: 6, border: "1px solid rgba(255,255,255,0.12)" }}>
                 <span style={{ fontSize: 8, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, display: "block", marginBottom: 6, textAlign: "center" }}>Method confluence</span>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-                  {confluenceMethods.map(m => (
+                  {visibleMethods.map(m => (
                     <span key={m} onClick={(e) => { e.stopPropagation(); setExpandedMethod(expandedMethod === m ? null : m); }}
                       className={glowing ? "tag-glow" : ""}
                       style={{ fontSize: 9, color: expandedMethod === m ? "#000" : "#ddd", background: expandedMethod === m ? "#ddd" : "#000", padding: "2px 6px", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer" }}>{m}</span>
@@ -996,7 +1120,7 @@ function TodayClosedCard({ trade, expanded, onToggle, themeKey = "black" }) {
   );
 }
 
-function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClosed, onDone, onView, onClose, pdtRemaining = 3, themeKey = "black", strategyName, onAddToPersonal }) {
+function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClosed, onDone, onView, onClose, pdtRemaining = 3, themeKey = "black", strategyName, strategyTotal = 10, onAddToPersonal }) {
   const [expandedMethod, setExpandedMethod] = React.useState(null);
   const [expandedSignal, setExpandedSignal] = React.useState(null);
   const [glowing, setGlowing] = React.useState(false);
@@ -1037,8 +1161,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
       (currentValue - investedAmount) / investedAmount * 100);
   // Clamp -0 to 0 to avoid negative zero display
   const pnlPercent = rawPnlPercent === 0 ? 0 : (Math.abs(rawPnlPercent) < 0.005 ? 0 : rawPnlPercent);
-  const rawPnlDollars = trade.current_pnl_dollars != null ? Number(trade.current_pnl_dollars) :
-    trade.gross_pnl != null ? Number(trade.gross_pnl) : getTradeOpenPnlDollars(trade);
+  const rawPnlDollars = getTradeOpenPnlDollars(trade);
   const pnlDollars = Math.abs(rawPnlDollars) < 0.005 ? 0 : rawPnlDollars;
   const isPositive = isLong ? pnlPercent >= 0 : pnlPercent <= 0;
   const pnlColor = pnlPercent === 0 ? T2 : (isPositive ? GREEN : RED);
@@ -1054,9 +1177,9 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
   const companyContext = getCompanyContext(trade);
 
   // Safe parse — confluence_methods may arrive as JSON string from DB
-  const confluenceMethods = Array.isArray(trade.confluence_methods)
-    ? trade.confluence_methods
-    : (() => { try { return JSON.parse(trade.confluence_methods || "[]"); } catch { return []; } })();
+  const confluenceMethods = strategyTagList(trade);
+  const visibleMethods = visibleStrategyTags(confluenceMethods, strategyName);
+  const signalCount = getSignalCount(trade);
 
   const sentiment = getSentimentLabel(pnlPercent, frozenTarget, trade.sentiment_icon, pdtRemaining);
 
@@ -1146,17 +1269,13 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
         borderColor={rulingColor}
         actions={<>
           <StrategyBadge strategy={trade.strategy || strategyName} selectedStrategy={strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
-          <CompactMethodTags methods={confluenceMethods} glowing={glowing} />
+          <CompactMethodTags methods={confluenceMethods} glowing={glowing} selectedStrategy={strategyName} />
           <EvidenceBadgeCompact evidence={trade.evidence} />
           {trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7 && (
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
           )}
-          {trade.confluence_count > 0 && (
-            <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center", flexShrink: 0 }}>{trade.confluence_count}/10</span>
-          )}
-          {trade.signal_fired?.length > 0 && (
-            <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: BLUE, letterSpacing: .3, padding: "1px 4px", background: "#0a1020", borderRadius: 3, border: "1px solid #1a2a40", textAlign: "center", flexShrink: 0 }}>{trade.signal_fired.length}/9</span>
-          )}
+          <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center", flexShrink: 0 }}>{confluenceMethods.length}/{strategyTotal}</span>
+          <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: BLUE, letterSpacing: .3, padding: "1px 4px", background: "#0a1020", borderRadius: 3, border: "1px solid #1a2a40", textAlign: "center", flexShrink: 0 }}>{signalCount}/9</span>
           {(sentiment.label === "CUT" || trade.outcome === "sold" || trade.outcome === "force_closed") && (
             <button onClick={(e) => { e.stopPropagation(); onDone && onDone(cardKey); }}
               style={{ background: "#222", border: `1px solid ${CARD_BORDER_LONG === "#1a3a4a" ? BLUE + "66" : "#444"}`, borderRadius: 4, color: "#ccc", fontSize: 9, fontWeight: 700, letterSpacing: 0.5, padding: "2px 8px", cursor: "pointer", flexShrink: 0 }}>
@@ -1205,11 +1324,11 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
               </div>
             ))}
           </div>
-          {(confluenceMethods.length > 0 || (trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7)) && (
+          {(visibleMethods.length > 0 || (trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7)) && (
             <div style={{ padding: "6px 10px 6px 4px", background: "#000", borderRadius: 7, marginTop: 4, border: "1px solid rgba(255,255,255,0.12)" }}>
               <span style={{ fontSize: 8, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, display: "block", marginBottom: 6, textAlign: "center" }}>Method confluence</span>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-                {confluenceMethods.map(m => (
+                {visibleMethods.map(m => (
                   <span key={m} className={glowing ? "tag-glow" : ""} onClick={(e) => { e.stopPropagation(); setExpandedMethod(expandedMethod === m ? null : m); setExpandedSignal(null); }}
                     style={{ fontSize: 9, color: expandedMethod === m ? "#000" : "#ddd", background: expandedMethod === m ? "#ddd" : "#000", padding: "2px 6px", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer" }}>{m}</span>
                 ))}
@@ -1921,6 +2040,7 @@ export default function App() {
   const [selectedVariantId, setSelectedVariantId] = useState("swingdesk_vector_0845_all");
   const [novaUniverse, setNovaUniverse] = useState(null);
   const [variantDetailsById, setVariantDetailsById] = useState({});
+  const [strategyPreviewRows, setStrategyPreviewRows] = useState([]);
   const [personalForm, setPersonalForm] = useState({
     ticker: "",
     buy_price: "",
@@ -2097,7 +2217,7 @@ export default function App() {
         // Fire all requests in parallel
         const [picksData, positions, statsData, runnersData, perfData, closedData,
                nnPicksData, nnPositionsData, nnStatsData, nnPerfData, personalData, monitorData,
-               dayPnlData, variantStatusData, variantBoardData, vectorUniverseData, novaUniverseData] = await Promise.all([
+               dayPnlData, variantStatusData, variantBoardData, variantPreviewData, vectorUniverseData, novaUniverseData] = await Promise.all([
           apiFetch("/picks").catch(() => ({ longs: [], shorts: [] })),
           apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
           apiFetch("/stats").catch(() => ({})),
@@ -2113,6 +2233,7 @@ export default function App() {
           apiFetch(`/day-pnl${feeQuery}`).catch(() => null),
           apiFetch("/variant-status").catch(() => null),
           apiFetch("/variant-leaderboard").catch(() => []),
+          apiFetch("/variant-strategy-preview").catch(() => null),
           apiFetch("/variant/swingdesk_vector_0845_all").catch(() => null),
           apiFetch("/variant/swingdesk_nova_0845_all").catch(() => null),
         ]);
@@ -2147,6 +2268,7 @@ export default function App() {
         setDayPnlStatus(dayPnlData);
         setVariantStatus(variantStatusData);
         setVariantLeaderboard(variantBoardData || []);
+        setStrategyPreviewRows(variantPreviewData?.rows || []);
         setVariantDetailsById({
           ...(vectorUniverseData?.variant?.id ? { [vectorUniverseData.variant.id]: vectorUniverseData } : {}),
           ...(novaUniverseData?.variant?.id ? { [novaUniverseData.variant.id]: novaUniverseData } : {}),
@@ -2259,7 +2381,7 @@ export default function App() {
       try {
         const [positions, perfData, closedData, statsData,
                nnPicksData, nnPositionsData, nnStatsData, nnPerfData,
-               dayPnlData, variantStatusData, variantBoardData, selectedUniverseData] = await Promise.all([
+               dayPnlData, variantStatusData, variantBoardData, variantPreviewData, selectedUniverseData] = await Promise.all([
           apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
           apiFetch(`/perf-history${feeQuery}`).catch(() => []),
           apiFetch("/today-closed").catch(() => []),
@@ -2271,7 +2393,8 @@ export default function App() {
           apiFetch(`/day-pnl${feeQuery}`).catch(() => null),
           apiFetch("/variant-status").catch(() => null),
           apiFetch("/variant-leaderboard").catch(() => []),
-          apiFetch(`/variant/${selectedVariantId}`).catch(() => null),
+          apiFetch("/variant-strategy-preview").catch(() => null),
+          selectedVariantId === "__all__" ? Promise.resolve(null) : apiFetch(`/variant/${selectedVariantId}`).catch(() => null),
         ]);
         setOpenPositions(positions);
         setTodayClosed(closedData || []);
@@ -2283,6 +2406,7 @@ export default function App() {
         setDayPnlStatus(dayPnlData);
         setVariantStatus(variantStatusData);
         setVariantLeaderboard(variantBoardData || []);
+        setStrategyPreviewRows(variantPreviewData?.rows || []);
         if (selectedUniverseData?.variant?.id) {
           setVariantDetailsById(prev => ({ ...prev, [selectedUniverseData.variant.id]: selectedUniverseData }));
           setNovaUniverse(selectedUniverseData);
@@ -2305,6 +2429,10 @@ export default function App() {
   useEffect(() => {
     if (!variantLeaderboard.length || portfolioTab === "personal") return;
     const brain = portfolioTab === "neural" ? "Nova" : "Vector";
+    if (selectedStrategy === "All") {
+      if (selectedVariantId !== "__all__") setSelectedVariantId("__all__");
+      return;
+    }
     const options = variantLeaderboard.filter(v => v.brain === brain && v.strategy === selectedStrategy);
     if (options.length && !options.some(v => v.id === selectedVariantId)) {
       setSelectedVariantId(options[0].id);
@@ -2313,6 +2441,7 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedVariantId) return;
+    if (selectedVariantId === "__all__") return;
     if (variantDetailsById[selectedVariantId]) {
       setNovaUniverse(variantDetailsById[selectedVariantId]);
       return;
@@ -2323,21 +2452,67 @@ export default function App() {
     }).catch(() => {});
   }, [selectedVariantId, variantDetailsById]);
 
+  useEffect(() => {
+    if (selectedStrategy !== "All" || portfolioTab === "personal" || !variantLeaderboard.length) return;
+    const brain = portfolioTab === "neural" ? "Nova" : "Vector";
+    const ids = variantLeaderboard
+      .filter(v => v.brain === brain && !["top 1", "top1", "top 3", "top3"].includes(String(v.selection_mode || "").toLowerCase()))
+      .map(v => v.id)
+      .filter(Boolean);
+    const missing = ids.filter(id => !variantDetailsById[id]);
+    if (!missing.length) return;
+    Promise.all(missing.map(id => apiFetch(`/variant/${id}`).catch(() => null))).then(results => {
+      const next = {};
+      results.forEach(data => {
+        if (data?.variant?.id) next[data.variant.id] = data;
+      });
+      if (Object.keys(next).length) {
+        setVariantDetailsById(prev => ({ ...prev, ...next }));
+      }
+    }).catch(() => {});
+  }, [selectedStrategy, portfolioTab, variantLeaderboard, variantDetailsById]);
+
   const openTickers = new Set(openPositions.filter(t => t.outcome === "open").map(t => t.ticker));
   const allBuyPicks = picks.longs.filter(pick => !openTickers.has(pick.ticker));
   const allShortPicks = picks.shorts.filter(pick => !openTickers.has(pick.ticker));
   const today = new Date().toISOString().split("T")[0];
   const activeVariantBrain = portfolioTab === "neural" ? "Nova" : "Vector";
-  const novaUniversePortfolio = novaUniverse?.portfolio || null;
-  const novaUniverseTrades = Array.isArray(novaUniverse?.trades)
+  const allStrategySelected = selectedStrategy === "All";
+  const strategyTotal = STRATEGY_OPTIONS.length;
+  const activeVariantUniverseIds = variantLeaderboard
+    .filter(v =>
+      v.brain === activeVariantBrain &&
+      (allStrategySelected || v.strategy === selectedStrategy) &&
+      !["top 1", "top1", "top 3", "top3"].includes(String(v.selection_mode || "").toLowerCase())
+    )
+    .map(v => v.id)
+    .filter(Boolean);
+  const aggregateVariantDetails = allStrategySelected
+    ? activeVariantUniverseIds.map(id => variantDetailsById[id]).filter(Boolean)
+    : [];
+  const aggregatePortfolios = aggregateVariantDetails.map(detail => detail?.portfolio).filter(Boolean);
+  const aggregatePortfolio = aggregatePortfolios.length ? {
+    equity: avg(aggregatePortfolios.map(p => Number(p.equity || 0))),
+    starting_cash: avg(aggregatePortfolios.map(p => Number(p.starting_cash || 1000))),
+  } : null;
+  const novaUniversePortfolio = allStrategySelected ? aggregatePortfolio : (novaUniverse?.portfolio || null);
+  const selectedUniverseTrades = Array.isArray(novaUniverse?.trades)
     ? novaUniverse.trades.filter(t => t.outcome !== "archived_excess_open")
     : [];
+  const aggregateTrades = aggregateVariantDetails.flatMap(detail => Array.isArray(detail?.trades)
+    ? detail.trades.filter(t => t.outcome !== "archived_excess_open")
+    : []);
+  const novaUniverseTrades = allStrategySelected
+    ? averageTradesByTicker(aggregateTrades, activeVariantBrain)
+    : selectedUniverseTrades;
   const novaUniverseOpen = novaUniverseTrades.filter(t => t.outcome === "open");
   const novaUniverseClosed = novaUniverseTrades.filter(t => t.outcome !== "open");
-  const selectedVariantMatchesTab = novaUniverse?.variant?.brain === activeVariantBrain;
-  const activeVariantLabel = selectedVariantMatchesTab && novaUniverse?.variant?.label
-    ? novaUniverse.variant.label
-    : `SwingDesk / ${activeVariantBrain} / 8:45 / All`;
+  const selectedVariantMatchesTab = allStrategySelected || novaUniverse?.variant?.brain === activeVariantBrain;
+  const activeVariantLabel = allStrategySelected
+    ? `All Strategies / ${activeVariantBrain} / All`
+    : selectedVariantMatchesTab && novaUniverse?.variant?.label
+      ? novaUniverse.variant.label
+      : `SwingDesk / ${activeVariantBrain} / 8:45 / All`;
 
   const openLongPositions = selectedVariantMatchesTab && activeVariantBrain === "Vector"
     ? novaUniverseOpen.filter(t => (t.direction || "long") === "long")
@@ -2411,7 +2586,12 @@ export default function App() {
   const sortedOpenFilteredPositions = sortPositions(openFilteredPositions);
   const todayClosedVisible = todayClosed.filter(t => !dismissedClosed[t.id]);
 
-  const buyVisible = buyListExpanded ? allBuyPicks : allBuyPicks.slice(0, 20);
+  const activeOpenTickers = new Set(openLongPositions.map(t => t.ticker));
+  const aggregateBuyPicks = allStrategySelected
+    ? averagePicksByTicker(strategyPreviewRows, activeVariantBrain).filter(pick => !activeOpenTickers.has(pick.ticker))
+    : null;
+  const activeBuyPicks = aggregateBuyPicks || allBuyPicks;
+  const buyVisible = buyListExpanded ? activeBuyPicks : activeBuyPicks.slice(0, 20);
   const sellVisible = sellListExpanded ? sortedOpenFilteredPositions : sortedOpenFilteredPositions.slice(0, 20);
   const monitorUpdated = Number(monitorStatus?.updated_count || 0);
   const monitorTotal = Number(monitorStatus?.total_open_positions || openLongPositions.length || 0);
@@ -2461,6 +2641,9 @@ export default function App() {
     return allSettled.length ? allSettled[allSettled.length - 1].virtual : 1000;
   })();
   const perfLast = round2(settledBalance + livePnl);
+  const activePortfolioBalance = selectedVariantMatchesTab && activeVariantBrain === "Vector" && novaUniversePortfolio?.equity != null
+    ? Number(novaUniversePortfolio.equity)
+    : perfLast;
 
   // perfFirst: baseline for percent gain calculation
   // 1D → yesterday's last settled balance (what we started today with)
@@ -2479,7 +2662,7 @@ export default function App() {
     return perfFiltered.length ? perfFiltered[0].virtual : 1000;
   })();
 
-  const perfChange = perfLast - perfFirst;
+  const perfChange = activePortfolioBalance - perfFirst;
   const perfPercent = perfFirst > 0 ? (perfChange / perfFirst * 100) : 0;
   const perfUp = perfChange >= 0;
   const backendDayPnl = dayPnlStatus?.success ? Number(dayPnlStatus.day_pnl || 0) : null;
@@ -2495,13 +2678,13 @@ export default function App() {
       ? novaFreshPositions
       : novaOpenPositions;
   const sortedNovaOpenFilteredPositions = sortPositions(novaOpenFilteredPositions);
+  const aggregateNovaBuyPicks = allStrategySelected
+    ? averagePicksByTicker(strategyPreviewRows, "Nova").filter(pick => !new Set(novaOpenPositions.map(t => t.ticker)).has(pick.ticker))
+    : null;
+  const activeNovaBuyPicks = aggregateNovaBuyPicks || (nnPicks.recommended_longs || []);
   const novaUniverseBalance = novaUniversePortfolio?.equity != null ? Number(novaUniversePortfolio.equity) : null;
   const novaLeader = variantLeaderboard.find(v => v.id === "swingdesk_nova_0845_all");
-  const novaOpenPnl = novaUniverseOpen.reduce((sum, trade) => {
-    const current = Number(trade.current_value ?? trade.invested_amount ?? 0);
-    const invested = Number(trade.invested_amount ?? 0);
-    return sum + (current - invested);
-  }, 0);
+  const novaOpenPnl = novaOpenPositions.reduce((sum, trade) => sum + getTradeOpenPnlDollars(trade), 0);
   const novaSessionPnl = (() => {
     const points = Array.isArray(novaUniverse?.equity_points) ? [...novaUniverse.equity_points] : [];
     if (!points.length) return null;
@@ -2518,7 +2701,7 @@ export default function App() {
     const baseline = prior ? Number(prior.equity || 1000) : Number(novaUniversePortfolio?.starting_cash || 1000);
     return round2(current - baseline);
   })();
-  const variantOptions = variantLeaderboard.filter(v =>
+  const variantOptions = allStrategySelected ? [] : variantLeaderboard.filter(v =>
     v.brain === activeVariantBrain &&
     v.strategy === selectedStrategy &&
     !["top 1", "top1", "top 3", "top3"].includes(String(v.selection_mode || "").toLowerCase())
@@ -2549,6 +2732,7 @@ export default function App() {
         <span style={{ fontSize: 9, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6, flexShrink: 0 }}>Strategy:</span>
         <select value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
           style={{ minWidth: 0, width: "100%", border: "none", outline: "none", background: "transparent", color: T1, fontSize: 12, fontWeight: 800, cursor: "pointer", appearance: "none" }}>
+          <option value="All" style={{ background: "#111", color: T1 }}>All</option>
           {STRATEGY_OPTIONS.map(name => <option key={name} value={name} style={{ background: "#111", color: T1 }}>{name}</option>)}
         </select>
         <SelectChevron color={T3} />
@@ -2556,8 +2740,11 @@ export default function App() {
       <label style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, height: HOME_CONTROL_H, border: `1px solid ${BORDER}`, borderRadius: HOME_CONTROL_RADIUS, background: CARD, padding: "0 9px" }}>
         <span style={{ fontSize: 9, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6, flexShrink: 0 }}>Variant:</span>
         <select value={selectedVariantId} onChange={e => setSelectedVariantId(e.target.value)}
-          style={{ minWidth: 0, width: "100%", border: "none", outline: "none", background: "transparent", color: T1, fontSize: 12, fontWeight: 800, cursor: "pointer", appearance: "none" }}>
-          {variantOptions.map(v => <option key={v.id} value={v.id} style={{ background: "#111", color: T1 }}>{variantLabel(v)}</option>)}
+          disabled={allStrategySelected}
+          style={{ minWidth: 0, width: "100%", border: "none", outline: "none", background: "transparent", color: T1, fontSize: 12, fontWeight: 800, cursor: allStrategySelected ? "default" : "pointer", appearance: "none" }}>
+          {allStrategySelected
+            ? <option value="__all__" style={{ background: "#111", color: T1 }}>All</option>
+            : variantOptions.map(v => <option key={v.id} value={v.id} style={{ background: "#111", color: T1 }}>{variantLabel(v)}</option>)}
         </select>
         <SelectChevron color={T3} />
       </label>
@@ -2601,6 +2788,7 @@ export default function App() {
                 <span style={{ fontSize: 9, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6, flexShrink: 0 }}>Strategy:</span>
                 <select value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
                   style={{ minWidth: 0, width: "100%", border: "none", outline: "none", background: "transparent", color: T1, fontSize: 12, fontWeight: 800, cursor: "pointer", appearance: "none" }}>
+                  <option value="All" style={{ background: "#111", color: T1 }}>All</option>
                   {STRATEGY_OPTIONS.map(name => <option key={name} value={name} style={{ background: "#111", color: T1 }}>{name}</option>)}
                 </select>
                 <span aria-hidden="true" style={{ color: T3, fontSize: 10, flexShrink: 0 }}>▼</span>
@@ -2658,7 +2846,7 @@ export default function App() {
             {/* Big balance + Day's P&L baseline-aligned */}
             <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 2 }}>
               <div style={{ fontSize: 32, fontWeight: 600, letterSpacing: "-1px", color: T1, fontFamily: "'DM Mono',monospace", lineHeight: 1 }}>
-                ${perfLast.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                ${activePortfolioBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
               </div>
               {(() => {
                 // Day's P&L: today's portfolio value vs yesterday's closing balance
@@ -2667,7 +2855,7 @@ export default function App() {
                 const baseline = yesterdaySettled.length
                   ? yesterdaySettled[yesterdaySettled.length - 1].virtual
                   : (perfHistory.find(p => p.seed)?.virtual || 1000);
-                const dayPnl = backendDayPnl == null ? (perfLast - baseline) : backendDayPnl;
+                const dayPnl = backendDayPnl == null ? (activePortfolioBalance - baseline) : backendDayPnl;
                 const dayUp2 = dayPnl >= 0;
                 return (
                   <div style={{ textAlign: "right", lineHeight: 1, paddingTop: 6 }}>
@@ -2776,7 +2964,7 @@ export default function App() {
           {/* SUB TOGGLE — Picks/Open + Sort */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 42px", margin: `0 16px ${HOME_ROW_GAP}px`, gap: HOME_ROW_GAP, alignItems: "stretch" }}>
             {[
-              ["buy", `Picks (${allBuyPicks.length})`, BLUE, "#0f1e35", `1px solid ${BLUE}44`],
+              ["buy", `Picks (${activeBuyPicks.length})`, BLUE, "#0f1e35", `1px solid ${BLUE}44`],
               ["sell", `Open (${openLongPositions.length})`, GREEN, "#091a0d", `1px solid ${GREEN}44`],
               ["closed", `Closed (${todayClosedVisible.length})`, AMBER, "#1a1500", `1px solid ${AMBER}55`]
             ].map(([id, label, color, activeBg, border]) => (
@@ -2839,10 +3027,11 @@ export default function App() {
                           cardKeyOverride={pick.ticker + "_l"}
                           themeKey={themeKey}
                           strategyName={selectedStrategy}
+                          strategyTotal={strategyTotal}
                           onAddToPersonal={pick => handleAddToPersonal(pick, "brain")}
                           onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))} />
                       ))}
-                      <ExpandButton isExpanded={buyListExpanded} onToggle={() => setBuyListExpanded(e => !e)} totalCount={allBuyPicks.length} label="picks" />
+                      <ExpandButton isExpanded={buyListExpanded} onToggle={() => setBuyListExpanded(e => !e)} totalCount={activeBuyPicks.length} label="picks" />
                     </div>
                   </>
                 )}
@@ -2995,6 +3184,7 @@ export default function App() {
                         pdtRemaining={pdtRemaining}
                         themeKey={themeKey}
                         strategyName={selectedStrategy}
+                        strategyTotal={strategyTotal}
                         onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
                         onDone={key => { setDoneCuts(prev => ({ ...prev, [key]: "done" })); setExpandedCards(prev => ({ ...prev, [key]: false })); }}
                         onView={key => setDoneCuts(prev => ({ ...prev, [key]: "open" }))}
@@ -3021,6 +3211,7 @@ export default function App() {
                           pdtRemaining={pdtRemaining}
                           themeKey={themeKey}
                           strategyName={selectedStrategy}
+                          strategyTotal={strategyTotal}
                           onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
                           onDone={key => { setDoneCuts(prev => ({ ...prev, [key]: "done" })); setExpandedCards(prev => ({ ...prev, [key]: false })); }}
                           onView={key => setDoneCuts(prev => ({ ...prev, [key]: "open" }))}
@@ -3047,6 +3238,7 @@ export default function App() {
                           pdtRemaining={pdtRemaining}
                           themeKey={themeKey}
                           strategyName={selectedStrategy}
+                          strategyTotal={strategyTotal}
                           onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
                           onDone={key => { setDoneCuts(prev => ({ ...prev, [key]: "done" })); setExpandedCards(prev => ({ ...prev, [key]: false })); }}
                           onView={key => setDoneCuts(prev => ({ ...prev, [key]: "open" }))}
@@ -3096,7 +3288,7 @@ export default function App() {
           {portfolioTab === "neural" && (
             <div style={{ padding: "10px 16px 0" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, minHeight: 24 }}>
-                <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>{novaUniverse?.variant?.label || "SwingDesk / Nova / 8:45 / All"}</div>
+                <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>{activeVariantBrain === "Nova" ? activeVariantLabel : (novaUniverse?.variant?.label || "SwingDesk / Nova / 8:45 / All")}</div>
                 <div style={{ display: "flex", alignItems: "center", gap: 6, position: "relative" }}>
                   <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
                     <button onClick={() => setShowNetInfo(v => !v)}
@@ -3195,7 +3387,7 @@ export default function App() {
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 42px", margin: `0 0 ${HOME_ROW_GAP}px`, gap: HOME_ROW_GAP, alignItems: "stretch" }}>
                 {[
-                  ["buy", `Picks (${nnPicks.recommended_longs?.length || 0})`, BLUE, "#0f1e35", `1px solid ${BLUE}44`],
+                  ["buy", `Picks (${activeNovaBuyPicks.length || 0})`, BLUE, "#0f1e35", `1px solid ${BLUE}44`],
                   ["sell", `Open (${novaOpenPositions.length})`, GREEN, "#091a0d", `1px solid ${GREEN}44`],
                   ["closed", `Closed (${novaUniverseClosed.length})`, AMBER, "#1a1500", `1px solid ${AMBER}55`]
                 ].map(([id, label, color, activeBg, border]) => (
@@ -3266,6 +3458,7 @@ export default function App() {
                         themeKey={themeKey}
                         pdtRemaining={pdtRemaining}
                         strategyName={selectedStrategy}
+                        strategyTotal={strategyTotal}
                         expanded={expandedCards[trade.id]}
                         onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
                         onAddToPersonal={trade => handleAddToPersonal(trade, "neural")} />
@@ -3280,7 +3473,7 @@ export default function App() {
               )}
 
               {/* NN Picks */}
-              {longSub === "buy" && nnPicks.recommended_longs && nnPicks.recommended_longs.length > 0 ? (
+              {longSub === "buy" && activeNovaBuyPicks.length > 0 ? (
                 <div>
                   <CardMetricGrid style={{ padding: `${HOME_ROW_GAP}px ${CARD_PAD_R} ${HOME_ROW_GAP}px ${CARD_PAD_L}` }}>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
@@ -3290,10 +3483,11 @@ export default function App() {
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right" }}>Conf</div>
                   </CardMetricGrid>
                   <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                    {nnPicks.recommended_longs.map(pick => (
+                    {activeNovaBuyPicks.map(pick => (
                       <PickCard key={pick.ticker + "_nn"} pick={mapPickFields(pick)} isLong={true}
                         themeKey={themeKey}
                         strategyName={selectedStrategy}
+                        strategyTotal={strategyTotal}
                         expanded={expandedCards[pick.ticker + "_nn"]}
                         cardKeyOverride={pick.ticker + "_nn"}
                         onAddToPersonal={pick => handleAddToPersonal(pick, "neural")}
