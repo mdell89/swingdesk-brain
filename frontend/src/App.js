@@ -562,6 +562,26 @@ function getTradeOpenPnlDollars(trade = {}, feeAdjusted = true) {
   return invested * (pct / 100);
 }
 
+function getClosedTradePnlPercent(trade = {}) {
+  if (trade.actual_move != null && Number.isFinite(Number(trade.actual_move))) return Number(trade.actual_move);
+  const buy = Number(trade.buy_price || trade.entry_price || 0);
+  const sell = Number(trade.sell_price || trade.current_price || 0);
+  if (buy > 0 && sell > 0) {
+    const pct = (sell - buy) / buy * 100;
+    return (trade.direction || "long") === "short" ? -pct : pct;
+  }
+  return 0;
+}
+
+function getClosedTradePnlDollars(trade = {}, feeAdjusted = true) {
+  const value = feeAdjusted ? trade.net_pnl : trade.gross_pnl;
+  if (value != null && Number.isFinite(Number(value))) return Number(value);
+  const fallback = feeAdjusted ? trade.gross_pnl : trade.net_pnl;
+  if (fallback != null && Number.isFinite(Number(fallback))) return Number(fallback);
+  const invested = Number(trade.invested_amount || 10);
+  return invested * (getClosedTradePnlPercent(trade) / 100);
+}
+
 const SIGNAL_KEY_ALIASES = {
   overnight_gap: "overnight_gap_probability",
   sector_rs: "sector_relative_strength",
@@ -969,11 +989,11 @@ function MiniChart({ data, timeframe, feeAdjusted = false }) {
 function ProjectionLine({ projection, T3, BLUE }) {
   if (!projection || projection.annualReturnPct == null) return null;
   return (
-    <div style={{ marginTop: 4, fontSize: 9, color: T3, fontFamily: "'DM Mono',monospace", display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-      <span>Projected annual return {projection.annualReturnPct >= 0 ? "+" : ""}{projection.annualReturnPct.toFixed(1)}%</span>
-      <span style={{ color: BLUE, border: `1px solid ${BLUE}55`, borderRadius: 4, padding: "1px 4px" }}>{projection.evidence}</span>
-      <span>exp {projection.expectancyPct >= 0 ? "+" : ""}{projection.expectancyPct.toFixed(2)}%</span>
-      {projection.avgR != null && <span>{projection.avgR.toFixed(2)}R</span>}
+    <div style={{ marginTop: 4, fontSize: 9, color: T3, fontFamily: "'DM Mono',monospace", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+      <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        Annualized est. {projection.annualReturnPct >= 0 ? "+" : ""}{projection.annualReturnPct.toFixed(1)}% · exp {projection.expectancyPct >= 0 ? "+" : ""}{projection.expectancyPct.toFixed(2)}%{projection.avgR != null ? ` · ${projection.avgR.toFixed(2)}R` : ""}
+      </span>
+      <span style={{ color: BLUE, border: `1px solid ${BLUE}55`, borderRadius: 4, padding: "1px 4px", flexShrink: 0 }}>{projection.evidence}</span>
     </div>
   );
 }
@@ -1013,6 +1033,7 @@ const METHOD_DEFINITIONS = {
 
 function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black", strategyName, strategyTotal = 10, cardKeyOverride, onAddToPersonal }) {
   const [expandedMethod, setExpandedMethod] = React.useState(null);
+  const [showScoreContext, setShowScoreContext] = React.useState(false);
   const [glowing, setGlowing] = React.useState(false);
   const [journalAdded, setJournalAdded] = React.useState(false);
   React.useEffect(() => {
@@ -1032,7 +1053,8 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
   const dayUp = dayChange >= 0;
   const confluenceMethods = strategyTagList(pick);
   const visibleMethods = visibleStrategyTags(confluenceMethods, strategyName);
-  const signalCount = getSignalCount(pick);
+  const signalData = getSignalData(pick);
+  const signalCount = signalData.fired.length;
   const cardKey = cardKeyOverride || (pick.ticker + "_" + (isLong ? "l" : "s"));
 
   return (
@@ -1067,7 +1089,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
           )}
           <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center", flexShrink: 0 }}>{confluenceMethods.length}/{strategyTotal}</span>
-          <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: BLUE, letterSpacing: .3, padding: "1px 4px", background: "#0a1020", borderRadius: 3, border: "1px solid #1a2a40", textAlign: "center", flexShrink: 0 }}>{signalCount}/9</span>
+          <span className={showScoreContext ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: BLUE, letterSpacing: .3, padding: "1px 4px", background: "#0a1020", borderRadius: 3, border: "1px solid #1a2a40", textAlign: "center", flexShrink: 0 }}>{signalCount}/9</span>
           {false && onAddToPersonal && <JournalButton
             compact
             state={journalAdded}
@@ -1111,8 +1133,31 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
               ))}
             </div>
             <div style={{ padding: "6px 10px", background: "#0e0e10", borderRadius: 7 }}>
-              <span style={{ fontSize: 10, color: T2, fontStyle: "italic" }}>{reasoningText}</span>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                <span style={{ fontSize: 10, color: T2, fontStyle: "italic", minWidth: 0 }}>{reasoningText}</span>
+                <button onClick={(e) => { e.stopPropagation(); setShowScoreContext(v => !v); }}
+                  style={{ border: `1px solid ${BLUE}55`, background: showScoreContext ? BLUE + "22" : "transparent", color: BLUE, borderRadius: 4, padding: "2px 6px", fontSize: 8, fontWeight: 800, letterSpacing: .4, flexShrink: 0 }}>
+                  CONTEXT
+                </button>
+              </div>
             </div>
+            {showScoreContext && (
+              <div style={{ padding: "7px 8px", background: "#06101f", border: `1px solid ${BLUE}33`, borderRadius: 7 }}>
+                <div style={{ fontSize: 8, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .5, marginBottom: 6 }}>Score Context</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
+                  {Object.entries({ rsi_momentum: "RSI", volume_surge: "Volume", overnight_gap_probability: "Gap", earnings_catalyst: "Earnings", support_resistance: "S&R", relative_strength: "Rel Str", sector_relative_strength: "Sector RS", vwap_reclaim: "VWAP", volatility_squeeze: "Squeeze" }).map(([key, label]) => {
+                    const score = Number(signalData.scores?.[key] ?? 0);
+                    const fired = signalData.fired.includes(key);
+                    return (
+                      <div key={key} className={fired ? "tag-glow" : ""} style={{ display: "flex", justifyContent: "space-between", gap: 6, border: `1px solid ${fired ? BLUE + "55" : BORDER}`, borderRadius: 5, padding: "4px 6px", background: fired ? BLUE + "14" : "#000" }}>
+                        <span style={{ fontSize: 8, color: fired ? BLUE : T3, fontWeight: 700 }}>{label}</span>
+                        <span style={{ fontSize: 8, color: T1, fontFamily: "'DM Mono',monospace" }}>{Math.round(score * 100)}%</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
             {visibleMethods.length > 0 && (
               <div style={{ padding: "6px 10px 6px 4px", background: "#000", borderRadius: 7, marginBottom: 6, border: "1px solid rgba(255,255,255,0.12)" }}>
                 <span style={{ fontSize: 8, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, display: "block", marginBottom: 6, textAlign: "center" }}>Method confluence</span>
@@ -2107,7 +2152,7 @@ function WhyNotPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED })
           </div>
           <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
             <input value={ticker} onChange={e => setTicker(e.target.value.toUpperCase())} onKeyDown={e => { if (e.key === "Enter") lookup(); }}
-              placeholder="DELL" style={{ width: 70, background: "#000", border: `1px solid ${BORDER}`, borderRadius: 7, color: T1, fontFamily: "'DM Mono',monospace", fontSize: 12, padding: "7px 8px", textTransform: "uppercase" }} />
+              placeholder={'e.g. DELL'} style={{ width: 86, background: "#000", border: `1px solid ${BORDER}`, borderRadius: 7, color: T1, fontFamily: "'DM Mono',monospace", fontSize: 12, padding: "7px 8px", textTransform: "uppercase" }} />
             <button onClick={lookup} disabled={loading || !ticker.trim()} style={{ background: loading ? "transparent" : BLUE, border: `1px solid ${BLUE}`, borderRadius: 7, color: loading ? BLUE : "#000", fontSize: 10, fontWeight: 800, padding: "7px 10px", cursor: loading ? "default" : "pointer" }}>
               {loading ? "..." : "CHECK"}
             </button>
@@ -2775,6 +2820,8 @@ export default function App() {
     : selectedVariantMatchesTab && novaUniverse?.variant?.label
       ? novaUniverse.variant.label
       : `SwingDesk / ${activeVariantBrain} / 8:45 / All`;
+  const analyticsVariantTrades = selectedVariantMatchesTab ? novaUniverseTrades : virtualTrades;
+  const analyticsVariantLabel = selectedVariantMatchesTab ? activeVariantLabel : "Legacy SwingDesk";
 
   const openLongPositions = selectedVariantMatchesTab && activeVariantBrain === "Vector"
     ? novaUniverseOpen.filter(t => (t.direction || "long") === "long")
@@ -3164,11 +3211,8 @@ export default function App() {
               <div style={{ fontSize: 16, fontWeight: 600, color: activeRealizedPnl >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(activeRealizedPnl)}</div>
             </div>
             <div style={{ flex: 1, background: CARD, border: `1px solid ${pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
-              <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Day trades</div>
-              <div style={{ display: "flex", alignItems: "baseline", gap: 4 }}>
-                <span style={{ fontSize: 16, fontWeight: 600, color: pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : GREEN, fontFamily: "'DM Mono',monospace" }}>{pdtUsed}/3</span>
-                <span style={{ fontSize: 8, color: pdtRemaining === 0 ? RED : T3 }}>{pdtRemaining === 0 ? "limit reached" : `${pdtRemaining} left`}</span>
-              </div>
+              <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>PDT</div>
+              <div style={{ fontSize: 16, fontWeight: 600, color: pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : GREEN, fontFamily: "'DM Mono',monospace" }}>{pdtUsed}/3</div>
             </div>
             <div style={{ flex: 1, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
               <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Open</div>
@@ -3615,7 +3659,7 @@ export default function App() {
                       <span style={{ fontSize: 12, color: T3 }}>{formatSignedCurrency(nnChange)}</span>
                       <span style={{ fontSize: 10, color: T3 }}>realized {formatSignedCurrency(novaRealizedPnl)} + open {formatSignedCurrency(novaOpenPnl)}</span>
                     </div>
-                    <MiniChart data={nnPerfHistory} timeframe={nnPerfTimeframe} />
+                    <MiniChart data={nnPerfHistory} timeframe={nnPerfTimeframe} feeAdjusted={feeAdjusted} />
                     <ProjectionLine projection={novaSimulationProjection} T3={T3} BLUE={"#a78bfa"} />
                     <div style={{ display: "flex", alignItems: "center", marginTop: 8, position: "relative" }}>
                       <div style={{ flex: 1, display: "flex", justifyContent: "center", gap: 4 }}>
@@ -3641,11 +3685,8 @@ export default function App() {
                   <div style={{ fontSize: 16, fontWeight: 600, color: novaRealizedPnl >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(novaRealizedPnl)}</div>
                 </div>
                 <div style={{ flex: 1, background: CARD, border: `1px solid ${pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
-                  <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Day trades</div>
-                  <div style={{ display: "flex", alignItems: "baseline", gap: 4 }}>
-                    <span style={{ fontSize: 16, fontWeight: 600, color: pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : GREEN, fontFamily: "'DM Mono',monospace" }}>{pdtUsed}/3</span>
-                    <span style={{ fontSize: 8, color: pdtRemaining === 0 ? RED : T3 }}>{pdtRemaining === 0 ? "limit reached" : `${pdtRemaining} left`}</span>
-                  </div>
+                  <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>PDT</div>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : GREEN, fontFamily: "'DM Mono',monospace" }}>{pdtUsed}/3</div>
                 </div>
                 <div style={{ flex: 1, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
                   <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Open</div>
@@ -3931,12 +3972,12 @@ export default function App() {
 
           {/* ── Analytics Stats ── */}
           {(() => {
-            const closedTrades = virtualTrades.filter(t => t.outcome !== "open");
+            const closedTrades = analyticsVariantTrades.filter(t => t.outcome !== "open");
             const hits = closedTrades.filter(t => t.outcome === "hit");
             const misses = closedTrades.filter(t => t.outcome === "miss");
             const winRate = closedTrades.length > 0 ? Math.round(hits.length / closedTrades.length * 100) : null;
-            const avgWin = hits.length > 0 ? hits.reduce((s, t) => s + (t.actual_move || 0), 0) / hits.length : null;
-            const avgLoss = misses.length > 0 ? misses.reduce((s, t) => s + (t.actual_move || 0), 0) / misses.length : null;
+            const avgWin = hits.length > 0 ? hits.reduce((s, t) => s + getClosedTradePnlPercent(t), 0) / hits.length : null;
+            const avgLoss = misses.length > 0 ? misses.reduce((s, t) => s + getClosedTradePnlPercent(t), 0) / misses.length : null;
             const expectancy = closedTrades.length && avgWin !== null && avgLoss !== null
               ? (hits.length / closedTrades.length) * avgWin + (misses.length / closedTrades.length) * avgLoss
               : null;
@@ -4002,19 +4043,19 @@ export default function App() {
 
           {/* ── Closed Trades Subpage ── */}
           {analyticsPage === "closed" && (() => {
-            const allClosed = virtualTrades.filter(t => t.outcome !== "open");
+            const allClosed = analyticsVariantTrades.filter(t => t.outcome !== "open");
             const wins = allClosed.filter(t => t.outcome === "hit");
             const cuts = allClosed.filter(t => t.outcome === "miss" || t.sell_reason === "cut_loss" || isModelStopLoss(t.sell_reason));
             const partials = allClosed.filter(t => t.outcome === "partial");
             const winRate = allClosed.length > 0 ? Math.round(wins.length / allClosed.length * 100) : null;
-            const totalPnl = allClosed.reduce((s, t) => s + (t.gross_pnl || 0), 0);
+            const totalPnl = allClosed.reduce((s, t) => s + getClosedTradePnlDollars(t, feeAdjusted), 0);
             const tabData = closedTab === "wins" ? wins : closedTab === "cuts" ? cuts : closedTab === "partials" ? partials : allClosed;
 
             return (
               <div style={{ marginTop: 16 }}>
                 {/* Header row: label + win rate */}
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-                  <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8 }}>Closed trades</div>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8 }}>Closed trades · {analyticsVariantLabel}</div>
                   <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                     {winRate !== null && (
                       <span style={{ fontSize: 11, fontWeight: 700, color: winRate >= 60 ? GREEN : winRate >= 45 ? AMBER : RED }}>{winRate}% win rate</span>
@@ -4043,7 +4084,8 @@ export default function App() {
                   <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                     {tabData.map(trade => {
                       const tradeColor = trade.outcome === "hit" ? GREEN : trade.outcome === "partial" ? AMBER : RED;
-                      const pnl = trade.actual_move;
+                      const pnl = getClosedTradePnlPercent(trade);
+                      const pnlDollars = getClosedTradePnlDollars(trade, feeAdjusted);
                       const conf = trade.lock_in_confidence || trade.confidence;
                       return (
                         <div key={trade.id} style={{ display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", padding: "10px 14px", background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, borderLeft: `3px solid ${tradeColor}` }}>
@@ -4060,7 +4102,7 @@ export default function App() {
                           </div>
                           <div style={{ textAlign: "right" }}>
                             <div style={{ fontSize: 13, fontWeight: 700, color: pnl >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{pnl >= 0 ? "+" : ""}{pnl != null ? pnl.toFixed(1) : "—"}%</div>
-                            {trade.gross_pnl != null && <div style={{ fontSize: 9, color: trade.gross_pnl >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace", marginTop: 1 }}>{trade.gross_pnl >= 0 ? "+" : ""}${trade.gross_pnl.toFixed(2)}</div>}
+                            <div style={{ fontSize: 9, color: pnlDollars >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace", marginTop: 1 }}>{pnlDollars >= 0 ? "+" : ""}${pnlDollars.toFixed(2)}</div>
                           </div>
                         </div>
                       );
@@ -4509,12 +4551,15 @@ export default function App() {
           </div>
 
           {/* ── ML LEARNING CONSOLE ── */}
-          <div style={{ marginBottom: 16 }}>
-            <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8, marginBottom: 8, display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, marginBottom: 16, overflow: "hidden" }}>
+            <div onClick={() => setExpandedMethods(p => ({ ...p, ml_weight_adjustments: !p.ml_weight_adjustments }))}
+              style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 14px", cursor: "pointer" }}>
               <span style={{ color: GREEN }}>◉</span> ML Weight Adjustments
-              <span style={{ fontSize: 8, color: T3, fontWeight: 400 }}>{learningTotal || learningEvents.length} total events</span>
+              <span style={{ fontSize: 8, color: T3, fontWeight: 400 }}>{learningTotal || learningEvents.length} total</span>
+              <span style={{ color: T3, fontSize: 10 }}>{expandedMethods.ml_weight_adjustments ? "▲" : "▼"}</span>
             </div>
-            <div style={{ background: "#050e1a", border: `1px solid ${GREEN}33`, borderRadius: 10, fontFamily: "'DM Mono',monospace", fontSize: 8 }}>
+            {expandedMethods.ml_weight_adjustments && (
+            <div style={{ background: "#050e1a", borderTop: `1px solid ${GREEN}33`, fontFamily: "'DM Mono',monospace", fontSize: 8 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 12px", borderBottom: `1px solid ${GREEN}20` }}>
                 <span style={{ color: T3 }}>Page {learningPage + 1} of {Math.max(1, Math.ceil((learningTotal || learningEvents.length) / LEARNING_PAGE_SIZE))}</span>
                 <div style={{ display: "flex", gap: 6 }}>
@@ -4586,6 +4631,7 @@ export default function App() {
                 );
               })}
             </div>
+            )}
           </div>
 
           <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8, marginBottom: 10 }}>Signal weights</div>
