@@ -4951,7 +4951,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
     except:
         queue_is_locked = False
 
-    if queue_is_locked and scan_type not in ("manual", "manual_fresh"):
+    if queue_is_locked and scan_type not in ("manual", "manual_fresh", "manual_shared", "manual_shared_nova"):
         log.info(f"Queue locked — scan completed but no new picks added ({scan_type})")
         pass
 
