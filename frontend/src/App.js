@@ -222,8 +222,9 @@ function EvidenceValue({ evidence }) {
 }
 
 function mapPickFields(pick) {
+  const normalized = withNormalizedSignals(pick);
   return {
-    ...pick,
+    ...normalized,
     lc: pick.long_conf, sc: pick.short_conf,
     lm: pick.long_move, sm: pick.short_move,
     lr: pick.long_reasoning, sr: pick.short_reasoning,
@@ -539,15 +540,56 @@ function getCompanyContext(item = {}) {
   return { name, description };
 }
 
-function getTradeOpenPnlDollars(trade = {}) {
+function getValuationFields(trade = {}, feeAdjusted = true) {
   const invested = Number(trade.invested_amount || 10);
-  const current = Number(trade.current_value ?? invested);
-  const valuePnl = current - invested;
+  const current = Number(
+    (feeAdjusted ? trade.current_value : trade.gross_current_value) ??
+    trade.current_value ??
+    trade.gross_current_value ??
+    invested
+  );
+  return { invested, current, pnl: current - invested };
+}
+
+function getTradeOpenPnlDollars(trade = {}, feeAdjusted = true) {
+  const { invested, pnl } = getValuationFields(trade, feeAdjusted);
+  const valuePnl = pnl;
   if (Math.abs(valuePnl) > 0.005) return valuePnl;
-  if (trade.net_pnl != null) return Number(trade.net_pnl);
+  if (feeAdjusted && trade.net_pnl != null) return Number(trade.net_pnl);
+  if (!feeAdjusted && trade.gross_pnl != null) return Number(trade.gross_pnl);
   if (trade.current_pnl_dollars != null) return Number(trade.current_pnl_dollars);
   const pct = Number(trade.current_pnl_percent ?? trade.actual_move ?? 0);
   return invested * (pct / 100);
+}
+
+function getSignalData(item = {}) {
+  const directFired = parseList(item.signal_fired ?? item.fired_signals ?? item.fired_signals_for_observation);
+  let scores = item.signal_scores_for_observation ?? item.signal_scores ?? item.scores ?? {};
+  let fired = directFired;
+  if (typeof scores === "string") {
+    try { scores = JSON.parse(scores || "{}"); } catch { scores = {}; }
+  }
+  if (scores && typeof scores === "object" && !Array.isArray(scores)) {
+    if (!fired.length) fired = parseList(scores.fired);
+    scores = scores.scores || scores;
+  } else {
+    scores = {};
+  }
+  if (!fired.length && scores && typeof scores === "object") {
+    fired = Object.entries(scores)
+      .filter(([, value]) => Number(value) >= 0.65)
+      .map(([key]) => key);
+  }
+  return { fired: uniqueList(fired), scores };
+}
+
+function getSignalCount(item = {}) {
+  return getSignalData(item).fired.length;
+}
+
+function withNormalizedSignals(item = {}) {
+  const signalData = getSignalData(item);
+  return { ...item, signal_fired: signalData.fired, signal_scores: signalData.scores };
 }
 
 function normalizeStrategyName(value) {
@@ -589,12 +631,37 @@ function avg(values = []) {
   return nums.length ? nums.reduce((sum, value) => sum + value, 0) / nums.length : 0;
 }
 
-function getSignalCount(item = {}) {
-  const fired = parseList(item.signal_fired);
-  if (fired.length) return fired.length;
-  const scores = item.signal_scores && typeof item.signal_scores === "object" ? item.signal_scores : null;
-  if (!scores) return 0;
-  return Object.values(scores).filter(value => Number(value) > 0).length;
+function evidenceLevelForSample(sampleSize = 0) {
+  if (sampleSize >= 75) return "Strong";
+  if (sampleSize >= 30) return "Building";
+  if (sampleSize >= 10) return "Thin";
+  return "New";
+}
+
+function calculateSimulationProjection(trades = []) {
+  const closed = trades.filter(t => t && t.outcome !== "open" && Number.isFinite(Number(t.actual_move)));
+  const wins = closed.filter(t => Number(t.actual_move) > 0);
+  const losses = closed.filter(t => Number(t.actual_move) <= 0);
+  if (!closed.length) return { annualReturnPct: null, expectancyPct: null, avgR: null, sampleSize: 0, evidence: evidenceLevelForSample(0) };
+  const avgWin = wins.length ? avg(wins.map(t => Number(t.actual_move))) : 0;
+  const avgLoss = losses.length ? avg(losses.map(t => Number(t.actual_move))) : 0;
+  const winRate = wins.length / closed.length;
+  const expectancyPct = winRate * avgWin + (1 - winRate) * avgLoss;
+  const avgR = avgLoss < 0 ? avgWin / Math.abs(avgLoss) : null;
+  const dates = closed
+    .map(t => new Date(t.sell_date || t.buy_date || t.updated_at || t.timestamp || Date.now()).getTime())
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+  const observedDays = dates.length >= 2 ? Math.max(1, (dates[dates.length - 1] - dates[0]) / 86400000) : Math.max(1, closed.length);
+  const tradesPerYear = Math.min(252, Math.max(1, closed.length / observedDays * 252));
+  const annualReturnPct = expectancyPct * tradesPerYear;
+  return {
+    annualReturnPct,
+    expectancyPct,
+    avgR,
+    sampleSize: closed.length,
+    evidence: evidenceLevelForSample(closed.length),
+  };
 }
 
 function strategyTagList(item = {}) {
@@ -611,7 +678,7 @@ function visibleStrategyTags(methods = [], selectedStrategy = "") {
   return list.filter(method => normalizeStrategyName(method) !== normalizeStrategyName(selectedStrategy));
 }
 
-function averageTradesByTicker(trades = [], brain = "") {
+function averageTradesByTicker(trades = [], brain = "", feeAdjusted = true) {
   const groups = new Map();
   trades.forEach(trade => {
     if (!trade?.ticker) return;
@@ -623,14 +690,14 @@ function averageTradesByTicker(trades = [], brain = "") {
     const base = group[0] || {};
     const methods = uniqueList(group.flatMap(strategyTagList));
     const invested = avg(group.map(t => Number(t.invested_amount || 0)));
-    const current = avg(group.map(t => Number(t.current_value ?? t.invested_amount ?? 0)));
+    const current = avg(group.map(t => getValuationFields(t, feeAdjusted).current));
     return {
       ...base,
       id: `all_${brain}_${base.ticker}_${base.direction || "long"}`,
       strategy: "All",
       confluence_methods: methods,
       confluence_count: methods.length,
-      signal_fired: uniqueList(group.flatMap(t => parseList(t.signal_fired))),
+      signal_fired: uniqueList(group.flatMap(t => getSignalData(t).fired)),
       invested_amount: invested,
       current_value: current,
       gross_current_value: avg(group.map(t => Number(t.gross_current_value ?? t.current_value ?? t.invested_amount ?? 0))),
@@ -668,7 +735,7 @@ function averagePicksByTicker(rows = [], brain = "") {
       strategy: "All",
       confluence_methods: methods,
       confluence_count: methods.length,
-      signal_fired: [],
+      signal_fired: uniqueList(group.flatMap(pick => getSignalData(pick).fired)),
       long_conf: confidence,
       long_move: move,
       long_reasoning: `${methods.length} ${brain} strategies currently agree on ${ticker}.`,
@@ -873,6 +940,18 @@ function MiniChart({ data, timeframe, feeAdjusted = false }) {
           <span style={{ color: T1, fontWeight: 600 }}>${hoveredPoint.v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
         </div>
       )}
+    </div>
+  );
+}
+
+function ProjectionLine({ projection, T3, BLUE }) {
+  if (!projection || projection.annualReturnPct == null) return null;
+  return (
+    <div style={{ marginTop: 4, fontSize: 9, color: T3, fontFamily: "'DM Mono',monospace", display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+      <span>Projected annual return {projection.annualReturnPct >= 0 ? "+" : ""}{projection.annualReturnPct.toFixed(1)}%</span>
+      <span style={{ color: BLUE, border: `1px solid ${BLUE}55`, borderRadius: 4, padding: "1px 4px" }}>{projection.evidence}</span>
+      <span>exp {projection.expectancyPct >= 0 ? "+" : ""}{projection.expectancyPct.toFixed(2)}%</span>
+      {projection.avgR != null && <span>{projection.avgR.toFixed(2)}R</span>}
     </div>
   );
 }
@@ -1142,7 +1221,7 @@ function TodayClosedCard({ trade, expanded, onToggle, themeKey = "black" }) {
   );
 }
 
-function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClosed, onDone, onView, onClose, pdtRemaining = 3, themeKey = "black", strategyName, strategyTotal = 10, onAddToPersonal }) {
+function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClosed, onDone, onView, onClose, pdtRemaining = 3, themeKey = "black", strategyName, strategyTotal = 10, onAddToPersonal, feeAdjusted = true }) {
   const [expandedMethod, setExpandedMethod] = React.useState(null);
   const [expandedSignal, setExpandedSignal] = React.useState(null);
   const [glowing, setGlowing] = React.useState(false);
@@ -1172,18 +1251,15 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
   const buyPrice = Number(trade.buy_price || trade.entry_price || 0);
   const investedAmount = Number(trade.invested_amount || 10);
   const currentPrice = Number(trade.current_price || trade.last_price || trade.price || 0);
-  const currentValue = Number(
-    trade.current_value ??
-    trade.gross_current_value ??
-    (currentPrice && buyPrice > 0 ? investedAmount * (currentPrice / buyPrice) : investedAmount)
-  );
+  const fallbackCurrentValue = currentPrice && buyPrice > 0 ? investedAmount * (currentPrice / buyPrice) : investedAmount;
+  const currentValue = Number(getValuationFields({ ...trade, current_value: trade.current_value ?? fallbackCurrentValue }, feeAdjusted).current);
   const rawPnlPercent = trade.current_pnl_percent != null ? Number(trade.current_pnl_percent) :
     trade.actual_move != null ? Number(trade.actual_move) :
     (buyPrice > 0 && currentPrice > 0 ? (currentPrice - buyPrice) / buyPrice * 100 :
       (currentValue - investedAmount) / investedAmount * 100);
   // Clamp -0 to 0 to avoid negative zero display
   const pnlPercent = rawPnlPercent === 0 ? 0 : (Math.abs(rawPnlPercent) < 0.005 ? 0 : rawPnlPercent);
-  const rawPnlDollars = getTradeOpenPnlDollars(trade);
+  const rawPnlDollars = getTradeOpenPnlDollars(trade, feeAdjusted);
   const pnlDollars = Math.abs(rawPnlDollars) < 0.005 ? 0 : rawPnlDollars;
   const isPositive = isLong ? pnlPercent >= 0 : pnlPercent <= 0;
   const pnlColor = pnlPercent === 0 ? T2 : (isPositive ? GREEN : RED);
@@ -1201,7 +1277,8 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
   // Safe parse — confluence_methods may arrive as JSON string from DB
   const confluenceMethods = strategyTagList(trade);
   const visibleMethods = visibleStrategyTags(confluenceMethods, strategyName);
-  const signalCount = getSignalCount(trade);
+  const signalData = getSignalData(trade);
+  const signalCount = signalData.fired.length;
 
   const sentiment = getSentimentLabel(pnlPercent, frozenTarget, trade.sentiment_icon, pdtRemaining);
 
@@ -1375,7 +1452,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
             </div>
           )}
           {/* ── Signal Indicators — which of the 9 scored above threshold ── */}
-          {trade.signal_fired && trade.signal_fired.length > 0 && (() => {
+          {signalData.fired.length > 0 && (() => {
             const SIGNAL_INFO = {
               rsi_momentum:       { label: "RSI",       def: "Relative Strength Index measures price momentum. Sweet spot is 40-65 — strong enough to show conviction but not so high the stock is overbought and due for a reversal." },
               volume_surge:       { label: "Volume",    def: "Today's volume vs the 20-day average. A surge above 1.5x means real institutional participation, not just retail noise. We score up to 3.5x average." },
@@ -1442,7 +1519,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
               <div style={{ padding: "6px 10px 6px 4px", background: "#0a1020", borderRadius: 7, marginTop: 4, border: "1px solid #1a2a40" }}>
                 <span style={{ fontSize: 8, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, display: "block", marginBottom: 6, textAlign: "center" }}>Signal indicators</span>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-                  {trade.signal_fired.map(key => {
+                  {signalData.fired.map(key => {
                     const info = SIGNAL_INFO[key] || { label: key, def: "" };
                     const isActive = expandedSignal === key;
                     return (
@@ -1713,7 +1790,7 @@ function SettingsIcon({ color }) {
   );
 }
 
-function SettingsDrawer({ open, onClose, T1, T2, T3, BORDER, BG, CARD, GREEN, BLUE, AMBER }) {
+function SettingsDrawer({ open, onClose, T1, T2, T3, BORDER, BG, CARD, GREEN, BLUE, AMBER, showTickerBanner = true, onShowTickerBannerChange }) {
   const API = "https://swingdesk-brain-production-205e.up.railway.app";
   const [notifyOn, setNotifyOn] = React.useState(true);
   const [testStatus, setTestStatus] = React.useState(null);
@@ -1753,6 +1830,18 @@ function SettingsDrawer({ open, onClose, T1, T2, T3, BORDER, BG, CARD, GREEN, BL
     setTimeout(() => setTestStatus(null), 4000);
   };
 
+  const toggleTickerBanner = async () => {
+    const next = !showTickerBanner;
+    onShowTickerBannerChange && onShowTickerBannerChange(next);
+    try {
+      await fetch(`${API}/api/ui-preferences`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ show_ticker_banner: next })
+      });
+    } catch(e) {}
+  };
+
   const provider = settings.provider || "twilio";
   const telegramConfigured = settings.telegram_configured;
 
@@ -1763,6 +1852,17 @@ function SettingsDrawer({ open, onClose, T1, T2, T3, BORDER, BG, CARD, GREEN, BL
       <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, zIndex: 101, background: CARD, borderRadius: "16px 16px 0 0", border: `1px solid ${BORDER}`, padding: "20px 20px 36px" }}>
         <div style={{ width: 36, height: 4, background: BORDER, borderRadius: 2, margin: "0 auto 20px" }}/>
         <div style={{ fontSize: 14, fontWeight: 700, color: T1, marginBottom: 16 }}>Settings</div>
+
+        <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .5, marginBottom: 10 }}>Display</div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px", background: BG, borderRadius: 10, border: `1px solid ${BORDER}`, marginBottom: 14 }}>
+          <div>
+            <div style={{ fontSize: 13, color: T1, fontWeight: 500 }}>Ticker banner</div>
+            <div style={{ fontSize: 10, color: T3, marginTop: 2 }}>Show or remove the scrolling market ticker row.</div>
+          </div>
+          <div onClick={toggleTickerBanner} style={{ cursor: "pointer", width: 44, height: 24, borderRadius: 12, background: showTickerBanner ? GREEN : BORDER, transition: "background 0.2s", position: "relative", flexShrink: 0, marginLeft: 12 }}>
+            <div style={{ position: "absolute", top: 2, left: showTickerBanner ? 22 : 2, width: 20, height: 20, borderRadius: "50%", background: "#fff", transition: "left 0.2s" }}/>
+          </div>
+        </div>
 
         {/* Notifications section */}
         <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .5, marginBottom: 10 }}>Notifications</div>
@@ -2206,6 +2306,7 @@ export default function App() {
   const feeQuery = feeAdjusted ? "?fees=on" : "?fees=off";
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [showNetInfo, setShowNetInfo] = useState(false);
+  const [showTickerBanner, setShowTickerBanner] = useState(true);
 
 
   const handleAddToPersonal = async (item, sourcePortfolio = "brain") => {
@@ -2329,7 +2430,7 @@ export default function App() {
         // Fire all requests in parallel
         const [picksData, positions, statsData, runnersData, perfData, closedData,
                nnPicksData, nnPositionsData, nnStatsData, nnPerfData, personalData, monitorData,
-               dayPnlData, variantStatusData, variantBoardData, variantPreviewData, vectorUniverseData, novaUniverseData] = await Promise.all([
+               dayPnlData, variantStatusData, variantBoardData, variantPreviewData, vectorUniverseData, novaUniverseData, uiPrefsData] = await Promise.all([
           apiFetch("/picks").catch(() => ({ longs: [], shorts: [] })),
           apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
           apiFetch("/stats").catch(() => ({})),
@@ -2348,6 +2449,7 @@ export default function App() {
           apiFetch("/variant-strategy-preview").catch(() => null),
           apiFetch("/variant/swingdesk_vector_0845_all").catch(() => null),
           apiFetch("/variant/swingdesk_nova_0845_all").catch(() => null),
+          apiFetch("/ui-preferences").catch(() => null),
         ]);
 
         // Auto-backfill lock_in_confidence for existing trades silently
@@ -2359,6 +2461,9 @@ export default function App() {
         localStorage.setItem("swingdesk_picks", JSON.stringify(picksData));
 
         setOpenPositions(positions);
+        if (uiPrefsData && typeof uiPrefsData.show_ticker_banner === "boolean") {
+          setShowTickerBanner(uiPrefsData.show_ticker_banner);
+        }
         setTodayClosed(closedData || []);
         setExtendedRunners(runnersData);
         setWeights(statsData.weights || {});
@@ -2420,11 +2525,7 @@ export default function App() {
 
     // Live "now" point — always inject if positions exist, even if unrealizedPnl is 0
     // This ensures today always has at least one data point for chart and Day's P&L
-    const unrealizedPnl = (positions || []).reduce((total, trade) => {
-      const invested = trade.invested_amount || 10;
-      const current = trade.current_value || invested;
-      return total + (current - invested);
-    }, 0);
+    const unrealizedPnl = (positions || []).reduce((total, trade) => total + getTradeOpenPnlDollars(trade, feeAdjusted), 0);
 
     const todayStr = new Date().toISOString().split("T")[0];
     const livePoint = (positions || []).some(t => t.outcome === "open") ? [{
@@ -2615,10 +2716,11 @@ export default function App() {
     ? detail.trades.filter(t => t.outcome !== "archived_excess_open")
     : []);
   const novaUniverseTrades = allStrategySelected
-    ? averageTradesByTicker(aggregateTrades, activeVariantBrain)
+    ? averageTradesByTicker(aggregateTrades, activeVariantBrain, feeAdjusted)
     : selectedUniverseTrades;
   const novaUniverseOpen = novaUniverseTrades.filter(t => t.outcome === "open");
   const novaUniverseClosed = novaUniverseTrades.filter(t => t.outcome !== "open");
+  const activeSimulationProjection = calculateSimulationProjection(novaUniverseClosed.length ? novaUniverseClosed : virtualTrades);
   const selectedVariantMatchesTab = allStrategySelected || novaUniverse?.variant?.brain === activeVariantBrain;
   const activeVariantLabel = allStrategySelected
     ? `All Strategies / ${activeVariantBrain} / All`
@@ -2630,7 +2732,7 @@ export default function App() {
     ? novaUniverseOpen.filter(t => (t.direction || "long") === "long")
     : openPositions.filter(t => t.direction === "long" && t.outcome === "open");
   const openShortPositions = openPositions.filter(t => t.direction === "short" && t.outcome === "open");
-  const activeOpenPnl = openLongPositions.reduce((sum, trade) => sum + getTradeOpenPnlDollars(trade), 0);
+  const activeOpenPnl = openLongPositions.reduce((sum, trade) => sum + getTradeOpenPnlDollars(trade, feeAdjusted), 0);
 
   const isWeekendNow = (() => { const d = new Date().getDay(); return d === 0 || d === 6; })();
   // Sell Today = previous session positions (buy_date < today), active on trading days
@@ -2726,11 +2828,7 @@ export default function App() {
   const monitorStale = openLongPositions.length > 0 && (monitorStatus?.status === "failed" || monitorAgeMinutes == null || monitorAgeMinutes >= 10);
 
   // Open P&L from currently held positions
-  const livePnl = openPositions.reduce((total, trade) => {
-    const invested = trade.invested_amount || 10;
-    const current = trade.current_value || invested;
-    return total + (current - invested);
-  }, 0);
+  const livePnl = openPositions.reduce((total, trade) => total + getTradeOpenPnlDollars(trade, feeAdjusted), 0);
 
   // Portfolio balance = last closed balance + unrealized P&L
   const tradingPerfPoints = perfHistory.filter(p => {
@@ -2786,6 +2884,7 @@ export default function App() {
   const novaOpenPositions = selectedVariantMatchesTab && activeVariantBrain === "Nova"
     ? novaUniverseOpen
     : nnPositions.filter(t => t.outcome === "open");
+  const novaSimulationProjection = calculateSimulationProjection(novaUniverseClosed.length ? novaUniverseClosed : nnPositions);
   const novaFreshPositions = novaOpenPositions.filter(t => t.buy_date === today);
   const novaCarryPositions = isWeekendNow ? novaOpenPositions : novaOpenPositions.filter(t => t.buy_date < today);
   const novaOpenFilteredPositions = openDayFilter === "day2"
@@ -2800,7 +2899,7 @@ export default function App() {
   const activeNovaBuyPicks = aggregateNovaBuyPicks || (nnPicks.recommended_longs || []);
   const novaUniverseBalance = novaUniversePortfolio?.equity != null ? Number(novaUniversePortfolio.equity) : null;
   const novaLeader = variantLeaderboard.find(v => v.id === "swingdesk_nova_0845_all");
-  const novaOpenPnl = novaOpenPositions.reduce((sum, trade) => sum + getTradeOpenPnlDollars(trade), 0);
+  const novaOpenPnl = novaOpenPositions.reduce((sum, trade) => sum + getTradeOpenPnlDollars(trade, feeAdjusted), 0);
   const novaStartingCash = Number(novaUniversePortfolio?.starting_cash || 1000);
   const novaRealizedPnl = novaUniversePortfolio?.realized_pnl != null && activeVariantBrain === "Nova"
     ? Number(novaUniversePortfolio.realized_pnl)
@@ -2895,7 +2994,7 @@ export default function App() {
         .tag-glow{animation:tagGlow 0.9s ease-in-out 0.25s;position:relative;z-index:2}
       `}</style>
 
-      <TickerBanner openPositions={openPositions} />
+      {showTickerBanner && <TickerBanner openPositions={openPositions} />}
 
       {/* ════════ TODAY TAB ════════ */}
       {tab === "today" && (
@@ -2993,6 +3092,7 @@ export default function App() {
               <span style={{ fontSize: 10, color: T3 }}>realized {formatSignedCurrency(activeRealizedPnl)} + open {formatSignedCurrency(activeOpenPnl)}</span>
             </div>
             <MiniChart data={perfHistory} timeframe={perfTimeframe} feeAdjusted={feeAdjusted} />
+            <ProjectionLine projection={activeSimulationProjection} T3={T3} BLUE={BLUE} />
             <div style={{ display: "flex", alignItems: "center", marginTop: 8, position: "relative" }}>
               <div style={{ flex: 1, display: "flex", justifyContent: "center", gap: 4 }}>
                 {["D", "W", "M", "3M", "Y", "ALL"].map(tf => (
@@ -3302,7 +3402,7 @@ export default function App() {
                 {openLongPositions.length > 0 && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 12 }}>
                     {sellVisible.map(trade => (
-                        <PositionCard key={trade.id} trade={trade} isLong={true}
+                        <PositionCard key={trade.id} trade={trade} isLong={true} feeAdjusted={feeAdjusted}
                         expanded={expandedCards[trade.id || trade.ticker]}
                         isDone={doneCuts[trade.id || trade.ticker] === "done"}
                         isClosed={doneCuts[trade.id || trade.ticker] === "closed"}
@@ -3329,7 +3429,7 @@ export default function App() {
                     </div>
                     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                       {sortedSellToday.map(trade => (
-                        <PositionCard key={trade.id} trade={trade} isLong={true}
+                        <PositionCard key={trade.id} trade={trade} isLong={true} feeAdjusted={feeAdjusted}
                           expanded={expandedCards[trade.id || trade.ticker]}
                           isDone={doneCuts[trade.id || trade.ticker] === "done"}
                           isClosed={doneCuts[trade.id || trade.ticker] === "closed"}
@@ -3356,7 +3456,7 @@ export default function App() {
                     </div>
                     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                       {sortedHolding.map(trade => (
-                      <PositionCard key={trade.id} trade={trade} isLong={true}
+                      <PositionCard key={trade.id} trade={trade} isLong={true} feeAdjusted={feeAdjusted}
                           expanded={expandedCards[trade.id || trade.ticker]}
                           isDone={doneCuts[trade.id || trade.ticker] === "done"}
                           isClosed={doneCuts[trade.id || trade.ticker] === "closed"}
@@ -3468,6 +3568,7 @@ export default function App() {
                       <span style={{ fontSize: 10, color: T3 }}>realized {formatSignedCurrency(novaRealizedPnl)} + open {formatSignedCurrency(novaOpenPnl)}</span>
                     </div>
                     <MiniChart data={nnPerfHistory} timeframe={nnPerfTimeframe} />
+                    <ProjectionLine projection={novaSimulationProjection} T3={T3} BLUE={"#a78bfa"} />
                     <div style={{ display: "flex", alignItems: "center", marginTop: 8, position: "relative" }}>
                       <div style={{ flex: 1, display: "flex", justifyContent: "center", gap: 4 }}>
                       {["D", "W", "M", "3M", "Y", "ALL"].map(tf => (
@@ -3584,7 +3685,7 @@ export default function App() {
                   </CardMetricGrid>
                   <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                     {sortedNovaOpenFilteredPositions.map(trade => (
-                      <PositionCard key={trade.id} trade={trade} isLong={true}
+                      <PositionCard key={trade.id} trade={trade} isLong={true} feeAdjusted={feeAdjusted}
                         themeKey={themeKey}
                         pdtRemaining={pdtRemaining}
                         strategyName={selectedStrategy}
@@ -4472,6 +4573,8 @@ export default function App() {
         onClose={() => setSettingsOpen(false)}
         T1={T1} T2={T2} T3={T3} BORDER={BORDER} BG={BG} CARD={CARD}
         GREEN={GREEN} BLUE={BLUE} AMBER={AMBER}
+        showTickerBanner={showTickerBanner}
+        onShowTickerBannerChange={setShowTickerBanner}
       />
     </div>
     </ErrorBoundary>

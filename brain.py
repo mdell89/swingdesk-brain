@@ -7717,6 +7717,7 @@ def api_ui_preferences():
     defaults = {
         "pick_percent_mode": "PM",
         "open_percent_mode": "RO",
+        "show_ticker_banner": True,
     }
     allowed = {
         "pick_percent_mode": {"PC", "PM", "RO"},
@@ -7730,6 +7731,8 @@ def api_ui_preferences():
             value = str(body.get(key, updated.get(key, defaults[key]))).upper()
             if value in valid_values:
                 updated[key] = value
+        if "show_ticker_banner" in body:
+            updated["show_ticker_banner"] = bool(body.get("show_ticker_banner"))
         set_app_state("ui_preferences", json.dumps(updated))
         return jsonify(updated)
     return jsonify({**defaults, **(get_app_state_json("ui_preferences", {}) or {})})
