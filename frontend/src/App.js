@@ -537,8 +537,10 @@ function JournalButton() {
   return null;
 }
 
-function StrategyBadge({ strategy, color = BLUE }) {
+function StrategyBadge({ strategy, selectedStrategy, color = BLUE }) {
   if (!strategy) return null;
+  const normalize = value => String(value || "").trim().toLowerCase();
+  if (normalize(strategy) === normalize(selectedStrategy)) return null;
   return (
     <span style={{
       fontSize: 7,
@@ -571,6 +573,7 @@ function CompactMethodTags({ methods = [], glowing = false }) {
       background: "#000",
       borderRadius: 3,
       border: "1px solid rgba(255,255,255,0.2)",
+      whiteSpace: "nowrap",
       flexShrink: 0,
     }}>{method}</span>
   ));
@@ -613,7 +616,7 @@ function CardActionRow({ statusLabel, statusPhrase, statusColor, staleTime, acti
           <StaleBadge staleTime={staleTime} />
         </span>
       </div>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 5, minWidth: 0, overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 5, minWidth: 0, overflow: "hidden", flexWrap: "wrap" }}>
         {actions}
       </div>
     </div>
@@ -803,7 +806,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
       <CardActionRow
         borderColor={BORDER}
         actions={<>
-          <StrategyBadge strategy={pick.strategy || strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
+          <StrategyBadge strategy={pick.strategy || strategyName} selectedStrategy={strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
           <CompactMethodTags methods={confluenceMethods} glowing={glowing} />
           <EvidenceBadgeCompact evidence={pick.evidence} />
           {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 && (
@@ -1136,7 +1139,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
         staleTime={isStale ? staleTime : null}
         borderColor={rulingColor}
         actions={<>
-          <StrategyBadge strategy={trade.strategy || strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
+          <StrategyBadge strategy={trade.strategy || strategyName} selectedStrategy={strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
           <CompactMethodTags methods={confluenceMethods} glowing={glowing} />
           <EvidenceBadgeCompact evidence={trade.evidence} />
           {trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7 && (
@@ -2145,7 +2148,7 @@ export default function App() {
     ? novaUniverse.variant.label
     : `SwingDesk / ${activeVariantBrain} / 8:45 / All`;
 
-  const openLongPositions = selectedVariantMatchesTab && activeVariantBrain === "Vector" && novaUniverseOpen.length
+  const openLongPositions = selectedVariantMatchesTab && activeVariantBrain === "Vector"
     ? novaUniverseOpen.filter(t => (t.direction || "long") === "long")
     : openPositions.filter(t => t.direction === "long" && t.outcome === "open");
   const openShortPositions = openPositions.filter(t => t.direction === "short" && t.outcome === "open");
@@ -2290,7 +2293,9 @@ export default function App() {
   const perfUp = perfChange >= 0;
   const backendDayPnl = dayPnlStatus?.success ? Number(dayPnlStatus.day_pnl || 0) : null;
   const backendDayUp = backendDayPnl == null ? perfUp : backendDayPnl >= 0;
-  const novaOpenPositions = novaUniverseOpen.length ? novaUniverseOpen : nnPositions.filter(t => t.outcome === "open");
+  const novaOpenPositions = selectedVariantMatchesTab && activeVariantBrain === "Nova"
+    ? novaUniverseOpen
+    : nnPositions.filter(t => t.outcome === "open");
   const novaFreshPositions = novaOpenPositions.filter(t => t.buy_date === today);
   const novaCarryPositions = isWeekendNow ? novaOpenPositions : novaOpenPositions.filter(t => t.buy_date < today);
   const novaOpenFilteredPositions = openDayFilter === "day2"
@@ -2322,7 +2327,11 @@ export default function App() {
     const baseline = prior ? Number(prior.equity || 1000) : Number(novaUniversePortfolio?.starting_cash || 1000);
     return round2(current - baseline);
   })();
-  const variantOptions = variantLeaderboard.filter(v => v.brain === activeVariantBrain && v.strategy === selectedStrategy);
+  const variantOptions = variantLeaderboard.filter(v =>
+    v.brain === activeVariantBrain &&
+    v.strategy === selectedStrategy &&
+    !["top 1", "top1", "top 3", "top3"].includes(String(v.selection_mode || "").toLowerCase())
+  );
   const variantLabel = v => {
     if (!v) return "All";
     const time = v.execution_time === "reg" ? "Reg" : (v.execution_time || "").replace(/^0/, "");

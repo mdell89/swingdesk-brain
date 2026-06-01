@@ -1309,21 +1309,13 @@ def initialize_database():
     now_iso = current_time_cst().isoformat()
     default_variants = [
         ("swingdesk_vector_0845_all", "SwingDesk", "Vector", "08:45", "All", "time_or_thesis", "SwingDesk / Vector / 8:45 / All"),
-        ("swingdesk_vector_0845_top1", "SwingDesk", "Vector", "08:45", "Top 1", "time_or_thesis", "SwingDesk / Vector / 8:45 / Top 1"),
         ("swingdesk_nova_0845_all", "SwingDesk", "Nova", "08:45", "All", "time_or_thesis", "SwingDesk / Nova / 8:45 / All"),
-        ("swingdesk_nova_0845_top1", "SwingDesk", "Nova", "08:45", "Top 1", "time_or_thesis", "SwingDesk / Nova / 8:45 / Top 1"),
         ("swingdesk_vector_0500_all", "SwingDesk", "Vector", "05:00", "All", "time_or_thesis", "SwingDesk / Vector / 5:00 / All"),
-        ("swingdesk_vector_0500_top1", "SwingDesk", "Vector", "05:00", "Top 1", "time_or_thesis", "SwingDesk / Vector / 5:00 / Top 1"),
         ("swingdesk_nova_0500_all", "SwingDesk", "Nova", "05:00", "All", "time_or_thesis", "SwingDesk / Nova / 5:00 / All"),
-        ("swingdesk_nova_0500_top1", "SwingDesk", "Nova", "05:00", "Top 1", "time_or_thesis", "SwingDesk / Nova / 5:00 / Top 1"),
         ("swingdesk_vector_0600_all", "SwingDesk", "Vector", "06:00", "All", "time_or_thesis", "SwingDesk / Vector / 6:00 / All"),
-        ("swingdesk_vector_0600_top1", "SwingDesk", "Vector", "06:00", "Top 1", "time_or_thesis", "SwingDesk / Vector / 6:00 / Top 1"),
         ("swingdesk_nova_0600_all", "SwingDesk", "Nova", "06:00", "All", "time_or_thesis", "SwingDesk / Nova / 6:00 / All"),
-        ("swingdesk_nova_0600_top1", "SwingDesk", "Nova", "06:00", "Top 1", "time_or_thesis", "SwingDesk / Nova / 6:00 / Top 1"),
         ("swingdesk_vector_0700_all", "SwingDesk", "Vector", "07:00", "All", "time_or_thesis", "SwingDesk / Vector / 7:00 / All"),
-        ("swingdesk_vector_0700_top1", "SwingDesk", "Vector", "07:00", "Top 1", "time_or_thesis", "SwingDesk / Vector / 7:00 / Top 1"),
         ("swingdesk_nova_0700_all", "SwingDesk", "Nova", "07:00", "All", "time_or_thesis", "SwingDesk / Nova / 7:00 / All"),
-        ("swingdesk_nova_0700_top1", "SwingDesk", "Nova", "07:00", "Top 1", "time_or_thesis", "SwingDesk / Nova / 7:00 / Top 1"),
         ("darvas_vector_reg_all", "Darvas", "Vector", "reg", "All", "strategy_exit", "Darvas / Vector / Reg / All"),
         ("darvas_nova_reg_all", "Darvas", "Nova", "reg", "All", "strategy_exit", "Darvas / Nova / Reg / All"),
         ("gap_go_vector_reg_all", "Gap & Go", "Vector", "reg", "All", "strategy_exit", "Gap & Go / Vector / Reg / All"),
@@ -1361,7 +1353,13 @@ def initialize_database():
             )""",
         [json.dumps(["retired_strategy_family_replaced_for_locked_swingdesk_12"]), now_iso, *retired_strategies],
     )
-    retired_variant_ids = ("swingdesk_vector_0845_top3", "swingdesk_nova_0845_top3")
+    retired_variant_ids = (
+        "swingdesk_vector_0845_top1", "swingdesk_nova_0845_top1",
+        "swingdesk_vector_0500_top1", "swingdesk_nova_0500_top1",
+        "swingdesk_vector_0600_top1", "swingdesk_nova_0600_top1",
+        "swingdesk_vector_0700_top1", "swingdesk_nova_0700_top1",
+        "swingdesk_vector_0845_top3", "swingdesk_nova_0845_top3",
+    )
     database.execute(
         f"UPDATE strategy_variants SET status='retired', updated_at=? WHERE id IN ({','.join(['?'] * len(retired_variant_ids))})",
         [now_iso, *retired_variant_ids],
