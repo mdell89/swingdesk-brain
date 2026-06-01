@@ -3291,8 +3291,9 @@ def fetch_current_prices(tickers, pin_to_845=False):
 def calculate_rsi_batch(tickers, period=14, price_data=None):
     """
     Calculate RSI for multiple tickers.
-    Uses daily_history already in price_data when available (no extra API calls).
-    Falls back to fetching from Twelve Data if history not available.
+    Uses daily_history already in price_data when available.
+    Missing history defaults to neutral RSI instead of doing hundreds of
+    per-ticker provider calls inside the scan hot path.
     """
     rsi_values = {}
 
@@ -3302,12 +3303,6 @@ def calculate_rsi_batch(tickers, period=14, price_data=None):
             history = None
             if price_data and ticker in price_data:
                 history = price_data[ticker].get("daily_history")
-
-            if not history or len(history) < period + 1:
-                # Fetch history for this ticker
-                td = fetch_twelve_data_batch([ticker], interval="1day", outputsize=60)
-                if ticker in td:
-                    history = td[ticker].get("daily_history", [])
 
             if not history or len(history) < period + 1:
                 rsi_values[ticker] = 50.0
@@ -3669,15 +3664,21 @@ def calculate_method_confluence(ticker, price_data, scored_stocks=None):
 def enrich_price_data_with_history(tickers, price_data):
     """
     Ensure daily_history is populated in price_data for confluence scoring.
-    Twelve Data already includes history in fetch_price_data results.
-    Only fetches missing history for tickers that don't have it yet.
+    Fetches only a bounded candidate subset so comprehensive scans cannot stall
+    on hundreds of one-by-one candle calls.
     """
     missing = [t for t in tickers if t in price_data and not price_data[t].get("daily_history")]
     if not missing:
         return  # All tickers already have history from Twelve Data
 
-    log.info(f"Fetching history for {len(missing)} tickers missing daily_history...")
-    supplemental = fetch_twelve_data_batch(missing, interval="1day", outputsize=60)
+    def history_priority(ticker):
+        data = price_data.get(ticker, {}) or {}
+        return max(abs(float(data.get("gap_percent") or 0)), abs(float(data.get("day_change_percent") or 0)))
+
+    max_history_fetch = int(os.getenv("SCAN_HISTORY_REFRESH_LIMIT", "40"))
+    selected = sorted(missing, key=history_priority, reverse=True)[:max_history_fetch]
+    log.info(f"Fetching history for {len(selected)}/{len(missing)} tickers missing daily_history...")
+    supplemental = fetch_twelve_data_batch(selected, interval="1day", outputsize=60)
     for ticker in missing:
         if ticker in supplemental and "daily_history" in supplemental[ticker]:
             price_data[ticker]["daily_history"] = supplemental[ticker]["daily_history"]
@@ -4563,15 +4564,23 @@ def enrich_with_live_prices(tickers, price_data):
 
     log.info(f"Extended hours active — enriching {len(tickers)} tickers with live prices ({'pre' if in_premarket else 'post'}-market)")
 
+    max_external = int(os.getenv("SCAN_LIVE_REFRESH_LIMIT", "80"))
+    external_used = 0
     enriched = 0
     cycle = ProviderCycle("extended_hours_enrich")
     for ticker in tickers:
         if ticker not in price_data:
             continue
+        cached_quote = _read_quote_cache(ticker)
+        if not cached_quote and external_used >= max_external:
+            continue
         try:
-            quote = fetch_quote_with_fallback(ticker, cycle=cycle, use_cache=True)
+            quote = cached_quote or fetch_quote_with_fallback(ticker, cycle=cycle, use_cache=False)
+            if not cached_quote:
+                external_used += 1
             if not quote or quote["price"] <= 0:
-                time.sleep(1.1)
+                if not cached_quote:
+                    time.sleep(1.1)
                 continue
             live_price = quote["price"]
             data = price_data[ticker]
@@ -4587,7 +4596,8 @@ def enrich_with_live_prices(tickers, price_data):
                 data["day_change_percent"] = round(new_change, 4)
             data["live_price_source"] = quote.get("source", "provider")
             enriched += 1
-            time.sleep(1.1)
+            if not cached_quote:
+                time.sleep(1.1)
         except:
             pass
     set_app_state("last_price_provider_summary", json.dumps(cycle.summary()))
@@ -5091,8 +5101,12 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
             "reason": "comprehensive_scan_already_running",
             "nn_picks": {"picks": 0, "qualified_count": 0, "source": "shared_comprehensive_scan"},
         }
+    started_after = current_time_cst().isoformat()
     try:
         return _run_comprehensive_scan_impl(weights=weights, scan_type=scan_type)
+    except Exception as error:
+        mark_running_events_error("comprehensive", started_after, error)
+        raise
     finally:
         _comprehensive_scan_lock.release()
 
