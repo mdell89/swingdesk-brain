@@ -2569,7 +2569,7 @@ export default function App() {
                   </div>
                 ) : (
                   <>
-                    <CardMetricGrid style={{ padding: `0 ${CARD_PAD_R} 5px ${CARD_PAD_L}` }}>
+                    <CardMetricGrid style={{ padding: `${HOME_ROW_GAP}px ${CARD_PAD_R} ${HOME_ROW_GAP}px ${CARD_PAD_L}` }}>
                       <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
                       <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center" }}>% Chg</div>
                       <SpineCell><div style={{ width: SPINE_VALUE_W, fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center", whiteSpace: "nowrap" }}>Move</div></SpineCell>
@@ -2681,7 +2681,7 @@ export default function App() {
 
                 {/* ── Column header (shared for both sections) ── */}
                 {openLongPositions.length > 0 && (
-                  <CardMetricGrid style={{ padding: `0 ${CARD_PAD_R} 5px ${CARD_PAD_L}` }}>
+                  <CardMetricGrid style={{ padding: `${HOME_ROW_GAP}px ${CARD_PAD_R} ${HOME_ROW_GAP}px ${CARD_PAD_L}` }}>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "left" }}>Day %</div>
                     <SpineCell><div style={{ width: SPINE_VALUE_W, fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center", whiteSpace: "nowrap" }}>Open P&L</div></SpineCell>
@@ -2992,7 +2992,7 @@ export default function App() {
                       }}>{label}</button>
                     ))}
                   </div>
-                  <CardMetricGrid style={{ padding: `0 ${CARD_PAD_R} 5px ${CARD_PAD_L}` }}>
+                  <CardMetricGrid style={{ padding: `${HOME_ROW_GAP}px ${CARD_PAD_R} ${HOME_ROW_GAP}px ${CARD_PAD_L}` }}>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "left" }}>Day %</div>
                     <SpineCell><div style={{ width: SPINE_VALUE_W, fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center", whiteSpace: "nowrap" }}>Open P&L</div></SpineCell>
@@ -3020,7 +3020,7 @@ export default function App() {
               {/* NN Picks */}
               {longSub === "buy" && nnPicks.recommended_longs && nnPicks.recommended_longs.length > 0 ? (
                 <div>
-                  <CardMetricGrid style={{ padding: `0 ${CARD_PAD_R} 5px ${CARD_PAD_L}` }}>
+                  <CardMetricGrid style={{ padding: `${HOME_ROW_GAP}px ${CARD_PAD_R} ${HOME_ROW_GAP}px ${CARD_PAD_L}` }}>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
                     <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center" }}>% Chg</div>
                     <SpineCell><div style={{ width: SPINE_VALUE_W, fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center", whiteSpace: "nowrap" }}>Move</div></SpineCell>
