@@ -2316,6 +2316,7 @@ export default function App() {
   const [learningEvents, setLearningEvents] = useState([]);
   const [learningTotal, setLearningTotal] = useState(0);
   const [learningPage, setLearningPage] = useState(0);
+  const [variantCounterPage, setVariantCounterPage] = useState(0);
   const [variantHealth, setVariantHealth] = useState(null);
   const [perfHistory, setPerfHistory] = useState([]);
   const [lastAudit, setLastAudit] = useState(null);
@@ -2642,6 +2643,7 @@ export default function App() {
   function round2(n) { return Math.round(n * 100) / 100; }
   const AUDIT_PAGE_SIZE = 3;
   const LEARNING_PAGE_SIZE = 10;
+  const VARIANT_COUNTER_PAGE_SIZE = 8;
 
   async function loadAuditPage(page = auditPage) {
     const offset = page * AUDIT_PAGE_SIZE;
@@ -2798,6 +2800,11 @@ export default function App() {
       }
     }).catch(() => {});
   }, [selectedStrategy, portfolioTab, variantLeaderboard, variantDetailsById]);
+
+  useEffect(() => {
+    const lastPage = Math.max(0, Math.ceil(variantLeaderboard.length / VARIANT_COUNTER_PAGE_SIZE) - 1);
+    setVariantCounterPage(page => Math.min(page, lastPage));
+  }, [variantLeaderboard.length]);
 
   const openTickers = new Set(openPositions.filter(t => t.outcome === "open").map(t => t.ticker));
   const allBuyPicks = picks.longs.filter(pick => !openTickers.has(pick.ticker));
@@ -3046,6 +3053,17 @@ export default function App() {
     v.strategy === selectedStrategy &&
     !["top 1", "top1", "top 3", "top3"].includes(String(v.selection_mode || "").toLowerCase())
   );
+  const variantsByClosedTrades = [...variantLeaderboard]
+    .sort((a, b) =>
+      Number(b.closed_count || 0) - Number(a.closed_count || 0) ||
+      Number(b.open_count || 0) - Number(a.open_count || 0) ||
+      Number(b.return_pct || 0) - Number(a.return_pct || 0)
+    );
+  const variantCounterPageCount = Math.max(1, Math.ceil(variantsByClosedTrades.length / VARIANT_COUNTER_PAGE_SIZE));
+  const variantCounterRows = variantsByClosedTrades.slice(
+    variantCounterPage * VARIANT_COUNTER_PAGE_SIZE,
+    (variantCounterPage + 1) * VARIANT_COUNTER_PAGE_SIZE
+  );
   const variantLabel = v => {
     if (!v) return "All";
     const time = v.execution_time === "reg" ? "Reg" : (v.execution_time || "").replace(/^0/, "");
@@ -3111,8 +3129,8 @@ export default function App() {
         ::-webkit-scrollbar{width:0}
         @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
         .fadeIn{animation:fadeUp .2s ease}
-        @keyframes tagGlow{0%{filter:none;opacity:1}50%{filter:drop-shadow(0 0 5px currentColor) drop-shadow(0 0 2px currentColor);opacity:.96}100%{filter:none;opacity:1}}
-        .tag-glow{animation:tagGlow 0.9s ease-in-out 0.25s;position:relative;z-index:2}
+        @keyframes tagGlow{0%{filter:drop-shadow(0 0 1px currentColor);opacity:1}50%{filter:drop-shadow(0 0 5px currentColor) drop-shadow(0 0 2px currentColor);opacity:.96}100%{filter:drop-shadow(0 0 3px currentColor);opacity:1}}
+        .tag-glow{animation:tagGlow 0.9s ease-in-out 0.25s;filter:drop-shadow(0 0 3px currentColor);position:relative;z-index:2}
       `}</style>
 
       {showTickerBanner && <TickerBanner openPositions={openPositions} />}
@@ -3389,8 +3407,8 @@ export default function App() {
                 {recentlyClosed.length > 0 && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 12 }}>
                     {recentlyClosed.map(trade => {
-                      const pnlPct = trade.actual_move || 0;
-                      const gross = trade.gross_pnl || 0;
+                      const pnlPct = getClosedTradePnlPercent(trade);
+                      const closedPnlDollars = getClosedTradePnlDollars(trade, feeAdjusted);
                       const pnlColor = pnlPct >= 0 ? GREEN : RED;
                       const isExpanded = expandedCards["closed_" + trade.id];
                       const outcomeColor = trade.outcome === "hit" ? GREEN : trade.outcome === "partial" ? AMBER : RED;
@@ -3406,7 +3424,7 @@ export default function App() {
                               </div>
                               <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 2 }}>
                                 <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, fontWeight: 600, color: pnlColor }}>{pnlPct >= 0 ? "+" : ""}{pnlPct.toFixed(1)}%</span>
-                                <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: pnlColor }}>{gross >= 0 ? "+" : ""}${Math.abs(gross).toFixed(2)}</span>
+                                <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: pnlColor }}>{closedPnlDollars >= 0 ? "+" : "-"}${Math.abs(closedPnlDollars).toFixed(2)}</span>
                                 <span style={{ fontSize: 9, color: T3 }}>{sellReasonLabel}</span>
                               </div>
                             </div>
@@ -4461,6 +4479,52 @@ export default function App() {
                 <div style={{ background: "#000", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
                   <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>Needs Attention</div>
                   <div style={{ fontSize: 12, color: variantHealth.attention_count ? AMBER : GREEN, fontFamily: "'DM Mono',monospace" }}>{variantHealth.attention_count || 0}</div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {variantLeaderboard.length > 0 && (
+            <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, marginBottom: 16, overflow: "hidden" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 14px", borderBottom: `1px solid ${BORDER}` }}>
+                <div>
+                  <div style={{ fontSize: 12, fontWeight: 800, color: T1 }}>Variant play counter</div>
+                  <div style={{ fontSize: 8, color: T3, marginTop: 2 }}>Closed trades by variant, sorted by sample count.</div>
+                </div>
+                <div style={{ fontSize: 10, color: BLUE, fontFamily: "'DM Mono',monospace" }}>
+                  {variantsByClosedTrades.reduce((sum, row) => sum + Number(row.closed_count || 0), 0)} closes
+                </div>
+              </div>
+              <div style={{ padding: "8px 12px 10px" }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                  {variantCounterRows.map(row => {
+                    const closedCount = Number(row.closed_count || 0);
+                    const winRate = row.win_rate == null ? null : Number(row.win_rate);
+                    const color = row.brain === "Nova" ? "#a78bfa" : BLUE;
+                    return (
+                      <div key={row.id} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8, alignItems: "center", padding: "7px 8px", background: "#070708", border: `1px solid ${BORDER}`, borderRadius: 7 }}>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontSize: 9, color: T1, fontWeight: 800, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{row.label || row.id}</div>
+                          <div style={{ fontSize: 8, color: T3, marginTop: 2 }}>
+                            {row.open_count || 0} open | {row.win_count || 0} wins | {row.loss_count || 0} losses
+                          </div>
+                        </div>
+                        <div style={{ textAlign: "right", flexShrink: 0 }}>
+                          <div style={{ fontSize: 13, color, fontWeight: 900, fontFamily: "'DM Mono',monospace" }}>{closedCount}</div>
+                          <div style={{ fontSize: 8, color: winRate == null ? T3 : winRate >= 60 ? GREEN : winRate >= 45 ? AMBER : RED, fontFamily: "'DM Mono',monospace" }}>
+                            {winRate == null ? "- win" : `${winRate.toFixed(1)}% win`}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8 }}>
+                  <span style={{ fontSize: 8, color: T3 }}>Page {variantCounterPage + 1} of {variantCounterPageCount}</span>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <button onClick={() => setVariantCounterPage(p => Math.max(0, p - 1))} disabled={variantCounterPage === 0} style={{ fontSize: 8, color: variantCounterPage === 0 ? T3 : BLUE, background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 5, padding: "3px 7px" }}>Prev</button>
+                    <button onClick={() => setVariantCounterPage(p => Math.min(variantCounterPageCount - 1, p + 1))} disabled={variantCounterPage >= variantCounterPageCount - 1} style={{ fontSize: 8, color: variantCounterPage >= variantCounterPageCount - 1 ? T3 : BLUE, background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 5, padding: "3px 7px" }}>Next</button>
+                  </div>
                 </div>
               </div>
             </div>

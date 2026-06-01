@@ -1,8 +1,14 @@
 import { render, screen } from '@testing-library/react';
 import App from './App';
 
-test('renders learn react link', () => {
-  render(<App />);
-  const linkElement = screen.getByText(/learn react/i);
-  expect(linkElement).toBeInTheDocument();
+test('renders SwingDesk loading shell', () => {
+  jest.spyOn(global, 'fetch').mockResolvedValue({
+    ok: false,
+    json: async () => ({}),
+  });
+  const { unmount } = render(<App />);
+  expect(screen.getByText(/swing desk/i)).toBeInTheDocument();
+  expect(screen.getByText(/not financial advice/i)).toBeInTheDocument();
+  unmount();
+  global.fetch.mockRestore();
 });
