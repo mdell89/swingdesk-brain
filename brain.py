@@ -1,11 +1,5 @@
 """
-brain.py — Overnight Swing Desk Backend v19b (Push 54)
-
-Changes in Push 54:
-  - Scoring loop emits per-ticker progress every 5 tickers via record_nn_scan_status()
-    writes: current_ticker, total_scanned, scanned_tickers (last 40) to app_state
-    surfaces through existing /api/nn-scan-status endpoint — no new routes
-
+brain.py — Overnight Swing Desk Backend v19b (Push 47b)
 ════════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
@@ -4893,8 +4887,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
     all_open_tickers = open_long_tickers | open_short_tickers
 
     scored_stocks = []
-    _scan_ticker_log = []
-    for _scan_i, ticker in enumerate(universe):
+    for ticker in universe:
         if ticker not in price_data:
             continue
         # Skip tickers with open positions — they're already committed
@@ -4902,16 +4895,6 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         if ticker in all_open_tickers:
             continue
         stock_data = price_data[ticker]
-        _scan_ticker_log.append(ticker)
-        if _scan_i % 5 == 0 or _scan_i == len(universe) - 1:
-            record_nn_scan_status(
-                status="running",
-                phase="scoring",
-                current_ticker=ticker,
-                total_scanned=len(_scan_ticker_log),
-                scanned_tickers=_scan_ticker_log[-40:],
-                scan_event_id=scan_event_id,
-            )
         rsi = rsi_values.get(ticker, 50.0)
         has_earnings = ticker in earnings_soon
 
@@ -7019,22 +7002,116 @@ def audit_llm_chain(prompt):
             log.warning(f"Audit provider {name} failed: {error}")
     raise RuntimeError(json.dumps(attempts))
 
+def build_variant_audit_prompt(variant_id, variant_label, current_weights, resolved_trades, win_rate, closed_days_summary):
+    """Build a specific, data-driven audit prompt for a single variant."""
+    signals = ["rsi_momentum","volume_surge","overnight_gap_probability","earnings_catalyst",
+               "support_resistance","relative_strength","sector_relative_strength",
+               "vwap_reclaim","volatility_squeeze"]
+
+    # Per-signal hit/miss stats from this variant's trade reasoning
+    indicator_stats = {}
+    for trade in resolved_trades:
+        reasoning_raw = (trade.get("reasoning") or "").lower()
+        scores_raw = {}
+        try:
+            blob = json.loads(trade.get("signal_scores") or "{}")
+            scores_raw = blob.get("scores", blob) if isinstance(blob, dict) else {}
+        except Exception:
+            pass
+        for signal in signals:
+            if signal in reasoning_raw or signal.replace("_"," ") in reasoning_raw or signal in scores_raw:
+                if signal not in indicator_stats:
+                    indicator_stats[signal] = {"hits":0,"misses":0,"avg_score":[], "avg_move":[]}
+                outcome = trade.get("outcome","")
+                if outcome == "hit":
+                    indicator_stats[signal]["hits"] += 1
+                elif outcome == "miss":
+                    indicator_stats[signal]["misses"] += 1
+                if signal in scores_raw:
+                    try:
+                        indicator_stats[signal]["avg_score"].append(float(scores_raw[signal]))
+                    except Exception:
+                        pass
+                try:
+                    indicator_stats[signal]["avg_move"].append(float(trade.get("actual_move") or 0))
+                except Exception:
+                    pass
+
+    for k in indicator_stats:
+        t = indicator_stats[k]["hits"] + indicator_stats[k]["misses"]
+        indicator_stats[k]["win_rate"] = round(indicator_stats[k]["hits"]/t, 2) if t else None
+        indicator_stats[k]["sample_size"] = t
+        scores = indicator_stats[k].pop("avg_score")
+        moves = indicator_stats[k].pop("avg_move")
+        indicator_stats[k]["avg_signal_score"] = round(sum(scores)/len(scores), 2) if scores else None
+        indicator_stats[k]["avg_actual_move_pct"] = round(sum(moves)/len(moves), 2) if moves else None
+
+    w = {k: f"{round(v*100)}%" for k,v in current_weights.items()}
+    wr_pct = f"{round(win_rate*100)}%" if win_rate else "N/A"
+    hits = sum(1 for t in resolved_trades if t.get("outcome")=="hit")
+    misses = sum(1 for t in resolved_trades if t.get("outcome")=="miss")
+
+    return f"""You are auditing signal weights for variant: {variant_label} (id: {variant_id})
+This variant runs its own independent simulation with its own weight table.
+
+CURRENT WEIGHTS FOR THIS VARIANT:
+{json.dumps(w, indent=2)}
+
+PERFORMANCE FOR THIS VARIANT ({len(resolved_trades)} resolved trades):
+- Overall win rate: {wr_pct} ({hits} hits, {misses} misses)
+- Hold duration breakdown: {json.dumps(closed_days_summary)}
+
+PER-SIGNAL DATA FOR THIS VARIANT (from trade signal scores and reasoning):
+{json.dumps(indicator_stats, indent=2)}
+
+SIGNAL DEFINITIONS:
+- rsi_momentum: RSI <35 oversold or 55-70 momentum zone
+- volume_surge: today volume vs 20-day average
+- overnight_gap_probability: historical gap frequency and magnitude
+- earnings_catalyst: upcoming earnings within 5 days
+- support_resistance: open air above = no overhead resistance
+- relative_strength: stock 5-day return vs SPY
+- sector_relative_strength: sector ETF 5-day return vs SPY
+- vwap_reclaim: closing above VWAP = institutional conviction
+- volatility_squeeze: low historical volatility = coiled spring
+
+ADJUSTMENT RULES:
+- signal win_rate > 0.65 AND sample_size >= 5 → consider increasing weight
+- signal win_rate < 0.45 AND sample_size >= 5 → consider decreasing weight
+- sample_size < 5 for any signal → DO NOT change that signal's weight (not enough data)
+- All weights must sum to exactly 1.0, each between 0.03 and 0.35
+
+Respond ONLY with valid JSON (no markdown, no code fences):
+{{
+  "weights": {{"rsi_momentum": 0.XX, "volume_surge": 0.XX, "overnight_gap_probability": 0.XX, "earnings_catalyst": 0.XX, "support_resistance": 0.XX, "relative_strength": 0.XX, "sector_relative_strength": 0.XX, "vwap_reclaim": 0.XX, "volatility_squeeze": 0.XX}},
+  "reasoning": [
+    "signal_name: win_rate=XX% on N trades, avg_signal_score=X.XX, current_weight=XX% → new_weight=XX% because [specific data reason]",
+    ... one line per signal that changed, skip unchanged signals ...
+  ],
+  "summary": "1-2 sentences on this variant specifically",
+  "confidence": "low|medium|high"
+}}"""
+
+
 def run_self_audit():
-    """Run the signal-weight audit through a real LLM provider chain."""
-    log.info("Running self-audit...")
+    """Run the signal-weight audit for EVERY active variant through the LLM."""
+    log.info("Running self-audit for all active variants...")
     database = get_database()
-    resolved_predictions = [dict(p) for p in database.execute(
+
+    # Get all active variants
+    variant_rows = [dict(r) for r in database.execute(
+        "SELECT id, strategy, brain, label FROM strategy_variants WHERE status='active' ORDER BY id"
+    ).fetchall()]
+
+    # Global performance context (for fallback)
+    global_resolved = [dict(p) for p in database.execute(
         "SELECT * FROM predictions WHERE outcome != 'pending' ORDER BY date DESC LIMIT 200"
     ).fetchall()]
-    total_predictions = database.execute("SELECT COUNT(*) as n FROM predictions").fetchone()["n"]
-    database.close()
+    global_total = database.execute("SELECT COUNT(*) as n FROM predictions").fetchone()["n"]
+    global_hits = [p for p in global_resolved if p["outcome"] == "hit"]
+    global_misses = [p for p in global_resolved if p["outcome"] == "miss"]
+    global_win_rate = len(global_hits)/len(global_resolved) if global_resolved else None
 
-    hit_predictions = [p for p in resolved_predictions if p["outcome"] == "hit"]
-    miss_predictions = [p for p in resolved_predictions if p["outcome"] == "miss"]
-    win_rate = len(hit_predictions) / len(resolved_predictions) if resolved_predictions else None
-    current_weights = get_signal_weights()
-
-    database = get_database()
     closed_days_rows = database.execute("""
         SELECT closed_days, COUNT(*) as count,
                AVG(COALESCE(actual_move, 0)) as avg_move,
@@ -7043,209 +7120,129 @@ def run_self_audit():
         WHERE outcome != 'open' AND closed_days IS NOT NULL
         GROUP BY closed_days ORDER BY closed_days
     """).fetchall()
-    database.close()
     closed_days_summary = [dict(row) for row in closed_days_rows]
+    database.close()
 
-    prompt = build_audit_prompt(
-        current_weights, total_predictions, resolved_predictions,
-        hit_predictions, miss_predictions, win_rate, closed_days_summary
-    )
-    provider_attempts = []
-    try:
-        provider, result, provider_attempts = audit_llm_chain(prompt)
-        new_weights = normalize_signal_weights(result["weights"])
-        save_signal_weights(new_weights)
+    variant_results = []
+    any_success = False
+    ts = current_time_cst().isoformat()
 
-        ts = current_time_cst().isoformat()
-        database = get_database()
-        database.execute("""
-            INSERT INTO audit_log (timestamp, audit_success, audit_provider, provider_attempts,
-            weights_before, weights_after, reasoning, summary,
-            total_predictions, resolved_count, hit_count, miss_count, win_rate)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, [ts, 1, provider, json.dumps(provider_attempts),
-              json.dumps(current_weights), json.dumps(new_weights),
-              json.dumps(result.get("reasoning", [])), result.get("summary", ""),
-              total_predictions, len(resolved_predictions), len(hit_predictions),
-              len(miss_predictions), win_rate])
-        database.execute("""
-            INSERT INTO weights_history (timestamp, rsi_momentum, volume_surge,
-            overnight_gap_probability, earnings_catalyst, support_resistance,
-            relative_strength, sector_relative_strength, vwap_reclaim, volatility_squeeze,
-            win_rate, total_resolved)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """, [ts,
-              new_weights.get("rsi_momentum", 0),
-              new_weights.get("volume_surge", 0),
-              new_weights.get("overnight_gap_probability", 0),
-              new_weights.get("earnings_catalyst", 0),
-              new_weights.get("support_resistance", 0),
-              new_weights.get("relative_strength", 0),
-              new_weights.get("sector_relative_strength", 0),
-              new_weights.get("vwap_reclaim", 0),
-              new_weights.get("volatility_squeeze", 0),
-              win_rate, len(resolved_predictions)])
-        database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_audit',?)", [ts])
-        database.commit()
-        database.close()
-        return {
-            "success": True,
-            "weights": new_weights,
-            "reasoning": result.get("reasoning", []),
-            "summary": result.get("summary", ""),
-            "confidence": result.get("confidence", "medium"),
-            "provider": provider,
-            "provider_attempts": provider_attempts,
-        }
-    except Exception as error:
-        log.error(f"All audit LLM providers failed: {error}")
+    for variant in variant_rows:
+        variant_id = variant["id"]
+        variant_label = variant.get("label") or variant_id
+        log.info(f"Auditing variant: {variant_label}")
+
+        db2 = get_database()
+        # Get this variant's resolved trades
+        resolved = [dict(r) for r in db2.execute(
+            "SELECT * FROM variant_virtual_trades WHERE variant_id=? AND outcome IN ('hit','miss') ORDER BY sell_date DESC LIMIT 100",
+            [variant_id]
+        ).fetchall()]
+        current_weights = get_variant_signal_weights(db2, variant_id)
+        db2.close()
+
+        # Need at least 3 resolved trades to audit meaningfully
+        if len(resolved) < 3:
+            variant_results.append({
+                "variant_id": variant_id,
+                "variant_label": variant_label,
+                "success": False,
+                "skipped": True,
+                "reason": f"Only {len(resolved)} resolved trades — need at least 3",
+                "weights_before": current_weights,
+                "weights_after": current_weights,
+                "reasoning": [],
+                "summary": f"Skipped: insufficient trade history ({len(resolved)} trades)",
+            })
+            continue
+
+        hits = [t for t in resolved if t["outcome"] == "hit"]
+        misses = [t for t in resolved if t["outcome"] == "miss"]
+        win_rate = len(hits)/len(resolved) if resolved else None
+
+        prompt = build_variant_audit_prompt(
+            variant_id, variant_label, current_weights,
+            resolved, win_rate, closed_days_summary
+        )
+
         try:
-            provider_attempts = json.loads(str(error))
-        except Exception:
-            provider_attempts = [{"provider": "audit_chain", "error": str(error)[:220]}]
-        failure_summary = "Audit failed: no configured LLM provider returned a usable weight update."
-        ts = current_time_cst().isoformat()
-        database = get_database()
-        database.execute("""
-            INSERT INTO audit_log (timestamp, audit_success, audit_provider, provider_attempts,
-            weights_before, weights_after, reasoning, summary,
-            total_predictions, resolved_count, hit_count, miss_count, win_rate)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, [ts, 0, None, json.dumps(provider_attempts),
-              json.dumps(current_weights), json.dumps(current_weights),
-              json.dumps(provider_attempts), failure_summary,
-              total_predictions, len(resolved_predictions), len(hit_predictions),
-              len(miss_predictions), win_rate])
-        database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_audit',?)", [ts])
-        database.commit()
-        database.close()
-        return {
-            "success": False,
-            "weights": current_weights,
-            "reasoning": provider_attempts,
-            "summary": failure_summary,
-            "confidence": "low",
-            "provider_attempts": provider_attempts,
-        }
-# ── SCHEDULER ─────────────────────────────────────────────────────────────────
-def run_scheduler():
-    """
-    Background scheduler for all automated tasks.
-    
-    All times are specified in UTC (CST + 5 hours).
-    
-    Comprehensive scans run every 30 minutes during pre-market and post-market.
-    8:30 AM CST market open scan fires after queue lock-in for fresh open-market scores.
-    5-minute monitoring runs continuously during active hours (4 AM - 7 PM CST).
-    """
-    import schedule
+            provider, result, provider_attempts = audit_llm_chain(prompt)
+            new_weights = normalize_signal_weights(result["weights"])
 
-    # ── Pre-market comprehensive scans (every 30 min, 4:00-8:00 AM CST) ──
-    # CST + 5 = UTC
-    for hour_utc, label in [(9,"4:00am"),(9.5,"4:30am"),(10,"5:00am"),(10.5,"5:30am"),
-                             (11,"6:00am"),(11.5,"6:30am"),(12,"7:00am"),(12.5,"7:30am"),
-                             (13,"8:00am")]:
-        hour = int(hour_utc)
-        minute = int((hour_utc % 1) * 60)
-        time_str = f"{hour:02d}:{minute:02d}"
-        scan_label = f"pre_market_{label}"
-        schedule.every().day.at(time_str).do(lambda st=scan_label: run_comprehensive_scan(scan_type=st))
+            # Save updated weights for this variant
+            db3 = get_database()
+            db3.execute("""
+                UPDATE variant_signal_weights
+                SET weights_json=?, updated_at=?
+                WHERE variant_id=?
+            """, [json.dumps(new_weights), ts, variant_id])
+            db3.commit()
+            db3.close()
 
-    # 8:15 AM CST = 13:15 UTC — Final pre-market scan
-    schedule.every().day.at("13:15").do(lambda: run_comprehensive_scan(scan_type="final_scan"))
+            any_success = True
+            variant_results.append({
+                "variant_id": variant_id,
+                "variant_label": variant_label,
+                "success": True,
+                "provider": provider,
+                "provider_attempts": provider_attempts,
+                "weights_before": current_weights,
+                "weights_after": new_weights,
+                "reasoning": result.get("reasoning", []),
+                "summary": result.get("summary", ""),
+                "confidence": result.get("confidence", "medium"),
+                "trade_count": len(resolved),
+                "win_rate": win_rate,
+            })
+            log.info(f"Variant {variant_label} audit complete via {provider}")
 
-    # 8:25 AM CST = 13:25 UTC — Queue lock-in: no new picks after this
-    schedule.every().day.at("13:25").do(lock_pick_queue)
+        except Exception as e:
+            log.warning(f"Audit failed for variant {variant_label}: {e}")
+            variant_results.append({
+                "variant_id": variant_id,
+                "variant_label": variant_label,
+                "success": False,
+                "error": str(e)[:200],
+                "weights_before": current_weights,
+                "weights_after": current_weights,
+                "reasoning": [],
+                "summary": f"LLM audit failed: {str(e)[:100]}",
+            })
 
-    # 8:30 AM CST = 13:30 UTC — Market open scan: fresh scores at open for recs + ML data
-    schedule.every().day.at("13:30").do(lambda: run_comprehensive_scan(scan_type="market_open"))
+    # Write one audit_log entry covering all variants
+    db4 = get_database()
+    db4.execute("""
+        INSERT INTO audit_log (timestamp, audit_success, audit_provider, provider_attempts,
+        weights_before, weights_after, reasoning, summary,
+        total_predictions, resolved_count, hit_count, miss_count, win_rate)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, [
+        ts,
+        1 if any_success else 0,
+        next((r.get("provider") for r in variant_results if r.get("success")), None),
+        json.dumps([r.get("provider_attempts", []) for r in variant_results if r.get("provider_attempts")]),
+        json.dumps({r["variant_id"]: r["weights_before"] for r in variant_results}),
+        json.dumps({r["variant_id"]: r["weights_after"] for r in variant_results}),
+        json.dumps([f"{r['variant_label']}: {'; '.join(r.get('reasoning', [])[:2])}" for r in variant_results]),
+        f"Audited {len(variant_results)} variants. {sum(1 for r in variant_results if r.get('success'))} updated, {sum(1 for r in variant_results if r.get('skipped'))} skipped (insufficient data), {sum(1 for r in variant_results if not r.get('success') and not r.get('skipped'))} failed.",
+        global_total,
+        len(global_resolved),
+        len(global_hits),
+        len(global_misses),
+        global_win_rate,
+    ])
+    db4.execute("INSERT OR REPLACE INTO app_state VALUES ('last_audit',?)", [ts])
+    db4.commit()
+    db4.close()
 
-    # Execution-time variant families. Each call only opens matching execution_time universes.
-    schedule.every().day.at("10:00").do(lambda: run_variant_universes_from_cache(trigger="scheduled_0500", buy_time="05:00:00"))
-    schedule.every().day.at("11:00").do(lambda: run_variant_universes_from_cache(trigger="scheduled_0600", buy_time="06:00:00"))
-    schedule.every().day.at("12:00").do(lambda: run_variant_universes_from_cache(trigger="scheduled_0700", buy_time="07:00:00"))
+    return {
+        "success": any_success,
+        "variant_results": variant_results,
+        "summary": f"Audited {len(variant_results)} variants. {sum(1 for r in variant_results if r.get('success'))} updated.",
+        "provider": next((r.get("provider") for r in variant_results if r.get("success")), None),
+    }
 
-    # 8:45 AM CST = 13:45 UTC — Execute positions at market open + 15 min
-    schedule.every().day.at("13:45").do(execute_opening_positions)
-    schedule.every().day.at("13:45").do(execute_nn_opening_positions)
-    schedule.every().day.at("13:45").do(lambda: run_variant_universes_from_cache(trigger="scheduled_0845", buy_time="08:45:00"))
 
-    # 2:45 PM CST = 19:45 UTC — Force-close previous session positions
-    schedule.every().day.at("19:45").do(force_close_previous_session)
-    schedule.every().day.at("19:45").do(force_close_nn_previous_session)
-
-    # 3:00 PM CST = 20:00 UTC — Market close scan
-    schedule.every().day.at("20:00").do(lambda: run_comprehensive_scan(scan_type="market_close"))
-
-    # ── Post-market comprehensive scans (every 30 min, 3:30-6:00 PM CST) ──
-    for hour_utc, label in [(20.5,"3:30pm"),(21,"4:00pm"),(21.5,"4:30pm"),
-                             (22,"5:00pm"),(22.5,"5:30pm"),(23,"6:00pm")]:
-        hour = int(hour_utc)
-        minute = int((hour_utc % 1) * 60)
-        time_str = f"{hour:02d}:{minute:02d}"
-        scan_label = f"post_market_{label}"
-        schedule.every().day.at(time_str).do(lambda st=scan_label: run_comprehensive_scan(scan_type=st))
-
-    # 4:00 AM CST = 09:00 UTC — Unlock queue for new pre-market session
-    schedule.every().day.at("09:00").do(unlock_pick_queue)
-
-    # Self-audit at 7:00 PM CST = 00:00 UTC (midnight) — end of trading day
-    # Runs after post-market closes so brain has full day of data to learn from
-    # Skip weekends — no trading data on Sat/Sun
-    def run_audit_if_weekday():
-        if current_time_cst().weekday() < 5:
-            run_self_audit()
-            # Train NN after audit — fresh data available
-            try:
-                train_neural_network()
-            except Exception as nn_err:
-                log.error(f"NN training failed: {nn_err}")
-    schedule.every().day.at("23:55").do(run_audit_if_weekday)
-
-    # NN scoring now runs from each comprehensive scan snapshot.
-    for hour, minute, label in [
-        (9,"00","4:00am"),(9,30,"4:30am"),(10,"00","5:00am"),(10,30,"5:30am"),
-        (11,"00","6:00am"),(11,30,"6:30am"),(12,"00","7:00am"),(12,30,"7:30am"),
-        (13,"00","8:00am"),(13,30,"8:30am"),(14,"00","9:00am"),(14,30,"9:30am"),
-        (15,"00","10:00am"),(15,30,"10:30am"),(16,"00","11:00am"),(16,30,"11:30am"),
-        (17,"00","12:00pm"),(17,30,"12:30pm"),(18,"00","1:00pm"),(18,30,"1:30pm"),
-        (19,"00","2:00pm"),(19,30,"2:30pm"),(20,"00","3:00pm"),(20,30,"3:30pm"),
-        (21,"00","4:00pm"),(21,30,"4:30pm"),(22,"00","5:00pm"),(22,30,"5:30pm"),
-        (23,"00","6:00pm"),(23,30,"6:30pm"),(0,"00","7:00pm"),(0,30,"7:30pm"),
-    ]:
-        time_str = f"{hour:02d}:{minute:02d}" if isinstance(minute, int) else f"{hour:02d}:{minute}"
-        # NN scoring now runs from the comprehensive scan snapshot.
-        # Keep manual /api/nn-scan-now for debugging, but do not schedule a second universe fetch.
-        pass
-
-    log.info("Scheduler started — comprehensive shared scans every 30min, position monitoring 2.5min regular/5min extended")
-
-    # Dynamic monitoring loop — 2.5 min during regular hours, 5 min during pre/post market
-    last_monitor_time = 0
-    while True:
-        schedule.run_pending()
-        current_time = time.time()
-
-        now = current_time_cst()
-        is_regular = is_market_open()
-        in_extended, _ = is_extended_hours()
-        is_active = now.weekday() < 5 and (is_regular or in_extended or 4 <= now.hour < 20)
-
-        # 2.5 min during regular market hours, 5 min during pre/post market
-        dynamic_interval = 150 if is_regular else 300  # 150s = 2.5 min, 300s = 5 min
-
-        if is_active and current_time - last_monitor_time >= dynamic_interval:
-            last_monitor_time = current_time
-            try:
-                monitor_open_positions()
-                monitor_nn_open_positions()
-                monitor_variant_universes(trigger="scheduled")
-            except Exception as error:
-                log.error(f"Monitor error: {error}")
-
-        time.sleep(15)
-
-# ── API ROUTES ────────────────────────────────────────────────────────────────
 @app.route("/api/health")
 def health():
     return jsonify({
