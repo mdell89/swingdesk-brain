@@ -528,6 +528,11 @@ function getTradeOpenPnlDollars(trade = {}) {
   return invested * (pct / 100);
 }
 
+function formatSignedCurrency(value = 0) {
+  const n = Number(value || 0);
+  return `${n < 0 ? "-" : "+"}$${Math.abs(n).toFixed(2)}`;
+}
+
 function JournalButton() {
   return null;
 }
@@ -552,6 +557,23 @@ function StrategyBadge({ strategy, color = BLUE }) {
       flexShrink: 0,
     }}>{strategy}</span>
   );
+}
+
+function CompactMethodTags({ methods = [], glowing = false }) {
+  const list = Array.isArray(methods) ? methods : [];
+  return list.slice(0, 3).map(method => (
+    <span key={method} className={glowing ? "tag-glow" : ""} style={{
+      fontSize: 7,
+      fontWeight: 800,
+      color: "#ddd",
+      letterSpacing: .25,
+      padding: "1px 4px",
+      background: "#000",
+      borderRadius: 3,
+      border: "1px solid rgba(255,255,255,0.2)",
+      flexShrink: 0,
+    }}>{method}</span>
+  ));
 }
 
 function StaleBadge({ staleTime }) {
@@ -734,7 +756,7 @@ const METHOD_DEFINITIONS = {
   "Vol Squeeze": "Historical Volatility Ratio measures compression. When a stock's recent volatility shrinks relative to its 20-day average, it's coiling. Volatility compression historically precedes explosive directional moves — the tighter the squeeze, the stronger the breakout.",
 };
 
-function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black", strategyName, onAddToPersonal }) {
+function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black", strategyName, cardKeyOverride, onAddToPersonal }) {
   const [expandedMethod, setExpandedMethod] = React.useState(null);
   const [glowing, setGlowing] = React.useState(false);
   const [journalAdded, setJournalAdded] = React.useState(false);
@@ -753,7 +775,8 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
   const borderColor = confidenceColor(confidence, themeKey);
   const dayChange = pick.dayChg || 0;
   const dayUp = dayChange >= 0;
-  const cardKey = pick.ticker + "_" + (isLong ? "l" : "s");
+  const confluenceMethods = Array.isArray(pick.confluence_methods) ? pick.confluence_methods : [];
+  const cardKey = cardKeyOverride || (pick.ticker + "_" + (isLong ? "l" : "s"));
 
   return (
     <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, overflow: "hidden", cursor: "pointer", borderLeft: `3px solid ${borderColor}` }}
@@ -780,7 +803,8 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
       <CardActionRow
         borderColor={BORDER}
         actions={<>
-          <StrategyBadge strategy={strategyName || pick.strategy} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
+          <StrategyBadge strategy={pick.strategy || strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
+          <CompactMethodTags methods={confluenceMethods} glowing={glowing} />
           <EvidenceBadgeCompact evidence={pick.evidence} />
           {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 && (
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
@@ -833,11 +857,11 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
             <div style={{ padding: "6px 10px", background: "#0e0e10", borderRadius: 7 }}>
               <span style={{ fontSize: 10, color: T2, fontStyle: "italic" }}>{reasoningText}</span>
             </div>
-            {pick.confluence_methods && pick.confluence_methods.length > 0 && (
+            {confluenceMethods.length > 0 && (
               <div style={{ padding: "6px 10px 6px 4px", background: "#000", borderRadius: 7, marginBottom: 6, border: "1px solid rgba(255,255,255,0.12)" }}>
                 <span style={{ fontSize: 8, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, display: "block", marginBottom: 6, textAlign: "center" }}>Method confluence</span>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-                  {pick.confluence_methods.map(m => (
+                  {confluenceMethods.map(m => (
                     <span key={m} onClick={(e) => { e.stopPropagation(); setExpandedMethod(expandedMethod === m ? null : m); }}
                       className={glowing ? "tag-glow" : ""}
                       style={{ fontSize: 9, color: expandedMethod === m ? "#000" : "#ddd", background: expandedMethod === m ? "#ddd" : "#000", padding: "2px 6px", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer" }}>{m}</span>
@@ -1112,7 +1136,8 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
         staleTime={isStale ? staleTime : null}
         borderColor={rulingColor}
         actions={<>
-          <StrategyBadge strategy={strategyName || trade.strategy} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
+          <StrategyBadge strategy={trade.strategy || strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
+          <CompactMethodTags methods={confluenceMethods} glowing={glowing} />
           <EvidenceBadgeCompact evidence={trade.evidence} />
           {trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7 && (
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
@@ -1731,17 +1756,17 @@ export default function App() {
   ];
   const STRATEGY_OPTIONS = [
     "SwingDesk",
-    "Bullish Mean Reversion",
     "Darvas",
     "Gap & Go",
     "VWAP Reclaim",
-    "Donchian",
     "Inside Day",
     "NR7",
     "Bull Flag",
     "Pocket Pivot",
-    "S&R Breakout",
     "Vol Squeeze Breakout",
+    "Relative Strength Pullback",
+    "EMA Trend Pullback",
+    "Opening Range Hold",
   ];
   const [expandedCards, setExpandedCards] = useState({});
   const [doneCuts, setDoneCuts] = useState({});
@@ -2447,7 +2472,7 @@ export default function App() {
                 return (
                   <div style={{ textAlign: "right", lineHeight: 1, paddingTop: 6 }}>
                     <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L</div>
-                    <div style={{ fontSize: 16, fontWeight: 600, color: dayUp2 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{dayUp2 ? "+" : ""}${dayPnl.toFixed(2)}</div>
+                    <div style={{ fontSize: 16, fontWeight: 600, color: dayUp2 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(dayPnl)}</div>
 
                   </div>
                 );
@@ -2456,7 +2481,7 @@ export default function App() {
 
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
               <span style={{ fontSize: 13, fontWeight: 500, color: backendDayUp ? GREEN : RED }}>{perfUp ? "↑" : "↓"} {Math.abs(perfPercent).toFixed(2)}%</span>
-              <span style={{ fontSize: 12, color: T3 }}>{perfUp ? "+" : ""}${perfChange.toFixed(2)}</span>
+              <span style={{ fontSize: 12, color: T3 }}>{formatSignedCurrency(perfChange)}</span>
             </div>
             <MiniChart data={perfHistory} timeframe={perfTimeframe} feeAdjusted={feeAdjusted} />
             <div style={{ display: "flex", alignItems: "center", marginTop: 8, position: "relative" }}>
@@ -2611,6 +2636,7 @@ export default function App() {
                       {buyVisible.map(pick => (
                         <PickCard key={pick.ticker + "_l"} pick={pick} isLong={true}
                           expanded={expandedCards[pick.ticker + "_l"]}
+                          cardKeyOverride={pick.ticker + "_l"}
                           themeKey={themeKey}
                           strategyName={selectedStrategy}
                           onAddToPersonal={pick => handleAddToPersonal(pick, "brain")}
@@ -2916,12 +2942,12 @@ export default function App() {
                       </div>
                       <div style={{ textAlign: "right", lineHeight: 1, paddingTop: 6 }}>
                         <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L</div>
-                        <div style={{ fontSize: 16, fontWeight: 600, color: nnUp ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{nnUp ? "+" : ""}${nnChange.toFixed(2)}</div>
+                        <div style={{ fontSize: 16, fontWeight: 600, color: nnUp ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(nnChange)}</div>
                       </div>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
                       <span style={{ fontSize: 13, fontWeight: 500, color: nnUp ? GREEN : RED }}>{nnUp ? "↑" : "↓"} {Math.abs(nnPercent).toFixed(2)}%</span>
-                      <span style={{ fontSize: 12, color: T3 }}>{nnUp ? "+" : ""}${nnChange.toFixed(2)}</span>
+                      <span style={{ fontSize: 12, color: T3 }}>{formatSignedCurrency(nnChange)}</span>
                     </div>
                     <MiniChart data={nnPerfHistory} timeframe={nnPerfTimeframe} />
                     <div style={{ display: "flex", alignItems: "center", marginTop: 8, position: "relative" }}>
@@ -3069,6 +3095,7 @@ export default function App() {
                         themeKey={themeKey}
                         strategyName={selectedStrategy}
                         expanded={expandedCards[pick.ticker + "_nn"]}
+                        cardKeyOverride={pick.ticker + "_nn"}
                         onAddToPersonal={pick => handleAddToPersonal(pick, "neural")}
                         onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))} />
                     ))}

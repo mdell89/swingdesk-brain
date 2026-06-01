@@ -1305,6 +1305,18 @@ def initialize_database():
         ("swingdesk_vector_0845_top1", "SwingDesk", "Vector", "08:45", "Top 1", "time_or_thesis", "SwingDesk / Vector / 8:45 / Top 1"),
         ("swingdesk_nova_0845_all", "SwingDesk", "Nova", "08:45", "All", "time_or_thesis", "SwingDesk / Nova / 8:45 / All"),
         ("swingdesk_nova_0845_top1", "SwingDesk", "Nova", "08:45", "Top 1", "time_or_thesis", "SwingDesk / Nova / 8:45 / Top 1"),
+        ("swingdesk_vector_0500_all", "SwingDesk", "Vector", "05:00", "All", "time_or_thesis", "SwingDesk / Vector / 5:00 / All"),
+        ("swingdesk_vector_0500_top1", "SwingDesk", "Vector", "05:00", "Top 1", "time_or_thesis", "SwingDesk / Vector / 5:00 / Top 1"),
+        ("swingdesk_nova_0500_all", "SwingDesk", "Nova", "05:00", "All", "time_or_thesis", "SwingDesk / Nova / 5:00 / All"),
+        ("swingdesk_nova_0500_top1", "SwingDesk", "Nova", "05:00", "Top 1", "time_or_thesis", "SwingDesk / Nova / 5:00 / Top 1"),
+        ("swingdesk_vector_0600_all", "SwingDesk", "Vector", "06:00", "All", "time_or_thesis", "SwingDesk / Vector / 6:00 / All"),
+        ("swingdesk_vector_0600_top1", "SwingDesk", "Vector", "06:00", "Top 1", "time_or_thesis", "SwingDesk / Vector / 6:00 / Top 1"),
+        ("swingdesk_nova_0600_all", "SwingDesk", "Nova", "06:00", "All", "time_or_thesis", "SwingDesk / Nova / 6:00 / All"),
+        ("swingdesk_nova_0600_top1", "SwingDesk", "Nova", "06:00", "Top 1", "time_or_thesis", "SwingDesk / Nova / 6:00 / Top 1"),
+        ("swingdesk_vector_0700_all", "SwingDesk", "Vector", "07:00", "All", "time_or_thesis", "SwingDesk / Vector / 7:00 / All"),
+        ("swingdesk_vector_0700_top1", "SwingDesk", "Vector", "07:00", "Top 1", "time_or_thesis", "SwingDesk / Vector / 7:00 / Top 1"),
+        ("swingdesk_nova_0700_all", "SwingDesk", "Nova", "07:00", "All", "time_or_thesis", "SwingDesk / Nova / 7:00 / All"),
+        ("swingdesk_nova_0700_top1", "SwingDesk", "Nova", "07:00", "Top 1", "time_or_thesis", "SwingDesk / Nova / 7:00 / Top 1"),
         ("darvas_vector_reg_all", "Darvas", "Vector", "reg", "All", "strategy_exit", "Darvas / Vector / Reg / All"),
         ("darvas_nova_reg_all", "Darvas", "Nova", "reg", "All", "strategy_exit", "Darvas / Nova / Reg / All"),
         ("gap_go_vector_reg_all", "Gap & Go", "Vector", "reg", "All", "strategy_exit", "Gap & Go / Vector / Reg / All"),
@@ -5085,6 +5097,7 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None):
     }
     today = current_time_cst().strftime("%Y-%m-%d")
     buy_time = buy_time or current_time_cst().strftime("%H:%M:%S")
+    target_execution_time = buy_time[:5]
     database = get_database()
     try:
         snapshot, refusal = variant_cache_snapshot(database, require_fresh=True)
@@ -5119,6 +5132,9 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None):
         status["variants"] = len(variants)
 
         for variant in variants:
+            execution_time = (variant.get("execution_time") or "").strip()
+            if execution_time and execution_time != "reg" and execution_time != target_execution_time:
+                continue
             brain = variant.get("brain")
             source_picks = nova_picks if brain == "Nova" else vector_picks
             if brain == "Nova":
@@ -5199,6 +5215,10 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None):
                 signal_scores = pick.get("signal_scores") or pick.get("signal_scores_for_observation") or {}
                 if not isinstance(signal_scores, str):
                     signal_scores = json.dumps(signal_scores)
+                confluence_methods = pick.get("confluence_methods") or pick.get("confluence_methods_for_observation") or []
+                if not isinstance(confluence_methods, str):
+                    confluence_methods = json.dumps(confluence_methods)
+                confluence_count = int(pick.get("confluence_count") or 0)
                 reasoning = pick.get("long_reasoning") or f"{brain} variant simulation"
                 fee_quote = calculate_stock_fee_model(invested, buy_price, buy_price, "long")
                 database.execute(f"""
@@ -5206,14 +5226,14 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None):
                     (id, variant_id, strategy, brain, ticker, direction, buy_date, buy_time,
                      buy_price, invested_amount, current_value, confidence, expected_move,
                      {FEE_MODEL_INSERT_COLUMNS},
-                     outcome, sector, reasoning, signal_scores, source_scan_time, source_rank,
+                     outcome, sector, reasoning, signal_scores, confluence_count, confluence_methods, source_scan_time, source_rank,
                      created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 'long', ?, ?, ?, ?, ?, ?, ?, {FEE_MODEL_INSERT_PLACEHOLDERS}, 'open', ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, 'long', ?, ?, ?, ?, ?, ?, ?, {FEE_MODEL_INSERT_PLACEHOLDERS}, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [
                     trade_id, variant["id"], variant["strategy"], brain, ticker, today, buy_time,
                     float(buy_price), round(invested, 4), fee_quote["net_current_value"], confidence, expected_move,
                     *fee_model_values(fee_quote),
-                    pick.get("sector") or get_sector(ticker), reasoning, signal_scores, scan_time, rank,
+                    pick.get("sector") or get_sector(ticker), reasoning, signal_scores, confluence_count, confluence_methods, scan_time, rank,
                     status["ran_at"], status["ran_at"],
                 ])
                 database.execute("""
@@ -5356,6 +5376,48 @@ def monitor_variant_universes(trigger="manual"):
         return status
     finally:
         database.close()
+
+def refresh_variant_open_quotes(database, variant_id):
+    """Refresh open quotes for one variant before returning detail to the UI."""
+    open_rows = [dict(r) for r in database.execute(
+        "SELECT * FROM variant_virtual_trades WHERE variant_id=? AND outcome='open'",
+        [variant_id],
+    ).fetchall()]
+    if not open_rows:
+        return 0
+    current_prices = fetch_current_prices(sorted({r["ticker"] for r in open_rows}))
+    updated = 0
+    now_iso = current_time_cst().isoformat()
+    for row in open_rows:
+        raw = current_prices.get(row["ticker"])
+        if not raw:
+            continue
+        quote = normalize_monitor_quote(raw, row.get("buy_price"))
+        price = float(quote["price"])
+        buy_price = float(row.get("buy_price") or price)
+        invested = float(row.get("invested_amount") or 0)
+        pnl_pct = (price - buy_price) / max(buy_price, 0.01) * 100
+        if row.get("direction") == "short":
+            pnl_pct = -pnl_pct
+        fee_quote = calculate_stock_fee_model(invested, buy_price, price, row.get("direction") or "long")
+        database.execute(f"""
+            UPDATE variant_virtual_trades
+            SET current_value=?, actual_move=?, gross_pnl=?, net_pnl=?,
+                {FEE_MODEL_UPDATE_SET}, updated_at=?
+            WHERE id=?
+        """, [
+            round(fee_quote["net_current_value"], 4),
+            round(pnl_pct, 2),
+            fee_quote["gross_pnl"],
+            fee_quote["net_pnl"],
+            *fee_model_values(fee_quote),
+            now_iso,
+            row["id"],
+        ])
+        updated += 1
+    if updated:
+        update_variant_portfolio(database, variant_id, note="detail_refresh")
+    return updated
 
 def repair_variant_open_caps(apply_changes=False):
     """Archive excess open variant trades created before open-position caps existed."""
@@ -6960,6 +7022,11 @@ def run_scheduler():
     # 8:30 AM CST = 13:30 UTC — Market open scan: fresh scores at open for recs + ML data
     schedule.every().day.at("13:30").do(lambda: run_comprehensive_scan(scan_type="market_open"))
 
+    # Execution-time variant families. Each call only opens matching execution_time universes.
+    schedule.every().day.at("10:00").do(lambda: run_variant_universes_from_cache(trigger="scheduled_0500", buy_time="05:00:00"))
+    schedule.every().day.at("11:00").do(lambda: run_variant_universes_from_cache(trigger="scheduled_0600", buy_time="06:00:00"))
+    schedule.every().day.at("12:00").do(lambda: run_variant_universes_from_cache(trigger="scheduled_0700", buy_time="07:00:00"))
+
     # 8:45 AM CST = 13:45 UTC — Execute positions at market open + 15 min
     schedule.every().day.at("13:45").do(execute_opening_positions)
     schedule.every().day.at("13:45").do(execute_nn_opening_positions)
@@ -8009,6 +8076,9 @@ def api_variant_detail(variant_id):
             return jsonify({"error": "variant not found"}), 404
         portfolio = db.execute("SELECT * FROM variant_portfolios WHERE variant_id=?", [variant_id]).fetchone()
         weights = db.execute("SELECT * FROM variant_signal_weights WHERE variant_id=?", [variant_id]).fetchone()
+        refresh_variant_open_quotes(db, variant_id)
+        db.commit()
+        portfolio = db.execute("SELECT * FROM variant_portfolios WHERE variant_id=?", [variant_id]).fetchone()
         trades = [dict(r) for r in db.execute("""
             SELECT * FROM variant_virtual_trades
             WHERE variant_id=?
