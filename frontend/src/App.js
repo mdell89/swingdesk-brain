@@ -410,6 +410,22 @@ const CARD_PAD_L = "15px";
 const CARD_PAD_R = "12px";
 const TOOLBAR_CONTROL_H = 26;
 const SPINE_VALUE_W = 66;
+const HOME_ROW_GAP = 8;
+const HOME_CONTROL_H = 36;
+const HOME_CONTROL_RADIUS = 8;
+
+function SelectChevron({ color }) {
+  return (
+    <span aria-hidden="true" style={{
+      width: 0,
+      height: 0,
+      borderLeft: "4px solid transparent",
+      borderRight: "4px solid transparent",
+      borderTop: `6px solid ${color}`,
+      flexShrink: 0,
+    }} />
+  );
+}
 
 function SpinePercent({ value, color, fontSize = 12, fontWeight = 600, decimals = 1 }) {
   const n = Number(value) || 0;
@@ -501,27 +517,19 @@ function getCompanyContext(item = {}) {
   return { name, description };
 }
 
-function JournalButton({ state, onClick, compact = false }) {
-  return (
-    <button onClick={onClick} style={{
-      background: state === "added" ? BLUE + "22" : state === "error" ? RED + "18" : "transparent",
-      border: `1px solid ${state === "error" ? RED + "66" : BLUE + "55"}`,
-      borderRadius: 4,
-      color: state === "added" ? BLUE : state === "error" ? RED : BLUE + "99",
-      fontSize: 8,
-      fontWeight: 700,
-      letterSpacing: 0.5,
-      lineHeight: 1,
-      minWidth: compact ? 34 : 64,
-      textAlign: "center",
-      padding: compact ? "4px 6px" : "4px 7px",
-      cursor: "pointer",
-      flexShrink: 0,
-      transition: "all 0.2s",
-    }}>
-      {state === "added" ? "ADDED" : state === "error" ? "ERR" : compact ? "ADD" : "JOURNAL"}
-    </button>
-  );
+function getTradeOpenPnlDollars(trade = {}) {
+  const invested = Number(trade.invested_amount || 10);
+  if (trade.current_pnl_dollars != null) return Number(trade.current_pnl_dollars);
+  if (trade.gross_pnl != null) return Number(trade.gross_pnl);
+  const current = Number(trade.current_value ?? trade.gross_current_value ?? invested);
+  const valuePnl = current - invested;
+  if (Math.abs(valuePnl) > 0.005) return valuePnl;
+  const pct = Number(trade.current_pnl_percent ?? trade.actual_move ?? 0);
+  return invested * (pct / 100);
+}
+
+function JournalButton() {
+  return null;
 }
 
 function StaleBadge({ staleTime }) {
@@ -974,8 +982,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
   // Clamp -0 to 0 to avoid negative zero display
   const pnlPercent = rawPnlPercent === 0 ? 0 : (Math.abs(rawPnlPercent) < 0.005 ? 0 : rawPnlPercent);
   const rawPnlDollars = trade.current_pnl_dollars != null ? Number(trade.current_pnl_dollars) :
-    trade.gross_pnl != null ? Number(trade.gross_pnl) :
-    (currentValue - investedAmount);
+    trade.gross_pnl != null ? Number(trade.gross_pnl) : getTradeOpenPnlDollars(trade);
   const pnlDollars = Math.abs(rawPnlDollars) < 0.005 ? 0 : rawPnlDollars;
   const isPositive = isLong ? pnlPercent >= 0 : pnlPercent <= 0;
   const pnlColor = pnlPercent === 0 ? T2 : (isPositive ? GREEN : RED);
@@ -1671,6 +1678,7 @@ export default function App() {
   const [variantLeaderboard, setVariantLeaderboard] = useState([]);
   const [selectedVariantId, setSelectedVariantId] = useState("swingdesk_vector_0845_all");
   const [novaUniverse, setNovaUniverse] = useState(null);
+  const [variantDetailsById, setVariantDetailsById] = useState({});
   const [personalForm, setPersonalForm] = useState({
     ticker: "",
     buy_price: "",
@@ -1847,7 +1855,7 @@ export default function App() {
         // Fire all requests in parallel
         const [picksData, positions, statsData, runnersData, perfData, closedData,
                nnPicksData, nnPositionsData, nnStatsData, nnPerfData, personalData, monitorData,
-               dayPnlData, variantStatusData, variantBoardData, novaUniverseData] = await Promise.all([
+               dayPnlData, variantStatusData, variantBoardData, vectorUniverseData, novaUniverseData] = await Promise.all([
           apiFetch("/picks").catch(() => ({ longs: [], shorts: [] })),
           apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
           apiFetch("/stats").catch(() => ({})),
@@ -1863,6 +1871,7 @@ export default function App() {
           apiFetch(`/day-pnl${feeQuery}`).catch(() => null),
           apiFetch("/variant-status").catch(() => null),
           apiFetch("/variant-leaderboard").catch(() => []),
+          apiFetch("/variant/swingdesk_vector_0845_all").catch(() => null),
           apiFetch("/variant/swingdesk_nova_0845_all").catch(() => null),
         ]);
 
@@ -1894,7 +1903,11 @@ export default function App() {
         setDayPnlStatus(dayPnlData);
         setVariantStatus(variantStatusData);
         setVariantLeaderboard(variantBoardData || []);
-        setNovaUniverse(novaUniverseData);
+        setVariantDetailsById({
+          ...(vectorUniverseData?.variant?.id ? { [vectorUniverseData.variant.id]: vectorUniverseData } : {}),
+          ...(novaUniverseData?.variant?.id ? { [novaUniverseData.variant.id]: novaUniverseData } : {}),
+        });
+        setNovaUniverse(vectorUniverseData || novaUniverseData);
 
         setLoadStatus("Ready"); setLoadProgress(100);
       } catch (error) {
@@ -2001,7 +2014,7 @@ export default function App() {
       try {
         const [positions, perfData, closedData, statsData,
                nnPicksData, nnPositionsData, nnStatsData, nnPerfData,
-               dayPnlData, variantStatusData, variantBoardData, novaUniverseData] = await Promise.all([
+               dayPnlData, variantStatusData, variantBoardData, selectedUniverseData] = await Promise.all([
           apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
           apiFetch(`/perf-history${feeQuery}`).catch(() => []),
           apiFetch("/today-closed").catch(() => []),
@@ -2013,7 +2026,7 @@ export default function App() {
           apiFetch(`/day-pnl${feeQuery}`).catch(() => null),
           apiFetch("/variant-status").catch(() => null),
           apiFetch("/variant-leaderboard").catch(() => []),
-          apiFetch("/variant/swingdesk_nova_0845_all").catch(() => null),
+          apiFetch(`/variant/${selectedVariantId}`).catch(() => null),
         ]);
         setOpenPositions(positions);
         setTodayClosed(closedData || []);
@@ -2025,12 +2038,15 @@ export default function App() {
         setDayPnlStatus(dayPnlData);
         setVariantStatus(variantStatusData);
         setVariantLeaderboard(variantBoardData || []);
-        setNovaUniverse(novaUniverseData);
+        if (selectedUniverseData?.variant?.id) {
+          setVariantDetailsById(prev => ({ ...prev, [selectedUniverseData.variant.id]: selectedUniverseData }));
+          setNovaUniverse(selectedUniverseData);
+        }
         buildPerfHistory(perfData, positions);
       } catch {}
     }, 2.5 * 60 * 1000);
     return () => clearInterval(interval);
-  }, []);
+  }, [selectedVariantId]);
 
   // ── Computed values ──
   useEffect(() => {
@@ -2052,16 +2068,32 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedVariantId) return;
-    apiFetch(`/variant/${selectedVariantId}`).then(data => setNovaUniverse(data)).catch(() => {});
-  }, [selectedVariantId]);
+    if (variantDetailsById[selectedVariantId]) {
+      setNovaUniverse(variantDetailsById[selectedVariantId]);
+      return;
+    }
+    apiFetch(`/variant/${selectedVariantId}`).then(data => {
+      setVariantDetailsById(prev => ({ ...prev, [selectedVariantId]: data }));
+      setNovaUniverse(data);
+    }).catch(() => {});
+  }, [selectedVariantId, variantDetailsById]);
 
   const openTickers = new Set(openPositions.filter(t => t.outcome === "open").map(t => t.ticker));
   const allBuyPicks = picks.longs.filter(pick => !openTickers.has(pick.ticker));
   const allShortPicks = picks.shorts.filter(pick => !openTickers.has(pick.ticker));
   const today = new Date().toISOString().split("T")[0];
+  const activeVariantBrain = portfolioTab === "neural" ? "Nova" : "Vector";
+  const novaUniversePortfolio = novaUniverse?.portfolio || null;
+  const novaUniverseTrades = Array.isArray(novaUniverse?.trades) ? novaUniverse.trades : [];
+  const novaUniverseOpen = novaUniverseTrades.filter(t => t.outcome === "open");
+  const novaUniverseClosed = novaUniverseTrades.filter(t => t.outcome !== "open");
+  const selectedVariantMatchesTab = novaUniverse?.variant?.brain === activeVariantBrain;
 
-  const openLongPositions = openPositions.filter(t => t.direction === "long" && t.outcome === "open");
+  const openLongPositions = selectedVariantMatchesTab && activeVariantBrain === "Vector" && novaUniverseOpen.length
+    ? novaUniverseOpen.filter(t => (t.direction || "long") === "long")
+    : openPositions.filter(t => t.direction === "long" && t.outcome === "open");
   const openShortPositions = openPositions.filter(t => t.direction === "short" && t.outcome === "open");
+  const activeOpenPnl = openLongPositions.reduce((sum, trade) => sum + getTradeOpenPnlDollars(trade), 0);
 
   const isWeekendNow = (() => { const d = new Date().getDay(); return d === 0 || d === 6; })();
   // Sell Today = previous session positions (buy_date < today), active on trading days
@@ -2202,10 +2234,6 @@ export default function App() {
   const perfUp = perfChange >= 0;
   const backendDayPnl = dayPnlStatus?.success ? Number(dayPnlStatus.day_pnl || 0) : null;
   const backendDayUp = backendDayPnl == null ? perfUp : backendDayPnl >= 0;
-  const novaUniversePortfolio = novaUniverse?.portfolio || null;
-  const novaUniverseTrades = Array.isArray(novaUniverse?.trades) ? novaUniverse.trades : [];
-  const novaUniverseOpen = novaUniverseTrades.filter(t => t.outcome === "open");
-  const novaUniverseClosed = novaUniverseTrades.filter(t => t.outcome !== "open");
   const novaOpenPositions = novaUniverseOpen.length ? novaUniverseOpen : nnPositions.filter(t => t.outcome === "open");
   const novaFreshPositions = novaOpenPositions.filter(t => t.buy_date === today);
   const novaCarryPositions = isWeekendNow ? novaOpenPositions : novaOpenPositions.filter(t => t.buy_date < today);
@@ -2238,39 +2266,44 @@ export default function App() {
     const baseline = prior ? Number(prior.equity || 1000) : Number(novaUniversePortfolio?.starting_cash || 1000);
     return round2(current - baseline);
   })();
-  const activeVariantBrain = portfolioTab === "neural" ? "Nova" : "Vector";
   const variantOptions = variantLeaderboard.filter(v => v.brain === activeVariantBrain && v.strategy === selectedStrategy);
+  const variantLabel = v => {
+    if (!v) return "All";
+    const time = v.execution_time === "reg" ? "Reg" : (v.execution_time || "").replace(/^0/, "");
+    const mode = v.selection_mode || "All";
+    return time ? `${time} / ${mode}` : mode;
+  };
   const renderPortfolioControls = (padded = true) => (
-    <div style={{ padding: padded ? "0 16px 14px" : "0 0 14px" }}>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginBottom: 6 }}>
+    <div style={{ padding: padded ? `0 16px ${HOME_ROW_GAP}px` : `0 0 ${HOME_ROW_GAP}px` }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: HOME_ROW_GAP, marginBottom: HOME_ROW_GAP }}>
         {[
           ["brain", "Vector", BLUE],
           ["neural", "Nova", "#a78bfa"],
         ].map(([id, label, color]) => (
           <button key={id} onClick={() => setPortfolioTab(id)} style={{
-            padding: "7px 0", borderRadius: 7, fontSize: 11, fontWeight: 800,
+            height: HOME_CONTROL_H, padding: 0, borderRadius: HOME_CONTROL_RADIUS, fontSize: 12, fontWeight: 800,
             border: `1px solid ${portfolioTab === id ? color + "66" : BORDER}`,
             cursor: "pointer", letterSpacing: .4, background: portfolioTab === id ? color + "18" : "transparent",
             color: portfolioTab === id ? color : T3,
           }}>{label}</button>
         ))}
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 6 }}>
-      <label style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, height: 32, border: `1px solid ${BORDER}`, borderRadius: 8, background: CARD, padding: "0 9px" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: HOME_ROW_GAP, marginBottom: 0 }}>
+      <label style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, height: HOME_CONTROL_H, border: `1px solid ${BORDER}`, borderRadius: HOME_CONTROL_RADIUS, background: CARD, padding: "0 9px" }}>
         <span style={{ fontSize: 9, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6, flexShrink: 0 }}>Strategy:</span>
         <select value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
           style={{ minWidth: 0, width: "100%", border: "none", outline: "none", background: "transparent", color: T1, fontSize: 12, fontWeight: 800, cursor: "pointer", appearance: "none" }}>
           {STRATEGY_OPTIONS.map(name => <option key={name} value={name} style={{ background: "#111", color: T1 }}>{name}</option>)}
         </select>
-        <span aria-hidden="true" style={{ color: T3, fontSize: 10, flexShrink: 0 }}>▼</span>
+        <SelectChevron color={T3} />
       </label>
-      <label style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, height: 32, border: `1px solid ${BORDER}`, borderRadius: 8, background: CARD, padding: "0 9px" }}>
+      <label style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, height: HOME_CONTROL_H, border: `1px solid ${BORDER}`, borderRadius: HOME_CONTROL_RADIUS, background: CARD, padding: "0 9px" }}>
         <span style={{ fontSize: 9, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6, flexShrink: 0 }}>Variant:</span>
         <select value={selectedVariantId} onChange={e => setSelectedVariantId(e.target.value)}
           style={{ minWidth: 0, width: "100%", border: "none", outline: "none", background: "transparent", color: T1, fontSize: 12, fontWeight: 800, cursor: "pointer", appearance: "none" }}>
-          {variantOptions.map(v => <option key={v.id} value={v.id} style={{ background: "#111", color: T1 }}>{v.selection_mode || v.execution_time || v.id}</option>)}
+          {variantOptions.map(v => <option key={v.id} value={v.id} style={{ background: "#111", color: T1 }}>{variantLabel(v)}</option>)}
         </select>
-        <span aria-hidden="true" style={{ color: T3, fontSize: 10, flexShrink: 0 }}>▼</span>
+        <SelectChevron color={T3} />
       </label>
       </div>
     </div>
@@ -2408,10 +2441,10 @@ export default function App() {
           {renderPortfolioControls()}
 
           {/* METRIC STRIP */}
-          <div style={{ display: "flex", gap: 8, padding: "0 16px 14px" }}>
+          <div style={{ display: "flex", gap: HOME_ROW_GAP, padding: `0 16px ${HOME_ROW_GAP}px` }}>
             <div style={{ flex: 1, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
               <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Open P&L</div>
-              <div style={{ fontSize: 16, fontWeight: 600, color: livePnl >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{livePnl >= 0 ? "+" : ""}${Math.abs(livePnl).toFixed(2)}</div>
+              <div style={{ fontSize: 16, fontWeight: 600, color: activeOpenPnl >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{activeOpenPnl >= 0 ? "+" : "-"}${Math.abs(activeOpenPnl).toFixed(2)}</div>
             </div>
             <div style={{ flex: 1, background: CARD, border: `1px solid ${pdtRemaining === 0 ? RED : pdtRemaining === 1 ? AMBER : BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
               <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Day trades</div>
@@ -2422,7 +2455,7 @@ export default function App() {
             </div>
             <div style={{ flex: 1, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
               <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Open</div>
-              <div style={{ fontSize: 16, fontWeight: 600, color: openPositions.length > 0 ? GREEN : T2 }}>{openPositions.filter(t => t.outcome === "open").length}</div>
+              <div style={{ fontSize: 16, fontWeight: 600, color: openLongPositions.length > 0 ? GREEN : T2 }}>{openLongPositions.length}</div>
             </div>
           </div>
 
@@ -2448,7 +2481,7 @@ export default function App() {
           )}
 
           {/* CONFIDENCE LEGEND */}
-          <div style={{ margin: "0 16px 10px", background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 14px" }}>
+          <div style={{ margin: `0 16px ${HOME_ROW_GAP}px`, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 14px" }}>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
               {[[AMBER, "85%+ elite"], [GREEN, "75-84 strong"], [BLUE, "65-74 decent"], [T3, "<65 skip"]].map(([color, label]) => (
                 <div key={label} style={{ display: "flex", alignItems: "center", gap: 5 }}>
@@ -2460,7 +2493,7 @@ export default function App() {
           </div>
 
           {false && variantLeaderboard.length > 0 && (
-            <div style={{ margin: "0 16px 10px", background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "9px 10px" }}>
+            <div style={{ margin: `0 16px ${HOME_ROW_GAP}px`, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "9px 10px" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 7 }}>
                 <div style={{ fontSize: 9, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .7 }}>Universe leaders</div>
                 <div style={{ fontSize: 8, color: T3 }}>{variantStatus?.variants || variantLeaderboard.length} live</div>
@@ -2485,7 +2518,7 @@ export default function App() {
 
 
           {/* SUB TOGGLE — Picks/Open + Sort */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 42px", margin: "0 16px 12px", gap: 4, alignItems: "stretch" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 42px", margin: `0 16px ${HOME_ROW_GAP}px`, gap: HOME_ROW_GAP, alignItems: "stretch" }}>
             {[
               ["buy", `Picks (${allBuyPicks.length})`, BLUE, "#0f1e35", `1px solid ${BLUE}44`],
               ["sell", `Open (${openLongPositions.length})`, GREEN, "#091a0d", `1px solid ${GREEN}44`],
@@ -2624,7 +2657,7 @@ export default function App() {
                 )}
 
                 {openLongPositions.length > 0 && (
-                  <div style={{ display: "flex", gap: 4, marginBottom: 7 }}>
+                  <div style={{ display: "flex", gap: HOME_ROW_GAP, marginBottom: HOME_ROW_GAP }}>
                     {[
                       ["all", `All (${openLongPositions.length})`],
                       ["day1", `Fresh (${holdingPositions.length})`],
@@ -2870,7 +2903,7 @@ export default function App() {
               })()}
               {renderPortfolioControls(false)}
 
-              <div style={{ display: "flex", gap: 8, padding: "0 0 14px" }}>
+              <div style={{ display: "flex", gap: HOME_ROW_GAP, padding: `0 0 ${HOME_ROW_GAP}px` }}>
                 <div style={{ flex: 1, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "7px 12px" }}>
                   <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .6, marginBottom: 3 }}>Open P&L</div>
                   <div style={{ fontSize: 16, fontWeight: 600, color: novaOpenPnl >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{novaOpenPnl >= 0 ? "+" : "-"}${Math.abs(novaOpenPnl).toFixed(2)}</div>
@@ -2889,7 +2922,7 @@ export default function App() {
                   </div>
                 </div>
               </div>
-              <div style={{ margin: "0 0 10px", background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 14px" }}>
+              <div style={{ margin: `0 0 ${HOME_ROW_GAP}px`, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 14px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
                   {[[AMBER, "85%+ elite"], [GREEN, "75-84 strong"], [BLUE, "65-74 decent"], [T3, "<65 skip"]].map(([color, label]) => (
                     <div key={label} style={{ display: "flex", alignItems: "center", gap: 5 }}>
@@ -2899,7 +2932,7 @@ export default function App() {
                   ))}
                 </div>
               </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 42px", margin: "0 0 12px", gap: 4, alignItems: "stretch" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 42px", margin: `0 0 ${HOME_ROW_GAP}px`, gap: HOME_ROW_GAP, alignItems: "stretch" }}>
                 {[
                   ["buy", `Picks (${nnPicks.recommended_longs?.length || 0})`, BLUE, "#0f1e35", `1px solid ${BLUE}44`],
                   ["sell", `Open (${novaOpenPositions.length})`, GREEN, "#091a0d", `1px solid ${GREEN}44`],
@@ -2939,7 +2972,7 @@ export default function App() {
               {/* NN Open Positions */}
               {longSub === "sell" && novaOpenPositions.length > 0 && (
                 <div style={{ marginBottom: 16 }}>
-                  <div style={{ display: "flex", gap: 4, marginBottom: 7 }}>
+                  <div style={{ display: "flex", gap: HOME_ROW_GAP, marginBottom: HOME_ROW_GAP }}>
                     {[
                       ["all", `All (${novaOpenPositions.length})`],
                       ["day1", `Fresh (${novaFreshPositions.length})`],
