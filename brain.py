@@ -2677,6 +2677,74 @@ def is_long_pick_eligible(pick, open_tickers=None, confidence_floor=CONFIDENCE_F
         and not pick.get("earnings_soon")
     )
 
+def explain_long_pick_gate(row, open_tickers=None, confidence_floor=CONFIDENCE_FLOOR):
+    """Return human-readable pass/fail reasons for the shared long-pick gate."""
+    open_tickers = open_tickers or set()
+    ticker = (row.get("ticker") or "").upper()
+    confidence = int(round(float(row.get("confidence") or row.get("long_conf") or row.get("nn_score") or 0)))
+    expected_move = float(row.get("expected_move") or row.get("long_move") or 0)
+    values = row.get("signal_values") or row.get("values") or {}
+    scores = row.get("signal_scores") or row.get("scores") or {}
+    context = row.get("context_json") or {}
+    volume = (
+        values.get("volume_surge")
+        if isinstance(values, dict) and values.get("volume_surge") is not None
+        else row.get("vol_ratio") or row.get("volume_ratio") or 1
+    )
+    try:
+        volume = float(volume or 1)
+    except Exception:
+        volume = 1.0
+    price = float(row.get("price") or row.get("open_price") or 0)
+    earnings_soon = bool(row.get("earnings_soon") or context.get("earnings_soon"))
+    reasons = []
+    passes = []
+    if ticker in open_tickers:
+        reasons.append("Already open, so it is hidden from fresh picks.")
+    else:
+        passes.append("No open position blocked it.")
+    if price <= 0:
+        reasons.append("No valid price was available.")
+    else:
+        passes.append(f"Valid price: ${price:.2f}.")
+    if confidence < confidence_floor:
+        reasons.append(f"Confidence {confidence}% is below the {confidence_floor}% pick floor.")
+    else:
+        passes.append(f"Confidence {confidence}% clears the {confidence_floor}% floor.")
+    if expected_move < MIN_EXPECTED_MOVE:
+        reasons.append(f"Expected move {expected_move:.1f}% is below the {MIN_EXPECTED_MOVE:.1f}% minimum.")
+    else:
+        passes.append(f"Expected move {expected_move:.1f}% clears the minimum.")
+    if volume < MIN_VOLUME_RATIO:
+        reasons.append(f"Volume ratio {volume:.2f}x is below the {MIN_VOLUME_RATIO:.2f}x minimum.")
+    else:
+        passes.append(f"Volume ratio {volume:.2f}x clears the minimum.")
+    if earnings_soon:
+        reasons.append("Earnings are too close, so the setup is blocked.")
+    else:
+        passes.append("No near-term earnings block.")
+    fired = row.get("fired_signals") or []
+    if isinstance(fired, str):
+        try:
+            fired = json.loads(fired or "[]")
+        except Exception:
+            fired = []
+    if not fired and isinstance(scores, dict):
+        fired = [k for k, v in scores.items() if float(v or 0) >= 0.65]
+    return {
+        "eligible": not reasons,
+        "reasons": reasons,
+        "passes": passes,
+        "confidence": confidence,
+        "confidence_floor": confidence_floor,
+        "expected_move": expected_move,
+        "expected_move_floor": MIN_EXPECTED_MOVE,
+        "volume_ratio": volume,
+        "volume_floor": MIN_VOLUME_RATIO,
+        "price": price,
+        "fired_signals": fired,
+    }
+
 def variant_investment_amount(portfolio):
     """Small starting allocation that compounds independently per universe."""
     equity = float(portfolio.get("equity") or 1000.0)
@@ -8452,6 +8520,89 @@ def api_signal_observations():
     except Exception as e:
         log.error(f"signal-observations error: {e}")
         return jsonify([]), 500
+
+@app.route("/api/why-not")
+def api_why_not():
+    """Explain why a ticker did or did not make the latest pick lists."""
+    ticker = (request.args.get("ticker") or "").strip().upper()
+    if not ticker:
+        return jsonify({"success": False, "error": "ticker is required"}), 400
+    try:
+        db = get_database()
+        open_rows = []
+        for table in ("virtual_trades", "nn_virtual_trades", "personal_trades"):
+            try:
+                open_rows.extend([dict(r) for r in db.execute(
+                    f"SELECT ticker, direction, 'open' AS status, '{table}' AS source FROM {table} WHERE outcome='open' AND ticker=?",
+                    [ticker],
+                ).fetchall()])
+            except Exception:
+                pass
+        open_tickers = {r["ticker"] for r in open_rows}
+
+        obs_rows = [dict(r) for r in db.execute("""
+            SELECT *
+            FROM signal_observations
+            WHERE ticker=?
+            ORDER BY scan_time DESC, brain DESC, confidence DESC
+            LIMIT 20
+        """, [ticker]).fetchall()]
+        db.close()
+
+        for row in obs_rows:
+            for key in ("signal_scores", "signal_values", "fired_signals", "confluence_methods", "regime_context", "context_json"):
+                try:
+                    row[key] = json.loads(row[key] or "{}")
+                except Exception:
+                    row[key] = [] if key in ("fired_signals", "confluence_methods") else {}
+
+        latest_by_brain = {}
+        for row in obs_rows:
+            brain = row.get("brain") or "Unknown"
+            if brain not in latest_by_brain:
+                gate = explain_long_pick_gate(row, open_tickers, NN_CONFIDENCE_FLOOR if brain == "Nova" else CONFIDENCE_FLOOR)
+                selected = bool(row.get("selected"))
+                executable = bool(row.get("executable"))
+                if selected:
+                    verdict = "selected"
+                elif ticker in open_tickers:
+                    verdict = "already_open"
+                elif not executable:
+                    verdict = "not_executable"
+                elif not gate["eligible"]:
+                    verdict = "failed_gate"
+                else:
+                    verdict = "ranked_below_selected"
+                latest_by_brain[brain] = {
+                    "brain": brain,
+                    "verdict": verdict,
+                    "selected": selected,
+                    "executable": executable,
+                    "scan_time": row.get("scan_time"),
+                    "scan_type": row.get("scan_type"),
+                    "rank": row.get("rank"),
+                    "sector": row.get("sector"),
+                    "confidence_bin": row.get("confidence_bin"),
+                    "gate": gate,
+                    "scores": row.get("signal_scores") or {},
+                    "values": row.get("signal_values") or {},
+                    "methods": row.get("confluence_methods") or [],
+                    "context": row.get("context_json") or {},
+                    "regime": row.get("regime_context") or {},
+                }
+
+        return jsonify({
+            "success": True,
+            "ticker": ticker,
+            "open_positions": open_rows,
+            "observed": bool(obs_rows),
+            "latest": list(latest_by_brain.values()),
+            "observation_count": len(obs_rows),
+            "note": "This explains the latest stored scan observations. If the market move shown here disagrees with your broker/watchlist, the data feed or freshness layer needs investigation.",
+        })
+    except Exception as e:
+        log.error(f"why-not error for {ticker}: {e}")
+        return jsonify({"success": False, "ticker": ticker, "error": str(e)}), 500
 
 @app.route("/api/position-checks/<position_id>")
 def api_position_checks(position_id):

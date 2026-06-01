@@ -1932,6 +1932,102 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
   );
 }
 
+function WhyNotPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
+  const [ticker, setTicker] = React.useState("");
+  const [loading, setLoading] = React.useState(false);
+  const [result, setResult] = React.useState(null);
+  const [error, setError] = React.useState("");
+
+  const lookup = async () => {
+    const clean = ticker.trim().toUpperCase();
+    if (!clean) return;
+    setLoading(true);
+    setError("");
+    setResult(null);
+    try {
+      const res = await fetch(`${API}/why-not?ticker=${encodeURIComponent(clean)}`);
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || "Lookup failed");
+      setResult(data);
+    } catch (err) {
+      setError(err.message || "Lookup failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const verdictLabel = verdict => ({
+    selected: ["Selected", GREEN],
+    already_open: ["Already open", AMBER],
+    not_executable: ["Not executable", RED],
+    failed_gate: ["Failed gate", RED],
+    ranked_below_selected: ["Ranked lower", AMBER],
+  }[verdict] || ["Observed", T2]);
+
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 12, padding: "12px 14px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 9 }}>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: T1, letterSpacing: .3 }}>Why Not?</div>
+            <div style={{ fontSize: 9, color: T3, marginTop: 2 }}>Explain why a ticker did or did not make the pick list.</div>
+          </div>
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <input value={ticker} onChange={e => setTicker(e.target.value.toUpperCase())} onKeyDown={e => { if (e.key === "Enter") lookup(); }}
+              placeholder="DELL" style={{ width: 70, background: "#000", border: `1px solid ${BORDER}`, borderRadius: 7, color: T1, fontFamily: "'DM Mono',monospace", fontSize: 12, padding: "7px 8px", textTransform: "uppercase" }} />
+            <button onClick={lookup} disabled={loading || !ticker.trim()} style={{ background: loading ? "transparent" : BLUE, border: `1px solid ${BLUE}`, borderRadius: 7, color: loading ? BLUE : "#000", fontSize: 10, fontWeight: 800, padding: "7px 10px", cursor: loading ? "default" : "pointer" }}>
+              {loading ? "..." : "CHECK"}
+            </button>
+          </div>
+        </div>
+        {error && <div style={{ fontSize: 10, color: RED }}>{error}</div>}
+        {result && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {result.open_positions?.length > 0 && (
+              <div style={{ fontSize: 10, color: AMBER, lineHeight: 1.4 }}>
+                {result.ticker} is already open, so fresh-pick lists hide it unless we later add scale-in recommendations.
+              </div>
+            )}
+            {!result.observed && <div style={{ fontSize: 10, color: T3 }}>No stored scan observation found for {result.ticker}. It may be outside the active universe or the latest scan did not log it.</div>}
+            {(result.latest || []).map(item => {
+              const [label, color] = verdictLabel(item.verdict);
+              const gate = item.gate || {};
+              const values = item.values || {};
+              const day = values.overnight_gap ?? values.day_change_pct ?? null;
+              return (
+                <div key={item.brain} style={{ borderTop: `1px solid ${BORDER}`, paddingTop: 8 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 5 }}>
+                    <span style={{ fontSize: 11, fontWeight: 800, color: item.brain === "Nova" ? "#a78bfa" : BLUE }}>{item.brain}</span>
+                    <span style={{ fontSize: 9, fontWeight: 800, color, textTransform: "uppercase", letterSpacing: .4 }}>{label}</span>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 5, marginBottom: 6 }}>
+                    {[["Conf", `${gate.confidence ?? 0}%`], ["Move", `${Number(gate.expected_move || 0).toFixed(1)}%`], ["Vol", `${Number(gate.volume_ratio || 0).toFixed(2)}x`], ["Rank", item.rank ?? "—"]].map(([k, v]) => (
+                      <div key={k} style={{ background: "#000", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "5px 6px" }}>
+                        <div style={{ fontSize: 7, color: T3, textTransform: "uppercase", letterSpacing: .4 }}>{k}</div>
+                        <div style={{ fontSize: 11, color: T1, fontFamily: "'DM Mono',monospace" }}>{v}</div>
+                      </div>
+                    ))}
+                  </div>
+                  {gate.reasons?.length > 0 ? (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                      {gate.reasons.map(reason => <div key={reason} style={{ fontSize: 10, color: RED, lineHeight: 1.35 }}>- {reason}</div>)}
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: 10, color: GREEN }}>It passed the shared gate; if absent, it was ranked below selected picks or filtered by the chosen strategy.</div>
+                  )}
+                  <div style={{ fontSize: 9, color: T3, marginTop: 6, lineHeight: 1.4 }}>
+                    Brain saw price ${Number(gate.price || 0).toFixed(2)}, gap/day signal {day == null ? "unknown" : `${Number(day).toFixed(1)}%`}, fired {(gate.fired_signals || []).join(", ") || "no strong indicators"}.
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── AUDIT BUTTON ─────────────────────────────────────────────────────────────
 function AuditButton({ API, T1, T2, T3, BORDER, CARD, GREEN, AMBER, RED, onComplete }) {
   const [state, setState] = React.useState("idle"); // idle | running | done | error
@@ -4075,6 +4171,7 @@ export default function App() {
           {tabLoading && <div style={{ textAlign: "center", padding: 20, fontSize: 11, color: T3 }}>Loading...</div>}
 
               <ScanPanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} />
+              <WhyNotPanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} />
           <AuditButton API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} AMBER={AMBER} RED={RED} onComplete={() => apiFetch("/audit/log").then(data => setAuditLog(data || [])).catch(() => {})} />
 
           <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
