@@ -1626,7 +1626,7 @@ def mark_running_events_error(job_type, started_after, error):
 
 def get_running_comprehensive_scan():
     """Return the active comprehensive scan event, if one is already running."""
-    mark_stalled_scan_events()
+    mark_stalled_scan_events(max_age_minutes=12, zero_progress_minutes=8)
     database = get_database()
     row = database.execute("""
         SELECT * FROM scan_events
