@@ -325,16 +325,18 @@ def extract_nn_features(trade_row):
             sig_data = sig_raw
         scores = sig_data.get("scores", {})
         values = sig_data.get("values", {})
+        scores = canonicalize_signal_map(scores)
+        values = canonicalize_signal_map(values)
 
         # [0-8] Signal scores
         f = [
             float(scores.get("rsi_momentum", 0.5)),
             float(scores.get("volume_surge", 0.5)),
-            float(scores.get("overnight_gap", 0.5)),
+            float(scores.get("overnight_gap_probability", 0.5)),
             float(scores.get("earnings_catalyst", 0.5)),
             float(scores.get("support_resistance", 0.5)),
             float(scores.get("relative_strength", 0.5)),
-            float(scores.get("sector_rs", 0.5)),
+            float(scores.get("sector_relative_strength", 0.5)),
             float(scores.get("vwap_reclaim", 0.5)),
             float(scores.get("volatility_squeeze", 0.5)),
         ]
@@ -346,7 +348,7 @@ def extract_nn_features(trade_row):
         f.append(min(float(values.get("volume_surge", 1.0)) / 5.0, 1.0))
 
         # [11] gap_percent
-        gap = float(values.get("overnight_gap", 0))
+        gap = float(values.get("overnight_gap_probability", 0))
         f.append(max(min(gap / 10.0, 1.0), -1.0))
 
         # [12] days_to_earnings
@@ -398,7 +400,7 @@ def extract_nn_features(trade_row):
         rs_val = values.get("relative_strength", {})
         stock_5d = rs_val.get("stock_5d", 0) if isinstance(rs_val, dict) else 0
         spy_5d = rs_val.get("spy_5d", 0) if isinstance(rs_val, dict) else 0
-        sector_val = values.get("sector_rs", {})
+        sector_val = values.get("sector_relative_strength", {})
         etf_5d = sector_val.get("etf_5d", 0) if isinstance(sector_val, dict) else 0
         f.append(max(min(float(stock_5d or 0) / 20.0, 1.0), -1.0))
         f.append(max(min(float(spy_5d or 0) / 20.0, 1.0), -1.0))
@@ -686,6 +688,13 @@ HIGH_VOLATILITY_TICKERS = [
     "SOXL","TQQQ","SQQQ","UVXY",
 ]
 
+# Liquid momentum names outside the core index lists that SwingDesk should still watch.
+# This is intentionally separate from HIGH_VOLATILITY_TICKERS so additions are auditable.
+MOMENTUM_EXPANSION_TICKERS = [
+    "FLNC",
+]
+UNIVERSE_VERSION = "2026-06-01-momentum-expansion-1"
+
 # Sector classification for each ticker
 SECTOR_MAP = {
     "NVDA":"Tech","META":"Tech","AMD":"Tech","TSLA":"Auto","AMZN":"Consumer",
@@ -702,6 +711,7 @@ SECTOR_MAP = {
     "SPY":"ETF","QQQ":"ETF","IWM":"ETF","DIA":"ETF","ARKK":"ETF","ARKG":"ETF",
     "XLF":"ETF","XLK":"ETF","XLE":"ETF","XLV":"ETF","MARA":"Crypto",
     "RIOT":"Crypto","DKNG":"Consumer","PLUG":"Energy","FCEL":"Energy",
+    "FLNC":"Energy",
     "LLY":"Healthcare","UNH":"Healthcare","JNJ":"Healthcare","PFE":"Healthcare",
     "ABBV":"Healthcare","MRK":"Healthcare","V":"Finance","MA":"Finance",
     "GS":"Finance","BLK":"Finance","WFC":"Finance","PG":"Consumer",
@@ -723,9 +733,10 @@ def build_ticker_universe():
     database = get_database()
     cached_universe = database.execute("SELECT value FROM app_state WHERE key='universe'").fetchone()
     cached_date = database.execute("SELECT value FROM app_state WHERE key='universe_date'").fetchone()
+    cached_version = database.execute("SELECT value FROM app_state WHERE key='universe_version'").fetchone()
     today = current_time_cst().strftime("%Y-%m-%d")
 
-    if cached_universe and cached_date and cached_date["value"] == today:
+    if cached_universe and cached_date and cached_date["value"] == today and cached_version and cached_version["value"] == UNIVERSE_VERSION:
         database.close()
         tickers = json.loads(cached_universe["value"])
         log.info(f"Using cached universe: {len(tickers)} tickers")
@@ -733,7 +744,7 @@ def build_ticker_universe():
 
     sp500 = fetch_sp500_tickers()
     nasdaq100 = fetch_nasdaq100_tickers()
-    combined = list(dict.fromkeys(sp500 + nasdaq100 + HIGH_VOLATILITY_TICKERS))
+    combined = list(dict.fromkeys(sp500 + nasdaq100 + HIGH_VOLATILITY_TICKERS + MOMENTUM_EXPANSION_TICKERS))
 
     if len(combined) < 100:
         if cached_universe:
@@ -745,6 +756,7 @@ def build_ticker_universe():
     else:
         database.execute("INSERT OR REPLACE INTO app_state VALUES ('universe',?)", [json.dumps(combined)])
         database.execute("INSERT OR REPLACE INTO app_state VALUES ('universe_date',?)", [today])
+        database.execute("INSERT OR REPLACE INTO app_state VALUES ('universe_version',?)", [UNIVERSE_VERSION])
         database.commit()
 
     database.close()
@@ -2378,6 +2390,44 @@ def canonical_signal_weights():
         "volatility_squeeze": 0.05,
     }
 
+LEGACY_SIGNAL_KEY_ALIASES = {
+    "overnight_gap": "overnight_gap_probability",
+    "sector_rs": "sector_relative_strength",
+}
+
+def canonical_signal_key(key):
+    """Return the canonical 9-signal key for persisted and legacy signal names."""
+    return LEGACY_SIGNAL_KEY_ALIASES.get(key, key)
+
+def signal_value(blob, canonical_key, default=0.5):
+    """Read a signal score/value using both canonical and legacy names."""
+    if not isinstance(blob, dict):
+        return default
+    legacy_keys = [k for k, v in LEGACY_SIGNAL_KEY_ALIASES.items() if v == canonical_key]
+    for key in [canonical_key, *legacy_keys]:
+        if key in blob:
+            return blob.get(key)
+    return default
+
+def canonicalize_signal_map(blob):
+    """Normalize persisted signal maps so ML, audit, and UI speak one vocabulary."""
+    if not isinstance(blob, dict):
+        return {}
+    normalized = {}
+    for key, value in blob.items():
+        normalized[canonical_signal_key(key)] = value
+    return normalized
+
+def split_price_context(ticker, price_context):
+    """
+    Accept either a full universe price map or a single ticker data row.
+    Returns (universe_map, ticker_row) so every signal can use the right context.
+    """
+    if isinstance(price_context, dict) and isinstance(price_context.get(ticker), dict):
+        return price_context, price_context.get(ticker) or {}
+    row = price_context if isinstance(price_context, dict) else {}
+    return {ticker: row}, row
+
 def normalize_signal_weights(weights):
     baseline = canonical_signal_weights()
     merged = {k: float((weights or {}).get(k, v) or v) for k, v in baseline.items()}
@@ -2403,6 +2453,7 @@ def variant_weighted_signal_score(pick, weights):
     if isinstance(scores, dict) and "scores" in scores:
         scores = scores.get("scores") or {}
     base_conf, _ = pick_confidence_and_move(pick)
+    scores = canonicalize_signal_map(scores)
     if not isinstance(scores, dict) or not scores:
         return float(base_conf)
     weighted = sum(float(scores.get(k, 0.5) or 0.5) * float(weights.get(k, 0)) for k in canonical_signal_weights())
@@ -2418,6 +2469,7 @@ def learn_variant_from_closed_trade(database, trade_row, outcome, actual_move):
     scores = scores_blob.get("scores") if isinstance(scores_blob, dict) else {}
     if not isinstance(scores, dict):
         scores = scores_blob if isinstance(scores_blob, dict) else {}
+    scores = canonicalize_signal_map(scores)
     if not scores:
         return
     direction = 1 if outcome == "hit" else -1
@@ -4260,6 +4312,7 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
     The values dict is what powers the sub-tray on position cards — showing
     the actual RSI number, volume ratio, gap %, etc. rather than abstract scores.
     """
+    universe_data, ticker_data = split_price_context(ticker, price_data)
     rsi = rsi if rsi == rsi else 50.0
 
     # RSI
@@ -4269,12 +4322,12 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
         rsi_score = 1.0 if rsi > 65 else (0.7 if rsi > 55 else 0.4)
 
     # Volume
-    volume_ratio = price_data.get("volume_ratio", 1.0)
+    volume_ratio = ticker_data.get("volume_ratio", 1.0)
     volume_ratio = volume_ratio if volume_ratio == volume_ratio else 1.0
     volume_score = min(volume_ratio / 3.5, 1.0)
 
     # Gap
-    gap_percent = price_data.get("gap_percent", 0)
+    gap_percent = ticker_data.get("gap_percent", 0)
     gap_percent = gap_percent if gap_percent == gap_percent else 0.0
     gap_score = min(abs(gap_percent) / 10.0, 1.0)
     if direction == "short":
@@ -4292,7 +4345,7 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
         earnings_score = 0.5
 
     # S&R
-    sr_analysis = price_data.get("sr_analysis")
+    sr_analysis = ticker_data.get("sr_analysis")
     sr_score = sr_analysis["score"] if sr_analysis else 0.5
     sr_signal = sr_analysis["signal"] if sr_analysis else "unknown"
     sr_nearest_resistance = sr_analysis.get("nearest_resistance") if sr_analysis else None
@@ -4300,11 +4353,11 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
     if direction == "short": sr_score = 1.0 - sr_score
 
     # RS vs Market — compute diff for display
-    rs_score = calculate_relative_strength(ticker, price_data)
+    rs_score = calculate_relative_strength(ticker, universe_data)
     rs_stock_5d, rs_spy_5d = None, None
     try:
-        ticker_history = price_data[ticker].get("daily_history", [])
-        spy_history = price_data.get("SPY", {}).get("daily_history", [])
+        ticker_history = universe_data[ticker].get("daily_history", [])
+        spy_history = universe_data.get("SPY", {}).get("daily_history", [])
         if len(ticker_history) >= 5 and len(spy_history) >= 5:
             rs_stock_5d = round((ticker_history[-1]["close"] - ticker_history[-5]["close"]) / max(ticker_history[-5]["close"], 0.01) * 100, 2)
             rs_spy_5d = round((spy_history[-1]["close"] - spy_history[-5]["close"]) / max(spy_history[-5]["close"], 0.01) * 100, 2)
@@ -4312,7 +4365,7 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
     if direction == "short": rs_score = 1.0 - rs_score
 
     # Sector RS — compute diff + ETF name for display
-    sector_rs_score = calculate_sector_relative_strength(ticker, price_data)
+    sector_rs_score = calculate_sector_relative_strength(ticker, universe_data)
     sector_etf_name, sector_etf_5d, sector_spy_5d = None, None, None
     try:
         SECTOR_ETF_MAP = {
@@ -4321,9 +4374,9 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
             "Defense": "XLI", "Auto": "XLY", "Crypto": "XLK",
         }
         sector_etf_name = SECTOR_ETF_MAP.get(get_sector(ticker))
-        if sector_etf_name and sector_etf_name in price_data and "SPY" in price_data:
-            etf_hist = price_data[sector_etf_name].get("daily_history", [])
-            spy_hist = price_data.get("SPY", {}).get("daily_history", [])
+        if sector_etf_name and sector_etf_name in universe_data and "SPY" in universe_data:
+            etf_hist = universe_data[sector_etf_name].get("daily_history", [])
+            spy_hist = universe_data.get("SPY", {}).get("daily_history", [])
             if len(etf_hist) >= 5 and len(spy_hist) >= 5:
                 sector_etf_5d = round((etf_hist[-1]["close"] - etf_hist[-5]["close"]) / max(etf_hist[-5]["close"], 0.01) * 100, 2)
                 sector_spy_5d = round((spy_hist[-1]["close"] - spy_hist[-5]["close"]) / max(spy_hist[-5]["close"], 0.01) * 100, 2)
@@ -4331,29 +4384,29 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
     if direction == "short": sector_rs_score = 1.0 - sector_rs_score
 
     # VWAP — capture mode + distance
-    vwap_score = calculate_vwap_signal(ticker, price_data)
+    vwap_score = calculate_vwap_signal(ticker, universe_data)
     vwap_mode, vwap_dist = "unknown", None
     try:
-        vwap = price_data.get(ticker, {}).get("vwap")
-        price = price_data.get(ticker, {}).get("price", 0)
+        vwap = universe_data.get(ticker, {}).get("vwap")
+        price = universe_data.get(ticker, {}).get("price", 0)
         if vwap and price and vwap > 0:
             vwap_mode = "real"
             vwap_dist = round((price - vwap) / vwap * 100, 2)
         else:
             vwap_mode = "proxy"
-            close = price_data.get(ticker, {}).get("price", 0)
-            open_p = price_data.get(ticker, {}).get("open", close)
+            close = universe_data.get(ticker, {}).get("price", 0)
+            open_p = universe_data.get(ticker, {}).get("open", close)
             if open_p > 0:
                 vwap_dist = round((close - open_p) / open_p * 100, 2)
     except: pass
     if direction == "short": vwap_score = 1.0 - vwap_score
 
     # Volatility Squeeze — compute HV ratio for display
-    squeeze_score = calculate_volatility_squeeze(ticker, price_data)
+    squeeze_score = calculate_volatility_squeeze(ticker, universe_data)
     hv_ratio = None
     try:
         import math
-        history = price_data.get(ticker, {}).get("daily_history", [])
+        history = universe_data.get(ticker, {}).get("daily_history", [])
         if len(history) >= 21:
             closes = [d["close"] for d in history]
             log_returns = [math.log(closes[i] / closes[i-1]) for i in range(1, len(closes)) if closes[i-1] > 0]
@@ -4369,11 +4422,11 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
     scores = {
         "rsi_momentum":       round(rsi_score, 3),
         "volume_surge":       round(volume_score, 3),
-        "overnight_gap":      round(gap_score, 3),
+        "overnight_gap_probability": round(gap_score, 3),
         "earnings_catalyst":  round(earnings_score, 3),
         "support_resistance": round(sr_score, 3),
         "relative_strength":  round(rs_score, 3),
-        "sector_rs":          round(sector_rs_score, 3),
+        "sector_relative_strength": round(sector_rs_score, 3),
         "vwap_reclaim":       round(vwap_score, 3),
         "volatility_squeeze": round(squeeze_score, 3),
     }
@@ -4381,11 +4434,11 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
     values = {
         "rsi_momentum":       round(rsi, 1),
         "volume_surge":       round(volume_ratio, 2),
-        "overnight_gap":      round(gap_percent, 2),
+        "overnight_gap_probability": round(gap_percent, 2),
         "earnings_catalyst":  days_to_earnings,
         "support_resistance": {"signal": sr_signal, "resistance": sr_nearest_resistance, "support": sr_nearest_support},
         "relative_strength":  {"stock_5d": rs_stock_5d, "spy_5d": rs_spy_5d},
-        "sector_rs":          {"etf": sector_etf_name, "etf_5d": sector_etf_5d, "spy_5d": sector_spy_5d},
+        "sector_relative_strength": {"etf": sector_etf_name, "etf_5d": sector_etf_5d, "spy_5d": sector_spy_5d},
         "vwap_reclaim":       {"mode": vwap_mode, "dist": vwap_dist},
         "volatility_squeeze": hv_ratio,
     }
@@ -4739,6 +4792,7 @@ def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, 
     Hard disqualifier: earnings tonight/tomorrow returns 0 immediately.
     Multiplier calibrated so average qualified setup scores ~70.
     """
+    universe_data, ticker_data = split_price_context(ticker, price_data)
     rsi = rsi if rsi == rsi else 50.0
 
     # 1. RSI Momentum
@@ -4748,12 +4802,12 @@ def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, 
         rsi_score = 1.0 if rsi > 65 else (0.7 if rsi > 55 else 0.4)
 
     # 2. Volume Surge
-    volume_ratio = price_data.get("volume_ratio", 1.0)
+    volume_ratio = ticker_data.get("volume_ratio", 1.0)
     volume_ratio = volume_ratio if volume_ratio == volume_ratio else 1.0
     volume_score = min(volume_ratio / 3.5, 1.0)
 
     # 3. Overnight Gap
-    gap_percent = price_data.get("gap_percent", 0)
+    gap_percent = ticker_data.get("gap_percent", 0)
     gap_percent = gap_percent if gap_percent == gap_percent else 0.0
     gap_score = min(abs(gap_percent) / 10.0, 1.0)
     if direction == "short":
@@ -4774,28 +4828,28 @@ def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, 
         earnings_score = 0.5
 
     # 5. Support & Resistance
-    sr_analysis = price_data.get("sr_analysis")
+    sr_analysis = ticker_data.get("sr_analysis")
     sr_score = sr_analysis["score"] if sr_analysis else 0.5
     if direction == "short":
         sr_score = 1.0 - sr_score
 
     # 6. Relative Strength vs Market
-    rs_score = calculate_relative_strength(ticker, price_data)
+    rs_score = calculate_relative_strength(ticker, universe_data)
     if direction == "short":
         rs_score = 1.0 - rs_score
 
     # 7. Sector Relative Strength
-    sector_rs_score = calculate_sector_relative_strength(ticker, price_data)
+    sector_rs_score = calculate_sector_relative_strength(ticker, universe_data)
     if direction == "short":
         sector_rs_score = 1.0 - sector_rs_score
 
     # 8. VWAP Distance/Reclaim
-    vwap_score = calculate_vwap_signal(ticker, price_data)
+    vwap_score = calculate_vwap_signal(ticker, universe_data)
     if direction == "short":
         vwap_score = 1.0 - vwap_score
 
     # 9. Volatility Squeeze
-    squeeze_score = calculate_volatility_squeeze(ticker, price_data)
+    squeeze_score = calculate_volatility_squeeze(ticker, universe_data)
 
     # Weighted combination — all 9 signals
     raw_score = (
@@ -5042,8 +5096,8 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         if has_earnings and days_to_earnings <= 1:
             continue
 
-        long_confidence = calculate_confidence_score(ticker, stock_data, rsi, earnings_soon, weights, "long")
-        short_confidence = calculate_confidence_score(ticker, stock_data, rsi, earnings_soon, weights, "short")
+        long_confidence = calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, "long")
+        short_confidence = calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, "short")
         long_move = estimate_overnight_move(stock_data, long_confidence, has_earnings)
         short_move = estimate_overnight_move(stock_data, short_confidence, has_earnings)
 
@@ -7798,9 +7852,14 @@ def api_audit():
 
 @app.route("/api/audit/log")
 def api_audit_log():
+    limit = min(max(int(request.args.get("limit", 10)), 1), 100)
+    offset = max(int(request.args.get("offset", 0)), 0)
+    paged = str(request.args.get("paged", "")).lower() in ("1", "true", "yes")
     database = get_database()
+    total = database.execute("SELECT COUNT(*) AS n FROM audit_log").fetchone()["n"]
     rows = [dict(r) for r in database.execute(
-        "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT 30"
+        "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+        [limit if paged else 30, offset if paged else 0],
     ).fetchall()]
     database.close()
     for row in rows:
@@ -7817,6 +7876,8 @@ def api_audit_log():
             row["provider_attempts"] = json.loads(row.get("provider_attempts") or "[]")
         except Exception:
             row["provider_attempts"] = []
+    if paged:
+        return jsonify({"rows": rows, "total": total, "limit": limit, "offset": offset})
     return jsonify(rows)
 
 @app.route("/api/perf-history")
@@ -8213,6 +8274,29 @@ def api_strategy_variants():
         log.error(f"strategy-variants error: {e}")
         return jsonify([]), 500
 
+@app.route("/api/ticker-universe")
+def api_ticker_universe():
+    """Return current scan universe membership for a ticker."""
+    try:
+        ticker = (request.args.get("ticker") or "").strip().upper()
+        universe = build_ticker_universe()
+        payload = {
+            "success": True,
+            "count": len(universe),
+            "ticker": ticker or None,
+            "present": ticker in universe if ticker else None,
+        }
+        if ticker:
+            payload["note"] = (
+                f"{ticker} is in the active scan universe."
+                if payload["present"]
+                else f"{ticker} is not in the active scan universe; it will not receive scan observations or Why Not rows."
+            )
+        return jsonify(payload)
+    except Exception as e:
+        log.error(f"ticker-universe error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route("/api/variant-portfolios")
 def api_variant_portfolios():
     """Return every live universe portfolio with current counts."""
@@ -8330,6 +8414,74 @@ def api_variant_status():
         log.error(f"variant-status error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
+@app.route("/api/variant-health")
+def api_variant_health():
+    """Operational proof that each active variant has current inputs, portfolio state, and preview results."""
+    try:
+        db = get_database()
+        snapshot, refusal = variant_cache_snapshot(db, require_fresh=False)
+        variants = [dict(r) for r in db.execute("""
+            SELECT sv.id, sv.strategy, sv.brain, sv.execution_time, sv.selection_mode, sv.exit_mode, sv.label,
+                   sv.status AS registry_status,
+                   vp.lifecycle_status, vp.open_count, vp.closed_count, vp.equity, vp.updated_at AS portfolio_updated_at,
+                   MAX(vt.updated_at) AS last_trade_at
+            FROM strategy_variants sv
+            LEFT JOIN variant_portfolios vp ON vp.variant_id=sv.id
+            LEFT JOIN variant_virtual_trades vt ON vt.variant_id=sv.id
+            WHERE sv.status='active'
+            GROUP BY sv.id
+            ORDER BY sv.brain, sv.strategy, sv.execution_time, sv.selection_mode
+        """).fetchall()]
+        latest_observation = db.execute("SELECT MAX(scan_time) AS ts FROM signal_observations").fetchone()["ts"]
+        db.close()
+
+        vector_picks = []
+        nova_picks = []
+        if snapshot:
+            vector_picks = snapshot["vector_payload"].get("longs") or snapshot["vector_payload"].get("recommended_longs") or []
+            nova_picks = snapshot["nova_payload"].get("recommended_longs") or snapshot["nova_payload"].get("longs") or []
+
+        rows = []
+        for variant in variants:
+            source = nova_picks if variant.get("brain") == "Nova" else vector_picks
+            if variant.get("brain") == "Nova":
+                source = [p for p in source if p.get("nn_executable", True)]
+            qualified = filter_variant_strategy_picks(source, variant) if snapshot else []
+            selected = select_variant_picks(qualified, variant.get("selection_mode")) if snapshot else []
+            issues = []
+            if not snapshot:
+                issues.append(refusal.get("reason", "missing_shared_snapshot") if isinstance(refusal, dict) else "missing_shared_snapshot")
+            if variant.get("lifecycle_status") == "archived":
+                issues.append("portfolio_archived")
+            if not source and snapshot:
+                issues.append(f"{variant.get('brain')} source pick list is empty")
+            rows.append({
+                **variant,
+                "source_count": len(source),
+                "strategy_qualified": len(qualified),
+                "selected_count": len(selected),
+                "selected_tickers": [p.get("ticker") for p in selected[:20]],
+                "last_shared_observation_at": latest_observation,
+                "health": "ok" if not issues else "attention",
+                "issues": issues,
+            })
+
+        ok_count = sum(1 for row in rows if row["health"] == "ok")
+        return jsonify({
+            "success": True,
+            "shared_snapshot": bool(snapshot),
+            "cache_issue": refusal,
+            "latest_observation_at": latest_observation,
+            "variant_count": len(rows),
+            "ok_count": ok_count,
+            "attention_count": len(rows) - ok_count,
+            "rows": rows,
+            "note": "A variant is alive when it is active, has a non-archived portfolio, and can evaluate the latest shared pick snapshot. Empty source pick lists mean the brain produced no executable candidates, not that the variant loop crashed.",
+        })
+    except Exception as e:
+        log.error(f"variant-health error: {e}")
+        return jsonify({"success": False, "error": str(e), "rows": []}), 500
+
 @app.route("/api/variant-strategy-preview")
 def api_variant_strategy_preview():
     """Show how each active strategy would filter the current shared snapshot."""
@@ -8446,10 +8598,13 @@ def api_variant_learning_events():
     """Recent per-universe weight updates for Vector/Nova QA."""
     try:
         limit = min(max(int(request.args.get("limit", 100)), 1), 5000)
+        offset = max(int(request.args.get("offset", 0)), 0)
+        paged = str(request.args.get("paged", "")).lower() in ("1", "true", "yes")
         variant_id = request.args.get("variant_id")
         where = "WHERE e.variant_id=?" if variant_id else ""
         params = [variant_id] if variant_id else []
         db = get_database()
+        total = db.execute(f"SELECT COUNT(*) AS n FROM variant_learning_events e {where}", params).fetchone()["n"]
         rows = [dict(r) for r in db.execute(f"""
             SELECT e.*,
                    t.ticker, t.buy_date, t.sell_date, t.sell_time,
@@ -8458,8 +8613,8 @@ def api_variant_learning_events():
             LEFT JOIN variant_virtual_trades t ON t.id = e.trade_id
             {where}
             ORDER BY e.timestamp DESC
-            LIMIT ?
-        """, params + [limit]).fetchall()]
+            LIMIT ? OFFSET ?
+        """, params + [limit, offset]).fetchall()]
         db.close()
         for row in rows:
             for key in ("weights_before", "weights_after", "reasoning"):
@@ -8467,6 +8622,8 @@ def api_variant_learning_events():
                     row[key] = json.loads(row[key] or "{}")
                 except Exception:
                     row[key] = [] if key == "reasoning" else {}
+        if paged:
+            return jsonify({"rows": rows, "total": total, "limit": limit, "offset": offset})
         return jsonify(rows)
     except Exception as e:
         log.error(f"variant-learning-events error: {e}")

@@ -562,25 +562,47 @@ function getTradeOpenPnlDollars(trade = {}, feeAdjusted = true) {
   return invested * (pct / 100);
 }
 
+const SIGNAL_KEY_ALIASES = {
+  overnight_gap: "overnight_gap_probability",
+  sector_rs: "sector_relative_strength",
+};
+
+function canonicalSignalKey(key) {
+  return SIGNAL_KEY_ALIASES[key] || key;
+}
+
+function canonicalSignalMap(map = {}) {
+  if (!map || typeof map !== "object" || Array.isArray(map)) return {};
+  return Object.fromEntries(Object.entries(map).map(([key, value]) => [canonicalSignalKey(key), value]));
+}
+
 function getSignalData(item = {}) {
   const directFired = parseList(item.signal_fired ?? item.fired_signals ?? item.fired_signals_for_observation);
   let scores = item.signal_scores_for_observation ?? item.signal_scores ?? item.scores ?? {};
+  let values = item.signal_values_for_observation ?? item.signal_values ?? item.values ?? {};
   let fired = directFired;
   if (typeof scores === "string") {
     try { scores = JSON.parse(scores || "{}"); } catch { scores = {}; }
   }
+  if (typeof values === "string") {
+    try { values = JSON.parse(values || "{}"); } catch { values = {}; }
+  }
   if (scores && typeof scores === "object" && !Array.isArray(scores)) {
     if (!fired.length) fired = parseList(scores.fired);
+    if (!values || !Object.keys(values).length) values = scores.values || {};
     scores = scores.scores || scores;
   } else {
     scores = {};
   }
+  scores = canonicalSignalMap(scores);
+  values = canonicalSignalMap(values);
+  fired = fired.map(canonicalSignalKey);
   if (!fired.length && scores && typeof scores === "object") {
     fired = Object.entries(scores)
       .filter(([, value]) => Number(value) >= 0.65)
       .map(([key]) => key);
   }
-  return { fired: uniqueList(fired), scores };
+  return { fired: uniqueList(fired), scores, values };
 }
 
 function getSignalCount(item = {}) {
@@ -589,7 +611,7 @@ function getSignalCount(item = {}) {
 
 function withNormalizedSignals(item = {}) {
   const signalData = getSignalData(item);
-  return { ...item, signal_fired: signalData.fired, signal_scores: signalData.scores };
+  return { ...item, signal_fired: signalData.fired, signal_scores: signalData.scores, signal_values: signalData.values };
 }
 
 function normalizeStrategyName(value) {
@@ -1454,6 +1476,8 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
           {/* ── Signal Indicators — which of the 9 scored above threshold ── */}
           {signalData.fired.length > 0 && (() => {
             const SIGNAL_INFO = {
+              overnight_gap_probability: { label: "Gap", def: "How much the stock gapped up at open vs yesterday's close. A positive gap shows the market opened with conviction." },
+              sector_relative_strength: { label: "Sector RS", def: "This stock's sector ETF 5-day return vs SPY. Sector tailwind raises continuation odds." },
               rsi_momentum:       { label: "RSI",       def: "Relative Strength Index measures price momentum. Sweet spot is 40-65 — strong enough to show conviction but not so high the stock is overbought and due for a reversal." },
               volume_surge:       { label: "Volume",    def: "Today's volume vs the 20-day average. A surge above 1.5x means real institutional participation, not just retail noise. We score up to 3.5x average." },
               overnight_gap:      { label: "Gap",       def: "How much the stock gapped up at open vs yesterday's close. A positive gap shows the market opened with conviction — buyers stepped in before the bell." },
@@ -1477,6 +1501,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
                 case "volume_surge":
                   return `Volume: ${v}x average — ${v >= 2 ? "strong institutional participation" : v >= 1.5 ? "above-average activity" : "modest activity"}`;
                 case "overnight_gap":
+                case "overnight_gap_probability":
                   return `Gap: ${v >= 0 ? "+" : ""}${v}% — ${Math.abs(v) >= 3 ? "strong conviction at open" : Math.abs(v) >= 1 ? "moderate gap" : "mild gap, modest signal"}`;
                 case "earnings_catalyst":
                   return v != null ? `Earnings in ${v} day${v === 1 ? "" : "s"} — run-up window active` : "No earnings this week — neutral";
@@ -1494,6 +1519,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
                   }
                   return null;
                 case "sector_rs":
+                case "sector_relative_strength":
                   if (v.etf && v.etf_5d != null && v.spy_5d != null) {
                     const diff = (v.etf_5d - v.spy_5d).toFixed(1);
                     return `${v.etf} ${v.etf_5d >= 0 ? "+" : ""}${v.etf_5d}% vs SPY ${v.spy_5d >= 0 ? "+" : ""}${v.spy_5d}% — sector ${diff >= 0 ? "tailwind" : "headwind"}`;
@@ -1533,7 +1559,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
                 </div>
                 {expandedSignal && (() => {
                   const info = SIGNAL_INFO[expandedSignal] || { label: expandedSignal, def: "" };
-                  const valueLine = buildValueLine(expandedSignal, trade.signal_values);
+                  const valueLine = buildValueLine(expandedSignal, signalData.values);
                   return (
                     <div style={{ marginTop: 8, fontSize: 10, color: T1, lineHeight: 1.5, borderTop: "1px solid #1a2a40", paddingTop: 8 }}>
                       {valueLine && <div style={{ color: T1, fontWeight: 500, marginBottom: 4 }}>{valueLine}</div>}
@@ -2100,7 +2126,7 @@ function WhyNotPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED })
               const [label, color] = verdictLabel(item.verdict);
               const gate = item.gate || {};
               const values = item.values || {};
-              const day = values.overnight_gap ?? values.day_change_pct ?? null;
+              const day = values.overnight_gap_probability ?? values.overnight_gap ?? values.day_change_pct ?? null;
               return (
                 <div key={item.brain} style={{ borderTop: `1px solid ${BORDER}`, paddingTop: 8 }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 5 }}>
@@ -2220,7 +2246,12 @@ export default function App() {
   const [expandedMethods, setExpandedMethods] = useState({});
   const [weightsHistory, setWeightsHistory] = useState([]);
   const [auditLog, setAuditLog] = useState([]);
+  const [auditTotal, setAuditTotal] = useState(0);
+  const [auditPage, setAuditPage] = useState(0);
   const [learningEvents, setLearningEvents] = useState([]);
+  const [learningTotal, setLearningTotal] = useState(0);
+  const [learningPage, setLearningPage] = useState(0);
+  const [variantHealth, setVariantHealth] = useState(null);
   const [perfHistory, setPerfHistory] = useState([]);
   const [lastAudit, setLastAudit] = useState(null);
   const [lastAuditSuccess, setLastAuditSuccess] = useState(null);
@@ -2543,6 +2574,22 @@ export default function App() {
   }
 
   function round2(n) { return Math.round(n * 100) / 100; }
+  const AUDIT_PAGE_SIZE = 3;
+  const LEARNING_PAGE_SIZE = 10;
+
+  async function loadAuditPage(page = auditPage) {
+    const offset = page * AUDIT_PAGE_SIZE;
+    const data = await apiFetch(`/audit/log?paged=1&limit=${AUDIT_PAGE_SIZE}&offset=${offset}`);
+    setAuditLog(data.rows || []);
+    setAuditTotal(Number(data.total || 0));
+  }
+
+  async function loadLearningPage(page = learningPage) {
+    const offset = page * LEARNING_PAGE_SIZE;
+    const data = await apiFetch(`/variant-learning-events?paged=1&limit=${LEARNING_PAGE_SIZE}&offset=${offset}`);
+    setLearningEvents(data.rows || []);
+    setLearningTotal(Number(data.total || 0));
+  }
 
   useEffect(() => {
     if (!loaded) return;
@@ -2575,9 +2622,10 @@ export default function App() {
         setWeightsHistory(data.weights_history || []);
       }).catch(() => {});
     }
-    if (tab === "intel" && auditLog.length === 0) {
-      apiFetch("/audit/log").then(data => setAuditLog(data || [])).catch(() => {});
-      apiFetch("/variant-learning-events?limit=5000").then(data => setLearningEvents(data || [])).catch(() => {});
+    if (tab === "intel") {
+      loadAuditPage(auditPage).catch(() => {});
+      loadLearningPage(learningPage).catch(() => {});
+      apiFetch("/variant-health").then(data => setVariantHealth(data || null)).catch(() => {});
     }
     if (tab === "intel" && predictions.length === 0) {
       setTabLoading(true);
@@ -2586,7 +2634,7 @@ export default function App() {
     if (tab === "virtual" && analyticsPage === "scan" && scanHistory.length === 0) {
       apiFetch("/scan-history").then(data => setScanHistory(data || [])).catch(() => {});
     }
-  }, [tab, loaded, analyticsPage]);
+  }, [tab, loaded, analyticsPage, auditPage, learningPage]);
 
   // ── 5-minute refresh ──
   useEffect(() => {
@@ -4313,9 +4361,35 @@ export default function App() {
                 ? "Last audit failed. No weights were changed."
                 : lastAuditProvider
                   ? `Last recap provider: ${lastAuditProvider}`
-                  : `${learningEvents.length} ML events recorded. Next audit recap runs automatically.`}
+                  : `${learningTotal || learningEvents.length} ML events recorded. Next audit recap runs automatically.`}
             </div>
           </div>
+
+          {variantHealth && (
+            <div style={{ background: CARD, border: `1px solid ${variantHealth.attention_count ? AMBER : GREEN}55`, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                <div style={{ fontSize: 12, fontWeight: 800, color: T1 }}>Variant health</div>
+                <div style={{ fontSize: 10, color: variantHealth.attention_count ? AMBER : GREEN, fontFamily: "'DM Mono',monospace" }}>
+                  {variantHealth.ok_count || 0}/{variantHealth.variant_count || 0} ok
+                </div>
+              </div>
+              <div style={{ fontSize: 9, color: T3, lineHeight: 1.45, marginBottom: 8 }}>{variantHealth.note}</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
+                <div style={{ background: "#000", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
+                  <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>Vector Source</div>
+                  <div style={{ fontSize: 12, color: BLUE, fontFamily: "'DM Mono',monospace" }}>{variantHealth.rows?.find(r => r.brain === "Vector")?.source_count ?? 0}</div>
+                </div>
+                <div style={{ background: "#000", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
+                  <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>Nova Source</div>
+                  <div style={{ fontSize: 12, color: "#a78bfa", fontFamily: "'DM Mono',monospace" }}>{variantHealth.rows?.find(r => r.brain === "Nova")?.source_count ?? 0}</div>
+                </div>
+                <div style={{ background: "#000", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
+                  <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>Needs Attention</div>
+                  <div style={{ fontSize: 12, color: variantHealth.attention_count ? AMBER : GREEN, fontFamily: "'DM Mono',monospace" }}>{variantHealth.attention_count || 0}</div>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Audit history */}
           <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, marginBottom: 16, overflow: "hidden" }}>
@@ -4342,7 +4416,14 @@ export default function App() {
                   </div>
                 ) : (
                   <div style={{ paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
-                    {auditLog.slice(0, 10).map((entry, i) => {
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                      <span style={{ fontSize: 8, color: T3 }}>Page {auditPage + 1} of {Math.max(1, Math.ceil((auditTotal || auditLog.length) / AUDIT_PAGE_SIZE))} · {auditTotal || auditLog.length} entries</span>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button onClick={() => setAuditPage(p => Math.max(0, p - 1))} disabled={auditPage === 0} style={{ fontSize: 8, color: auditPage === 0 ? T3 : BLUE, background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 5, padding: "3px 7px" }}>Prev</button>
+                        <button onClick={() => setAuditPage(p => p + 1)} disabled={(auditPage + 1) * AUDIT_PAGE_SIZE >= (auditTotal || auditLog.length)} style={{ fontSize: 8, color: (auditPage + 1) * AUDIT_PAGE_SIZE >= (auditTotal || auditLog.length) ? T3 : BLUE, background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 5, padding: "3px 7px" }}>Next</button>
+                      </div>
+                    </div>
+                    {auditLog.map((entry, i) => {
                       const reasoning = (() => {
                         try {
                           const parsed = JSON.parse(entry.reasoning || "[]");
@@ -4431,9 +4512,16 @@ export default function App() {
           <div style={{ marginBottom: 16 }}>
             <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8, marginBottom: 8, display: "flex", alignItems: "center", gap: 8 }}>
               <span style={{ color: GREEN }}>◉</span> ML Weight Adjustments
-              <span style={{ fontSize: 8, color: T3, fontWeight: 400 }}>{learningEvents.length} events loaded</span>
+              <span style={{ fontSize: 8, color: T3, fontWeight: 400 }}>{learningTotal || learningEvents.length} total events</span>
             </div>
-            <div style={{ background: "#050e1a", border: `1px solid ${GREEN}33`, borderRadius: 10, maxHeight: "70vh", overflowY: "auto", fontFamily: "'DM Mono',monospace", fontSize: 8 }}>
+            <div style={{ background: "#050e1a", border: `1px solid ${GREEN}33`, borderRadius: 10, fontFamily: "'DM Mono',monospace", fontSize: 8 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 12px", borderBottom: `1px solid ${GREEN}20` }}>
+                <span style={{ color: T3 }}>Page {learningPage + 1} of {Math.max(1, Math.ceil((learningTotal || learningEvents.length) / LEARNING_PAGE_SIZE))}</span>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button onClick={() => setLearningPage(p => Math.max(0, p - 1))} disabled={learningPage === 0} style={{ fontSize: 8, color: learningPage === 0 ? T3 : GREEN, background: "transparent", border: `1px solid ${GREEN}33`, borderRadius: 5, padding: "3px 7px" }}>Prev</button>
+                  <button onClick={() => setLearningPage(p => p + 1)} disabled={(learningPage + 1) * LEARNING_PAGE_SIZE >= (learningTotal || learningEvents.length)} style={{ fontSize: 8, color: (learningPage + 1) * LEARNING_PAGE_SIZE >= (learningTotal || learningEvents.length) ? T3 : GREEN, background: "transparent", border: `1px solid ${GREEN}33`, borderRadius: 5, padding: "3px 7px" }}>Next</button>
+                </div>
+              </div>
               {learningEvents.length === 0 ? (
                 <div style={{ padding: "16px", color: T3, textAlign: "center", fontSize: 9 }}>No learning events yet - weights update once daily at 7:00 PM Central from closed trades.</div>
               ) : learningEvents.map((ev, i) => {
