@@ -196,11 +196,17 @@ function EvidenceValue({ evidence }) {
   const glowClass = level === "New" ? "" : "tag-glow";
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontFamily: "'DM Mono',monospace" }}>
-      <span className={glowClass} title={title} style={{
+      <button type="button" className={glowClass} title={title} aria-label={title} onClick={(e) => e.stopPropagation()} style={{
+        width: 28, height: 28, borderRadius: "50%", border: "none", background: "transparent",
+        color, display: "inline-flex", alignItems: "center", justifyContent: "center",
+        padding: 0, margin: "-7px -3px", cursor: "pointer", WebkitTapHighlightColor: "transparent",
+      }}>
+        <span style={{
         width: 13, height: 13, borderRadius: "50%", border: `1px solid ${color}77`,
         color, display: "inline-flex", alignItems: "center", justifyContent: "center",
         fontSize: 8, fontWeight: 900, lineHeight: 1, background: color + "12",
       }}>i</span>
+      </button>
       <span style={{ color }}>{level}</span>
     </span>
   );
@@ -745,7 +751,7 @@ function CardActionRow({ statusLabel, statusPhrase, statusColor, staleTime, acti
           <StaleBadge staleTime={staleTime} />
         </span>
       </div>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 5, minWidth: 0, overflow: "hidden", flexWrap: "wrap" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 5, minWidth: 0, overflow: "visible", flexWrap: "wrap", padding: "4px 0" }}>
         {actions}
       </div>
     </div>
@@ -1807,6 +1813,7 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
   const [state, setState] = React.useState("idle"); // idle | running | done | error
   const [phase, setPhase] = React.useState("");
   const [totalScanned, setTotalScanned] = React.useState(0);
+  const [totalExpected, setTotalExpected] = React.useState(521);
   const [currentTicker, setCurrentTicker] = React.useState("");
   const [scannedTickers, setScannedTickers] = React.useState([]);
   const [qualified, setQualified] = React.useState(0);
@@ -1825,6 +1832,7 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
       const d = await res.json();
       setPhase(d.phase || "");
       setTotalScanned(d.total_scanned || 0);
+      setTotalExpected(d.total_expected || d.tickers_attempted || 521);
       setCurrentTicker(d.current_ticker || "");
       setScannedTickers(d.scanned_tickers || []);
       setQualified(d.qualified || 0);
@@ -1850,6 +1858,7 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
 
   const trigger = async () => {
     setState("running"); setPhase("starting"); setTotalScanned(0);
+    setTotalExpected(521);
     setScannedTickers([]); setCurrentTicker(""); setQualified(0);
     setPicks(0); setErrorMsg(""); setStartedAt(new Date().toISOString()); setFinishedAt(null);
     try { await fetch(`${API}/shared-scan-now`, { method: "POST" }); } catch (_) {}
@@ -1858,7 +1867,7 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
   };
 
   const elapsed = startedAt ? Math.round((new Date(finishedAt || Date.now()) - new Date(startedAt)) / 1000) : 0;
-  const pct = totalScanned > 0 ? Math.min(98, Math.round(totalScanned / 1.5)) : 0;
+  const pct = totalExpected > 0 ? Math.min(98, Math.round(totalScanned / totalExpected * 100)) : 0;
   const accent = state === "done" ? GREEN : state === "error" ? RED : BLUE;
   const phaseLabel = { starting: "Initializing…", fetching_prices: "Fetching price data…", scoring: "Scoring tickers…" }[phase] || (state === "running" ? "Scanning…" : "");
 
@@ -1873,9 +1882,9 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
             </div>
             <div style={{ fontSize: 9, color: T3, marginTop: 2, fontFamily: "'DM Mono',monospace" }}>
               {state === "running"
-                ? `${totalScanned} tickers scored${elapsed > 0 ? ` · ${elapsed}s` : ""}`
+                ? `${totalScanned}/${totalExpected} tickers scored${elapsed > 0 ? ` · ${elapsed}s` : ""}`
                 : state === "done"
-                ? `${totalScanned} scanned · ${qualified} qualified · ${picks} picks · ${elapsed}s`
+                ? `${totalScanned}/${totalExpected} scanned · ${qualified} qualified · ${picks} picks · ${elapsed}s`
                 : state === "error" ? errorMsg.slice(0, 60)
                 : "Vector + Nova · full universe · live data"}
             </div>
@@ -2590,7 +2599,7 @@ export default function App() {
   const aggregateBuyPicks = allStrategySelected
     ? averagePicksByTicker(strategyPreviewRows, activeVariantBrain).filter(pick => !activeOpenTickers.has(pick.ticker))
     : null;
-  const activeBuyPicks = aggregateBuyPicks || allBuyPicks;
+  const activeBuyPicks = (aggregateBuyPicks || allBuyPicks).filter(pick => !activeOpenTickers.has(pick.ticker));
   const buyVisible = buyListExpanded ? activeBuyPicks : activeBuyPicks.slice(0, 20);
   const sellVisible = sellListExpanded ? sortedOpenFilteredPositions : sortedOpenFilteredPositions.slice(0, 20);
   const monitorUpdated = Number(monitorStatus?.updated_count || 0);
@@ -2771,8 +2780,8 @@ export default function App() {
         ::-webkit-scrollbar{width:0}
         @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
         .fadeIn{animation:fadeUp .2s ease}
-        @keyframes tagGlow{0%{box-shadow:none;opacity:1}50%{box-shadow:0 0 4px 1px currentColor;opacity:0.85}100%{box-shadow:none;opacity:1}}
-        .tag-glow{animation:tagGlow 0.9s ease-in-out 0.25s}
+        @keyframes tagGlow{0%{filter:none;opacity:1}50%{filter:drop-shadow(0 0 5px currentColor) drop-shadow(0 0 2px currentColor);opacity:.96}100%{filter:none;opacity:1}}
+        .tag-glow{animation:tagGlow 0.9s ease-in-out 0.25s;position:relative;z-index:2}
       `}</style>
 
       <TickerBanner openPositions={openPositions} />
@@ -3007,7 +3016,7 @@ export default function App() {
             {/* PICKS TAB */}
             {longSub === "buy" && (
               <>
-                {allBuyPicks.length === 0 ? (
+                {activeBuyPicks.length === 0 ? (
                   <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 20, fontSize: 13, color: T3, textAlign: "center" }}>
                     {portfolioTab === "neural" ? "Nova picks appear after the shared comprehensive snapshot is scored." : "No picks yet — shared scans run throughout active market windows."}
                   </div>
@@ -3668,15 +3677,6 @@ export default function App() {
             const avgMissHeld = avgHeldDays(misses);
             const avgAllHeld = avgHeldDays(closedTrades);
 
-            // Sector breakdown
-            const sectorMap = {};
-            closedTrades.forEach(t => {
-              const s = t.sector || "Other";
-              if (!sectorMap[s]) sectorMap[s] = { hits: 0, total: 0 };
-              sectorMap[s].total++;
-              if (t.outcome === "hit") sectorMap[s].hits++;
-            });
-
             return (
               <div>
                 <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8, marginBottom: 10 }}>Performance</div>
@@ -3710,28 +3710,6 @@ export default function App() {
                           <div style={{ fontSize: 14, fontWeight: 600, color }}>{value.toFixed(1)}d</div>
                         </div>
                       ))}
-                    </div>
-                  </div>
-                )}
-
-                {Object.keys(sectorMap).length > 0 && (
-                  <div style={{ marginBottom: 16 }}>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8, marginBottom: 8 }}>Win rate by sector</div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                      {Object.entries(sectorMap).sort((a, b) => b[1].total - a[1].total).map(([sector, data]) => {
-                        const wr = Math.round(data.hits / data.total * 100);
-                        return (
-                          <div key={sector} style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "8px 12px" }}>
-                            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                              <span style={{ fontSize: 11, color: T1 }}>{sector}</span>
-                              <span style={{ fontSize: 11, fontWeight: 600, color: wr >= 60 ? GREEN : wr >= 45 ? AMBER : RED }}>{wr}% ({data.hits}/{data.total})</span>
-                            </div>
-                            <div style={{ height: 2, background: BORDER, borderRadius: 1, overflow: "hidden" }}>
-                              <div style={{ width: `${wr}%`, height: "100%", background: wr >= 60 ? GREEN : wr >= 45 ? AMBER : RED }} />
-                            </div>
-                          </div>
-                        );
-                      })}
                     </div>
                   </div>
                 )}

@@ -4844,7 +4844,10 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         source="shared_comprehensive_scan",
         started=True,
         already_running=False,
-        total_scanned=len(price_data),
+        total_scanned=0,
+        total_expected=len(universe),
+        scanned_tickers=[],
+        current_ticker=None,
         phase="scoring",
         scan_event_id=scan_event_id,
         error=None,
@@ -4897,7 +4900,19 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
     all_open_tickers = open_long_tickers | open_short_tickers
 
     scored_stocks = []
-    for ticker in universe:
+    scanned_tickers = []
+    for idx, ticker in enumerate(universe, start=1):
+        scanned_tickers.append(ticker)
+        if idx == 1 or idx % 5 == 0 or idx == len(universe):
+            record_nn_scan_status(
+                status="running",
+                phase="scoring",
+                scan_event_id=scan_event_id,
+                total_scanned=idx,
+                total_expected=len(universe),
+                current_ticker=ticker,
+                scanned_tickers=scanned_tickers[-40:],
+            )
         if ticker not in price_data:
             continue
         # Skip tickers with open positions — they're already committed
