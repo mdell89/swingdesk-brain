@@ -168,6 +168,7 @@ EvidenceBadge.displayName = "EvidenceBadge";
 function EvidenceBadgeCompact({ evidence }) {
   if (!evidence) return null;
   const level = evidence.level || "New";
+  if (level === "New") return null;
   const color = evidenceColor(level);
   const title = evidence.description || `Evidence: ${level}`;
   return (
@@ -756,7 +757,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
           {pick.confluence_count > 0 && (
             <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center", flexShrink: 0 }}>{pick.confluence_count}/10</span>
           )}
-          {onAddToPersonal && <JournalButton
+          {false && onAddToPersonal && <JournalButton
             compact
             state={journalAdded}
             onClick={(e) => {
@@ -958,14 +959,23 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
     clearTimeout(longPressTimer.current);
   };
 
-  const buyPrice = trade.buy_price || 0;
-  const investedAmount = trade.invested_amount || 10;
-  const currentValue = trade.current_value || investedAmount;
-  const rawPnlPercent = trade.current_pnl_percent != null ? trade.current_pnl_percent :
-    (buyPrice > 0 ? (currentValue - investedAmount) / investedAmount * 100 : 0);
+  const buyPrice = Number(trade.buy_price || trade.entry_price || 0);
+  const investedAmount = Number(trade.invested_amount || 10);
+  const currentPrice = Number(trade.current_price || trade.last_price || trade.price || 0);
+  const currentValue = Number(
+    trade.current_value ??
+    trade.gross_current_value ??
+    (currentPrice && buyPrice > 0 ? investedAmount * (currentPrice / buyPrice) : investedAmount)
+  );
+  const rawPnlPercent = trade.current_pnl_percent != null ? Number(trade.current_pnl_percent) :
+    trade.actual_move != null ? Number(trade.actual_move) :
+    (buyPrice > 0 && currentPrice > 0 ? (currentPrice - buyPrice) / buyPrice * 100 :
+      (currentValue - investedAmount) / investedAmount * 100);
   // Clamp -0 to 0 to avoid negative zero display
   const pnlPercent = rawPnlPercent === 0 ? 0 : (Math.abs(rawPnlPercent) < 0.005 ? 0 : rawPnlPercent);
-  const rawPnlDollars = currentValue - investedAmount;
+  const rawPnlDollars = trade.current_pnl_dollars != null ? Number(trade.current_pnl_dollars) :
+    trade.gross_pnl != null ? Number(trade.gross_pnl) :
+    (currentValue - investedAmount);
   const pnlDollars = Math.abs(rawPnlDollars) < 0.005 ? 0 : rawPnlDollars;
   const isPositive = isLong ? pnlPercent >= 0 : pnlPercent <= 0;
   const pnlColor = pnlPercent === 0 ? T2 : (isPositive ? GREEN : RED);
@@ -974,7 +984,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
   const frozenConfidence = Number(trade.confidence) || 0;
   const dynamicConfidence = Number(trade.dynamic_confidence) || frozenConfidence;
   const dynamicEstimate = Number(trade.dynamic_estimate) || frozenTarget;
-  const currentPrice = trade.current_value && investedAmount > 0 ? (trade.current_value / investedAmount) * buyPrice : null;
+  const displayCurrentPrice = currentPrice || (currentValue && investedAmount > 0 ? (currentValue / investedAmount) * buyPrice : null);
   const lockInConfidence = Number(trade.lock_in_confidence) || frozenConfidence;
   const confDelta = dynamicConfidence - lockInConfidence;
   const confDeltaColor = confDelta > 0 ? GREEN : confDelta < 0 ? RED : T3;
@@ -1044,8 +1054,8 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
           <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 14, fontWeight: 600, color: T1, lineHeight: 1.2 }}>{trade.ticker}</span>
           {trade.name && trade.name !== trade.ticker && <span style={{ fontSize: 9, color: T3, lineHeight: 1.2, marginTop: 1 }}>{trade.name}</span>}
         </div>
-        <div style={{ fontSize: 11, fontWeight: 600, color: (() => { const d = Number(trade.day_change_percent) || 0; return d > 0 ? GREEN : d < 0 ? RED : T3; })(), fontFamily: "'DM Mono',monospace", textAlign: "center" }}>
-          {(() => { const d = Number(trade.day_change_percent) || 0; return `${d >= 0 ? "+" : ""}${d.toFixed(1)}%`; })()}
+        <div style={{ fontSize: 11, fontWeight: 600, color: (() => { const d = Number(trade.day_change_percent ?? trade.day_change_pct ?? trade.pct_change_prev_close ?? trade.pct_change_regular_open ?? pnlPercent) || 0; return d > 0 ? GREEN : d < 0 ? RED : T3; })(), fontFamily: "'DM Mono',monospace", textAlign: "center" }}>
+          {(() => { const d = Number(trade.day_change_percent ?? trade.day_change_pct ?? trade.pct_change_prev_close ?? trade.pct_change_regular_open ?? pnlPercent) || 0; return `${d >= 0 ? "+" : ""}${d.toFixed(1)}%`; })()}
         </div>
         <SpineCell>
           <SpinePercent value={pnlPercent} color={pnlColor} fontSize={12} />
@@ -1088,7 +1098,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
               DONE
             </button>
           )}
-          {onAddToPersonal && <JournalButton
+          {false && onAddToPersonal && <JournalButton
             compact
             state={journalAdded}
             onClick={(e) => {
@@ -1116,7 +1126,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
               ["Held", `${daysHeld(trade.buy_date)}d`],
               ["Opened", formatDate(trade.buy_date)],
               ["Entry price", `$${buyPrice.toFixed(2)}`],
-              ["Current price", currentPrice ? `$${currentPrice.toFixed(2)}` : "—"],
+              ["Current price", displayCurrentPrice ? `$${displayCurrentPrice.toFixed(2)}` : "—"],
               ["Entry estimate", `+${frozenTarget.toFixed(1)}%`],
               ["Current estimate", `+${dynamicEstimate.toFixed(1)}%`],
               ["Entry confidence", `${frozenConfidence}%`],
@@ -2232,6 +2242,19 @@ export default function App() {
   const variantOptions = variantLeaderboard.filter(v => v.brain === activeVariantBrain && v.strategy === selectedStrategy);
   const renderPortfolioControls = (padded = true) => (
     <div style={{ padding: padded ? "0 16px 14px" : "0 0 14px" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginBottom: 6 }}>
+        {[
+          ["brain", "Vector", BLUE],
+          ["neural", "Nova", "#a78bfa"],
+        ].map(([id, label, color]) => (
+          <button key={id} onClick={() => setPortfolioTab(id)} style={{
+            padding: "7px 0", borderRadius: 7, fontSize: 11, fontWeight: 800,
+            border: `1px solid ${portfolioTab === id ? color + "66" : BORDER}`,
+            cursor: "pointer", letterSpacing: .4, background: portfolioTab === id ? color + "18" : "transparent",
+            color: portfolioTab === id ? color : T3,
+          }}>{label}</button>
+        ))}
+      </div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 6 }}>
       <label style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, height: 32, border: `1px solid ${BORDER}`, borderRadius: 8, background: CARD, padding: "0 9px" }}>
         <span style={{ fontSize: 9, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6, flexShrink: 0 }}>Strategy:</span>
@@ -2247,21 +2270,8 @@ export default function App() {
           style={{ minWidth: 0, width: "100%", border: "none", outline: "none", background: "transparent", color: T1, fontSize: 12, fontWeight: 800, cursor: "pointer", appearance: "none" }}>
           {variantOptions.map(v => <option key={v.id} value={v.id} style={{ background: "#111", color: T1 }}>{v.selection_mode || v.execution_time || v.id}</option>)}
         </select>
-        <span aria-hidden="true" style={{ color: T3, fontSize: 10, flexShrink: 0 }}>â–¼</span>
+        <span aria-hidden="true" style={{ color: T3, fontSize: 10, flexShrink: 0 }}>▼</span>
       </label>
-      </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
-        {[
-          ["brain", "Vector", BLUE],
-          ["neural", "Nova", "#a78bfa"],
-        ].map(([id, label, color]) => (
-          <button key={id} onClick={() => setPortfolioTab(id)} style={{
-            padding: "7px 0", borderRadius: 7, fontSize: 11, fontWeight: 800,
-            border: `1px solid ${portfolioTab === id ? color + "66" : BORDER}`,
-            cursor: "pointer", letterSpacing: .4, background: portfolioTab === id ? color + "18" : "transparent",
-            color: portfolioTab === id ? color : T3,
-          }}>{label}</button>
-        ))}
       </div>
     </div>
   );
