@@ -4953,13 +4953,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
 
     # Check if queue is locked (post 8:25 AM CST)
     # If locked, scan still runs for monitoring purposes but no new picks enter the queue
-    try:
-        _db = get_database()
-        _lock = _db.execute("SELECT value FROM app_state WHERE key='queue_locked'").fetchone()
-        queue_is_locked = _lock and _lock["value"] == "true"
-        _db.close()
-    except:
-        queue_is_locked = False
+    queue_is_locked = is_pick_queue_locked()
 
     if queue_is_locked and scan_type not in ("manual", "manual_fresh", "manual_shared", "manual_shared_nova"):
         log.info(f"Queue locked — scan completed but no new picks added ({scan_type})")
@@ -5795,6 +5789,27 @@ def unlock_pick_queue():
         log.info("Pick queue unlocked — pre-market scanning resumed")
     except Exception as e:
         log.error(f"Queue unlock error: {e}")
+
+def is_pick_queue_locked():
+    """Return queue lock state, auto-healing stale locks before the 8:25 AM cutoff."""
+    now = current_time_cst()
+    cutoff = now.replace(hour=8, minute=25, second=0, microsecond=0)
+    if now < cutoff:
+        try:
+            database = get_database()
+            database.execute("INSERT OR REPLACE INTO app_state VALUES ('queue_locked', 'false')")
+            database.commit()
+            database.close()
+        except Exception:
+            pass
+        return False
+    try:
+        database = get_database()
+        row = database.execute("SELECT value FROM app_state WHERE key='queue_locked'").fetchone()
+        database.close()
+        return bool(row and row["value"] == "true")
+    except Exception:
+        return False
 
 
 def _execute_opening_positions_legacy():
