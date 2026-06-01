@@ -829,6 +829,9 @@ def initialize_database():
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT NOT NULL,
+            audit_success INTEGER DEFAULT 1,
+            audit_provider TEXT,
+            provider_attempts TEXT,
             weights_before TEXT,
             weights_after TEXT,
             reasoning TEXT,
@@ -1245,6 +1248,27 @@ def initialize_database():
             database.execute(f"ALTER TABLE weights_history ADD COLUMN {wh_col}")
         except:
             pass  # Column already exists
+
+    # Add audit proof fields if upgrading from the earlier trust-me audit ledger.
+    for audit_col in [
+        "audit_success INTEGER DEFAULT 1",
+        "audit_provider TEXT",
+        "provider_attempts TEXT",
+    ]:
+        try:
+            database.execute(f"ALTER TABLE audit_log ADD COLUMN {audit_col}")
+        except:
+            pass  # Column already exists
+    try:
+        database.execute("""
+            UPDATE audit_log
+            SET audit_success=0
+            WHERE lower(COALESCE(summary, '')) LIKE 'audit failed:%'
+               OR lower(COALESCE(summary, '')) LIKE '%no configured llm provider%'
+               OR lower(COALESCE(summary, '')) LIKE 'local audit recorded%'
+        """)
+    except:
+        pass
 
     # Add new columns to virtual_trades if upgrading from earlier schema
     for column_definition in [
@@ -7018,10 +7042,12 @@ def run_self_audit():
         ts = current_time_cst().isoformat()
         database = get_database()
         database.execute("""
-            INSERT INTO audit_log (timestamp, weights_before, weights_after, reasoning, summary,
+            INSERT INTO audit_log (timestamp, audit_success, audit_provider, provider_attempts,
+            weights_before, weights_after, reasoning, summary,
             total_predictions, resolved_count, hit_count, miss_count, win_rate)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-        """, [ts, json.dumps(current_weights), json.dumps(new_weights),
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, [ts, 1, provider, json.dumps(provider_attempts),
+              json.dumps(current_weights), json.dumps(new_weights),
               json.dumps(result.get("reasoning", [])), result.get("summary", ""),
               total_predictions, len(resolved_predictions), len(hit_predictions),
               len(miss_predictions), win_rate])
@@ -7064,10 +7090,12 @@ def run_self_audit():
         ts = current_time_cst().isoformat()
         database = get_database()
         database.execute("""
-            INSERT INTO audit_log (timestamp, weights_before, weights_after, reasoning, summary,
+            INSERT INTO audit_log (timestamp, audit_success, audit_provider, provider_attempts,
+            weights_before, weights_after, reasoning, summary,
             total_predictions, resolved_count, hit_count, miss_count, win_rate)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-        """, [ts, json.dumps(current_weights), json.dumps(current_weights),
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, [ts, 0, None, json.dumps(provider_attempts),
+              json.dumps(current_weights), json.dumps(current_weights),
               json.dumps(provider_attempts), failure_summary,
               total_predictions, len(resolved_predictions), len(hit_predictions),
               len(miss_predictions), win_rate])
@@ -7592,6 +7620,20 @@ def api_audit_log():
         "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT 30"
     ).fetchall()]
     database.close()
+    for row in rows:
+        summary = (row.get("summary") or "").lower()
+        if summary.startswith("audit failed:") or summary.startswith("local audit recorded") or "no configured llm provider" in summary:
+            row["audit_success"] = 0
+        try:
+            before = normalize_signal_weights(json.loads(row.get("weights_before") or "{}"))
+            after = normalize_signal_weights(json.loads(row.get("weights_after") or "{}"))
+            row["weights_changed"] = any(abs(before.get(k, 0) - after.get(k, 0)) > 0.000001 for k in canonical_signal_weights())
+        except Exception:
+            row["weights_changed"] = None
+        try:
+            row["provider_attempts"] = json.loads(row.get("provider_attempts") or "[]")
+        except Exception:
+            row["provider_attempts"] = []
     return jsonify(rows)
 
 @app.route("/api/perf-history")
@@ -7889,6 +7931,9 @@ def api_stats():
     total_predictions = database.execute("SELECT COUNT(*) as n FROM predictions").fetchone()["n"]
 
     last_audit = database.execute("SELECT value FROM app_state WHERE key='last_audit'").fetchone()
+    last_audit_row = database.execute(
+        "SELECT audit_success, audit_provider FROM audit_log ORDER BY timestamp DESC LIMIT 1"
+    ).fetchone()
     last_scan = database.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
     database.close()
 
@@ -7905,6 +7950,8 @@ def api_stats():
         "virtual_trades": virtual_trade_count,
         "virtual_open": open_position_count,
         "last_audit": last_audit["value"] if last_audit else None,
+        "last_audit_success": bool(last_audit_row["audit_success"]) if last_audit_row else None,
+        "last_audit_provider": last_audit_row["audit_provider"] if last_audit_row else None,
         "last_scan": last_scan["value"] if last_scan else None,
         "weights": get_signal_weights(),
         "queue": get_queue_status(),

@@ -1706,6 +1706,8 @@ export default function App() {
   const [auditLog, setAuditLog] = useState([]);
   const [perfHistory, setPerfHistory] = useState([]);
   const [lastAudit, setLastAudit] = useState(null);
+  const [lastAuditSuccess, setLastAuditSuccess] = useState(null);
+  const [lastAuditProvider, setLastAuditProvider] = useState(null);
   const [lastScan, setLastScan] = useState(null);
   const [totalScanned, setTotalScanned] = useState(0);
   const [queueStatus, setQueueStatus] = useState(null);
@@ -1942,6 +1944,8 @@ export default function App() {
         setExtendedRunners(runnersData);
         setWeights(statsData.weights || {});
         setLastAudit(statsData.last_audit || null);
+        setLastAuditSuccess(statsData.last_audit_success ?? null);
+        setLastAuditProvider(statsData.last_audit_provider || null);
         setQueueStatus(statsData.queue || null);
         setOpenExecution(statsData.open_execution || null);
         setPdtUsed(statsData.pdt_used || 0);
@@ -3712,8 +3716,14 @@ export default function App() {
           {tabLoading && <div style={{ textAlign: "center", padding: 20, fontSize: 11, color: T3 }}>Loading...</div>}
           <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
             <div style={{ fontSize: 14, fontWeight: 600, color: T1, marginBottom: 4 }}>Self-audit engine</div>
-            <div style={{ fontSize: 10, color: T3 }}>{lastAudit ? `Last audit: ${new Date(lastAudit).toLocaleString()}` : "No completed audits yet."}</div>
-            <div style={{ fontSize: 10, color: T3, marginTop: 2 }}>Fully automated. No manual intervention needed.</div>
+            <div style={{ fontSize: 10, color: T3 }}>{lastAudit ? `Last audit attempt: ${new Date(lastAudit).toLocaleString()}` : "No audit attempts yet."}</div>
+            <div style={{ fontSize: 10, color: lastAuditSuccess === false ? RED : T3, marginTop: 2 }}>
+              {lastAuditSuccess === false
+                ? "Last audit failed. No weights were changed."
+                : lastAuditProvider
+                  ? `Last successful provider: ${lastAuditProvider}`
+                  : "LLM-driven only. If every provider fails, weights remain unchanged."}
+            </div>
           </div>
 
           {/* Audit history */}
@@ -3743,20 +3753,49 @@ export default function App() {
                   <div style={{ paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
                     {auditLog.slice(0, 10).map((entry, i) => {
                       const reasoning = (() => {
-                        try { return JSON.parse(entry.reasoning || "[]"); } catch { return []; }
+                        try {
+                          const parsed = JSON.parse(entry.reasoning || "[]");
+                          return Array.isArray(parsed) ? parsed : [parsed];
+                        } catch {
+                          return entry.reasoning ? [entry.reasoning] : [];
+                        }
                       })();
+                      const attempts = Array.isArray(entry.provider_attempts) ? entry.provider_attempts : (() => {
+                        try {
+                          const parsed = JSON.parse(entry.provider_attempts || "[]");
+                          return Array.isArray(parsed) ? parsed : [parsed];
+                        } catch {
+                          return [];
+                        }
+                      })();
+                      const auditSucceeded = entry.audit_success === undefined || entry.audit_success === null ? true : Boolean(Number(entry.audit_success));
                       return (
                       <div key={entry.id || i} style={{ fontSize: 9, color: T1, padding: "6px 0", borderBottom: i < auditLog.length - 1 ? `1px solid ${BORDER}` : "none", lineHeight: 1.6 }}>
                         <div style={{ fontSize: 8, color: T3, marginBottom: 3 }}>{new Date(entry.timestamp).toLocaleString()}</div>
+                        <div style={{ color: auditSucceeded ? GREEN : RED, marginBottom: 3, fontWeight: 700 }}>
+                          {auditSucceeded
+                            ? `LLM audit passed${entry.audit_provider ? ` via ${entry.audit_provider}` : ""}${entry.weights_changed === false ? " (weights unchanged)" : ""}`
+                            : "LLM audit failed. Weights unchanged."}
+                        </div>
                         <div style={{ color: T2, marginBottom: 4 }}>{entry.summary || "Audit recorded."}</div>
                         <div style={{ display: "flex", gap: 8, color: T3, fontFamily: "'DM Mono',monospace", marginBottom: reasoning.length ? 4 : 0 }}>
                           <span>{entry.resolved_count || 0} resolved</span>
                           <span>{entry.hit_count || 0} hits</span>
                           <span>{entry.win_rate != null ? `${Math.round(Number(entry.win_rate) * 100)}%` : "-"} win</span>
                         </div>
-                        {reasoning.slice(0, 2).map((line, idx) => (
-                          <div key={idx} style={{ color: T2 }}>• {line}</div>
-                        ))}
+                        {reasoning.slice(0, 2).map((line, idx) => {
+                          const text = typeof line === "string"
+                            ? line
+                            : line && typeof line === "object"
+                              ? `${line.provider || "provider"}: ${line.error || line.summary || "failed"}`
+                              : String(line ?? "");
+                          return <div key={idx} style={{ color: T2 }}>- {text}</div>;
+                        })}
+                        {!auditSucceeded && attempts.length > 0 && (
+                          <div style={{ color: T3, marginTop: 4 }}>
+                            Attempts: {attempts.slice(0, 4).map(a => `${a.provider}: ${a.error || "failed"}`).join(" | ")}
+                          </div>
+                        )}
                       </div>
                     );})}
                   </div>
