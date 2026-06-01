@@ -7002,73 +7002,51 @@ def audit_llm_chain(prompt):
             log.warning(f"Audit provider {name} failed: {error}")
     raise RuntimeError(json.dumps(attempts))
 
-def build_variant_audit_prompt(variant_id, variant_label, current_weights, resolved_trades, win_rate, closed_days_summary):
-    signals = ["rsi_momentum","volume_surge","overnight_gap_probability","earnings_catalyst",
-               "support_resistance","relative_strength","sector_relative_strength",
-               "vwap_reclaim","volatility_squeeze"]
-    indicator_stats = {}
-    for trade in resolved_trades:
-        reasoning_raw = (trade.get("reasoning") or "").lower()
-        scores_raw = {}
-        try:
-            blob = json.loads(trade.get("signal_scores") or "{}")
-            scores_raw = blob.get("scores", blob) if isinstance(blob, dict) else {}
-        except Exception:
-            pass
-        for signal in signals:
-            if signal in reasoning_raw or signal.replace("_"," ") in reasoning_raw or signal in scores_raw:
-                if signal not in indicator_stats:
-                    indicator_stats[signal] = {"hits":0,"misses":0,"scores":[],"moves":[]}
-                if trade.get("outcome") == "hit":
-                    indicator_stats[signal]["hits"] += 1
-                elif trade.get("outcome") == "miss":
-                    indicator_stats[signal]["misses"] += 1
-                if signal in scores_raw:
-                    try: indicator_stats[signal]["scores"].append(float(scores_raw[signal]))
-                    except Exception: pass
-                try: indicator_stats[signal]["moves"].append(float(trade.get("actual_move") or 0))
-                except Exception: pass
-    for k in indicator_stats:
-        t = indicator_stats[k]["hits"] + indicator_stats[k]["misses"]
-        indicator_stats[k]["win_rate"] = round(indicator_stats[k]["hits"]/t, 2) if t else None
-        indicator_stats[k]["sample_size"] = t
-        sc = indicator_stats[k].pop("scores")
-        mv = indicator_stats[k].pop("moves")
-        indicator_stats[k]["avg_signal_score"] = round(sum(sc)/len(sc), 2) if sc else None
-        indicator_stats[k]["avg_actual_move_pct"] = round(sum(mv)/len(mv), 2) if mv else None
+def build_variant_summary_prompt(variant_summaries):
+    """Build a prompt asking the LLM to explain what the ML already did — read only."""
+    lines = []
+    for v in variant_summaries:
+        if not v.get("recent_events"):
+            continue
+        lines.append(f"\nVariant: {v['label']}")
+        lines.append(f"  Current weights: {json.dumps({k: f'{round(val*100)}%' for k,val in v['weights'].items()})}")
+        lines.append(f"  Recent ML adjustments ({len(v['recent_events'])} events):")
+        for ev in v["recent_events"][:5]:
+            diffs = []
+            for k in v["weights"]:
+                b = round((ev["weights_before"].get(k,0))*100)
+                a = round((ev["weights_after"].get(k,0))*100)
+                if abs(a-b) > 0:
+                    diffs.append(f"{k}: {b}%→{a}%")
+            lines.append(f"    [{ev['outcome'].upper()} {ev['actual_move']:+.1f}%] {', '.join(diffs) or 'no change'}")
+            for r in (ev.get("reasoning") or [])[:2]:
+                lines.append(f"      reasoning: {r}")
 
-    w = {k: f"{round(v*100)}%" for k,v in current_weights.items()}
-    wr_pct = f"{round(win_rate*100)}%" if win_rate else "N/A"
-    hits = sum(1 for t in resolved_trades if t.get("outcome")=="hit")
-    misses = sum(1 for t in resolved_trades if t.get("outcome")=="miss")
+    data_block = "\n".join(lines) if lines else "No recent ML activity."
 
-    return f"""You are auditing signal weights for variant: {variant_label} (id: {variant_id})
-
-CURRENT WEIGHTS:
-{json.dumps(w, indent=2)}
-
-PERFORMANCE ({len(resolved_trades)} resolved trades): win_rate={wr_pct} ({hits} hits, {misses} misses)
-HOLD DURATION: {json.dumps(closed_days_summary)}
-PER-SIGNAL DATA: {json.dumps(indicator_stats, indent=2)}
-
-RULES: weights sum to 1.0, each 0.03-0.35. Only change a signal if sample_size >= 5.
-
-Respond ONLY with valid JSON (no markdown):
-{{
-  "weights": {{"rsi_momentum":0.XX,"volume_surge":0.XX,"overnight_gap_probability":0.XX,"earnings_catalyst":0.XX,"support_resistance":0.XX,"relative_strength":0.XX,"sector_relative_strength":0.XX,"vwap_reclaim":0.XX,"volatility_squeeze":0.XX}},
-  "reasoning": ["signal: win_rate=X% on N trades, weight X%->X% because [data reason]"],
-  "summary": "2 sentences referencing actual numbers",
-  "confidence": "low|medium|high"
-}}"""
+    return (
+        "The following shows recent machine learning weight adjustments made automatically by the "
+        "SwingDesk trading algorithm. Each adjustment happened when a trade closed — "
+        "winning trades rewarded signals that fired, losing trades penalized them.\n\n"
+        f"{data_block}\n\n"
+        "In 3-5 sentences, explain in plain English what patterns the ML is learning. "
+        "Which signals are being consistently rewarded or penalized? What does this suggest "
+        "about current market conditions? Be specific and reference the actual variants and signals. "
+        "Do NOT suggest changes — just explain what already happened.\n\n"
+        'Respond with JSON: {"summary": "your explanation here", "confidence": "low|medium|high"}'
+    )
 
 
 def run_self_audit():
-    """Run per-variant LLM audit for all active variants."""
-    log.info("Running self-audit for all active variants...")
+    """Read-only audit: summarize what the ML already did. Never writes weights."""
+    log.info("Running read-only self-audit — summarizing ML learning events...")
     db = get_database()
+
+    # Get all active variants
     variant_rows = [dict(r) for r in db.execute(
         "SELECT id, strategy, brain, label FROM strategy_variants WHERE status='active' ORDER BY id"
     ).fetchall()]
+
     global_resolved = [dict(p) for p in db.execute(
         "SELECT * FROM predictions WHERE outcome != 'pending' ORDER BY date DESC LIMIT 200"
     ).fetchall()]
@@ -7076,78 +7054,83 @@ def run_self_audit():
     global_hits = [p for p in global_resolved if p["outcome"] == "hit"]
     global_misses = [p for p in global_resolved if p["outcome"] == "miss"]
     global_win_rate = len(global_hits)/len(global_resolved) if global_resolved else None
-    closed_days_rows = db.execute("""
-        SELECT closed_days, COUNT(*) as count, AVG(COALESCE(actual_move,0)) as avg_move,
-               SUM(CASE WHEN outcome='hit' THEN 1 ELSE 0 END) as hits
-        FROM virtual_trades WHERE outcome != 'open' AND closed_days IS NOT NULL
-        GROUP BY closed_days ORDER BY closed_days
-    """).fetchall()
-    closed_days_summary = [dict(r) for r in closed_days_rows]
     db.close()
 
-    variant_results = []
-    any_success = False
-    ts = current_time_cst().isoformat()
-
+    # Build per-variant summaries from recent learning events
+    variant_summaries = []
     for variant in variant_rows:
-        variant_id = variant["id"]
-        variant_label = variant.get("label") or variant_id
-        log.info(f"Auditing variant: {variant_label}")
+        vid = variant["id"]
         db2 = get_database()
-        resolved = [dict(r) for r in db2.execute(
-            "SELECT * FROM variant_virtual_trades WHERE variant_id=? AND outcome IN ('hit','miss') ORDER BY sell_date DESC LIMIT 100",
-            [variant_id]
+        events = [dict(r) for r in db2.execute(
+            "SELECT * FROM variant_learning_events WHERE variant_id=? ORDER BY timestamp DESC LIMIT 10",
+            [vid]
         ).fetchall()]
-        current_weights = get_variant_signal_weights(db2, variant_id)
+        current_weights = get_variant_signal_weights(db2, vid)
         db2.close()
 
-        if len(resolved) < 3:
-            variant_results.append({"variant_id":variant_id,"variant_label":variant_label,
-                "success":False,"skipped":True,"weights_before":current_weights,"weights_after":current_weights,
-                "reasoning":[],"summary":f"Skipped: only {len(resolved)} resolved trades"})
-            continue
+        parsed_events = []
+        for ev in events:
+            try:
+                wb = json.loads(ev.get("weights_before") or "{}")
+                wa = json.loads(ev.get("weights_after") or "{}")
+                reasoning = json.loads(ev.get("reasoning") or "[]")
+                parsed_events.append({**ev, "weights_before": wb, "weights_after": wa, "reasoning": reasoning})
+            except Exception:
+                pass
 
-        hits = [t for t in resolved if t["outcome"]=="hit"]
-        win_rate = len(hits)/len(resolved) if resolved else None
-        prompt = build_variant_audit_prompt(variant_id, variant_label, current_weights, resolved, win_rate, closed_days_summary)
+        if parsed_events:
+            variant_summaries.append({
+                "id": vid,
+                "label": variant.get("label") or vid,
+                "weights": current_weights,
+                "recent_events": parsed_events,
+            })
 
+    ts = current_time_cst().isoformat()
+
+    if not variant_summaries:
+        summary_text = "No ML learning events recorded yet. Weights will update automatically as trades close."
+        provider = None
+        result_summary = summary_text
+        confidence = "low"
+    else:
+        prompt = build_variant_summary_prompt(variant_summaries)
         try:
-            provider, result, provider_attempts = audit_llm_chain(prompt)
-            new_weights = normalize_signal_weights(result["weights"])
-            db3 = get_database()
-            db3.execute("UPDATE variant_signal_weights SET weights_json=?, updated_at=? WHERE variant_id=?",
-                        [json.dumps(new_weights), ts, variant_id])
-            db3.commit()
-            db3.close()
-            any_success = True
-            variant_results.append({"variant_id":variant_id,"variant_label":variant_label,
-                "success":True,"provider":provider,"weights_before":current_weights,"weights_after":new_weights,
-                "reasoning":result.get("reasoning",[]),"summary":result.get("summary",""),"confidence":result.get("confidence","medium")})
-            log.info(f"Variant {variant_label} audit complete via {provider}")
+            provider, result, _ = audit_llm_chain(prompt)
+            result_summary = result.get("summary", "ML audit complete.")
+            confidence = result.get("confidence", "medium")
         except Exception as e:
-            log.warning(f"Audit failed for variant {variant_label}: {e}")
-            variant_results.append({"variant_id":variant_id,"variant_label":variant_label,
-                "success":False,"error":str(e)[:200],"weights_before":current_weights,"weights_after":current_weights,
-                "reasoning":[],"summary":f"Failed: {str(e)[:100]}"})
+            log.warning(f"LLM summary failed: {e}")
+            provider = None
+            result_summary = f"ML is actively learning. {sum(len(v['recent_events']) for v in variant_summaries)} weight adjustments recorded across {len(variant_summaries)} variants in recent history."
+            confidence = "low"
 
-    db4 = get_database()
-    db4.execute("""INSERT INTO audit_log (timestamp,audit_success,audit_provider,provider_attempts,
-        weights_before,weights_after,reasoning,summary,total_predictions,resolved_count,hit_count,miss_count,win_rate)
+    # Snapshot current weights for the audit log (read-only — never writes to variant_signal_weights)
+    weights_snapshot = {v["id"]: v["weights"] for v in variant_summaries}
+
+    db3 = get_database()
+    db3.execute("""INSERT INTO audit_log
+        (timestamp, audit_success, audit_provider, provider_attempts,
+         weights_before, weights_after, reasoning, summary,
+         total_predictions, resolved_count, hit_count, miss_count, win_rate)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        [ts, 1 if any_success else 0,
-         next((r.get("provider") for r in variant_results if r.get("success")), None),
-         json.dumps([]),
-         json.dumps({r["variant_id"]:r["weights_before"] for r in variant_results}),
-         json.dumps({r["variant_id"]:r["weights_after"] for r in variant_results}),
-         json.dumps([f"{r['variant_label']}: {'; '.join(r.get('reasoning',[])[:2])}" for r in variant_results]),
-         f"Audited {len(variant_results)} variants. {sum(1 for r in variant_results if r.get('success'))} updated, {sum(1 for r in variant_results if r.get('skipped'))} skipped.",
+        [ts, 1, provider, json.dumps([]),
+         json.dumps(weights_snapshot), json.dumps(weights_snapshot),  # same — no change
+         json.dumps([f"{v['label']}: {len(v['recent_events'])} recent ML events" for v in variant_summaries]),
+         result_summary,
          global_total, len(global_resolved), len(global_hits), len(global_misses), global_win_rate])
-    db4.execute("INSERT OR REPLACE INTO app_state VALUES ('last_audit',?)", [ts])
-    db4.commit()
-    db4.close()
-    return {"success":any_success, "variant_results":variant_results,
-            "summary":f"Audited {len(variant_results)} variants.",
-            "provider":next((r.get("provider") for r in variant_results if r.get("success")),None)}
+    db3.execute("INSERT OR REPLACE INTO app_state VALUES ('last_audit',?)", [ts])
+    db3.commit()
+    db3.close()
+
+    return {
+        "success": True,
+        "summary": result_summary,
+        "provider": provider,
+        "confidence": confidence,
+        "variants_summarized": len(variant_summaries),
+        "note": "Read-only. ML weight updates happen automatically on trade close via learn_variant_from_closed_trade.",
+    }
 
 def run_scheduler():
     """

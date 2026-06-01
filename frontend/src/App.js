@@ -1841,7 +1841,7 @@ function AuditButton({ API, T1, T2, T3, BORDER, CARD, GREEN, AMBER, RED, onCompl
                 ? `${result.provider || "LLM"} · ${result.confidence || "?"} confidence`
                 : state === "error" && result
                 ? (result.summary || "Failed").slice(0, 70)
-                : "Analyzes recent trades and adjusts signal weights via LLM"}
+                : "Reads ML-adjusted weights and generates a human-readable summary — does not change weights"}
             </div>
           </div>
           <button onClick={trigger} disabled={state === "running"} style={{ background: state === "running" ? "transparent" : accent, border: `1.5px solid ${accent}`, borderRadius: 8, padding: "7px 14px", fontSize: 10, fontWeight: 700, color: state === "running" ? accent : "#000", cursor: state === "running" ? "default" : "pointer", fontFamily: "'DM Mono',monospace", letterSpacing: 1, whiteSpace: "nowrap", opacity: state === "running" ? 0.6 : 1 }}>
@@ -1889,6 +1889,7 @@ export default function App() {
   const [expandedMethods, setExpandedMethods] = useState({});
   const [weightsHistory, setWeightsHistory] = useState([]);
   const [auditLog, setAuditLog] = useState([]);
+  const [learningEvents, setLearningEvents] = useState([]);
   const [perfHistory, setPerfHistory] = useState([]);
   const [lastAudit, setLastAudit] = useState(null);
   const [lastAuditSuccess, setLastAuditSuccess] = useState(null);
@@ -2241,6 +2242,7 @@ export default function App() {
     }
     if (tab === "intel" && auditLog.length === 0) {
       apiFetch("/audit/log").then(data => setAuditLog(data || [])).catch(() => {});
+      apiFetch("/variant-learning-events?limit=200").then(data => setLearningEvents(data || [])).catch(() => {});
     }
     if (tab === "intel" && predictions.length === 0) {
       setTabLoading(true);
@@ -3975,60 +3977,42 @@ export default function App() {
                         {/* Weight diffs */}
                         {auditSucceeded && entry.weights_before && entry.weights_after && (() => {
                           const LABELS = { rsi_momentum: "RSI Momentum", volume_surge: "Volume Surge", overnight_gap_probability: "Overnight Gap", earnings_catalyst: "Earnings Catalyst", support_resistance: "S&R", relative_strength: "Relative Strength", sector_relative_strength: "Sector RS", vwap_reclaim: "VWAP Reclaim", volatility_squeeze: "Vol Squeeze" };
-                          let beforeRaw, afterRaw;
-                          try { beforeRaw = typeof entry.weights_before === "string" ? JSON.parse(entry.weights_before) : entry.weights_before; } catch { beforeRaw = {}; }
-                          try { afterRaw = typeof entry.weights_after === "string" ? JSON.parse(entry.weights_after) : entry.weights_after; } catch { afterRaw = {}; }
-                          // Detect per-variant format: keys are variant_ids whose values are objects
-                          const firstVal = Object.values(afterRaw || {})[0];
-                          const isPerVariant = firstVal && typeof firstVal === "object" && !Array.isArray(firstVal);
-                          const DiffRow = ({d}) => (
-                            <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 3 }}>
-                              <span style={{ fontSize: 8, color: T3, width: 86, flexShrink: 0 }}>{d.label}</span>
-                              <span style={{ fontSize: 8, fontFamily: "'DM Mono',monospace", color: T2 }}>{d.b}%</span>
-                              <span style={{ fontSize: 7, color: T3 }}>→</span>
-                              <span style={{ fontSize: 8, fontFamily: "'DM Mono',monospace", color: T2 }}>{d.a}%</span>
-                              <span style={{ fontSize: 9, fontFamily: "'DM Mono',monospace", fontWeight: 700, color: d.delta > 0 ? GREEN : RED, minWidth: 26 }}>{d.delta > 0 ? "+" : ""}{d.delta}%</span>
-                              <div style={{ flex: 1, height: 2, background: BORDER, borderRadius: 1, overflow: "hidden" }}>
-                                <div style={{ width: `${Math.min(d.a,100)}%`, height: "100%", background: d.delta > 0 ? GREEN : RED }} />
-                              </div>
+                          let before, after;
+                          try { before = typeof entry.weights_before === "string" ? JSON.parse(entry.weights_before) : entry.weights_before; } catch { before = {}; }
+                          try { after = typeof entry.weights_after === "string" ? JSON.parse(entry.weights_after) : entry.weights_after; } catch { after = {}; }
+                          const diffs = Object.keys(LABELS).map(k => {
+                            const b = Math.round((before[k] || 0) * 100);
+                            const a = Math.round((after[k] || 0) * 100);
+                            return { key: k, label: LABELS[k], b, a, delta: a - b };
+                          }).filter(d => d.delta !== 0).sort((x, y) => Math.abs(y.delta) - Math.abs(x.delta));
+                          if (!diffs.length) return <div style={{ fontSize: 8, color: T3, marginBottom: 4 }}>No weight changes this audit.</div>;
+                          return (
+                            <div style={{ marginBottom: 6 }}>
+                              {diffs.map(d => (
+                                <div key={d.key} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+                                  <span style={{ fontSize: 8, color: T3, minWidth: 90 }}>{d.label}</span>
+                                  <span style={{ fontSize: 9, fontFamily: "'DM Mono',monospace", color: T2 }}>{d.b}%</span>
+                                  <span style={{ fontSize: 8, color: T3 }}>→</span>
+                                  <span style={{ fontSize: 9, fontFamily: "'DM Mono',monospace", color: T2 }}>{d.a}%</span>
+                                  <span style={{ fontSize: 9, fontFamily: "'DM Mono',monospace", fontWeight: 700, color: d.delta > 0 ? GREEN : RED }}>
+                                    {d.delta > 0 ? "+" : ""}{d.delta}%
+                                  </span>
+                                  <div style={{ flex: 1, height: 2, background: BORDER, borderRadius: 1, overflow: "hidden" }}>
+                                    <div style={{ width: `${d.a}%`, height: "100%", background: d.delta > 0 ? GREEN : RED, borderRadius: 1 }} />
+                                  </div>
+                                </div>
+                              ))}
                             </div>
                           );
-                          const makeDiffs = (before, after) => Object.keys(LABELS).map(k => ({
-                            key: k, label: LABELS[k],
-                            b: Math.round((before[k]||0)*100), a: Math.round((after[k]||0)*100),
-                            delta: Math.round(((after[k]||0)-(before[k]||0))*100),
-                          })).filter(d => d.delta !== 0).sort((x,y) => Math.abs(y.delta)-Math.abs(x.delta));
-
-                          if (isPerVariant) {
-                            const variantIds = Object.keys(afterRaw);
-                            const variantsWithChanges = variantIds.map(vid => ({
-                              vid, diffs: makeDiffs(beforeRaw[vid]||{}, afterRaw[vid]||{})
-                            })).filter(v => v.diffs.length > 0);
-                            if (!variantsWithChanges.length) return <div style={{ fontSize: 8, color: T3, marginBottom: 6 }}>No weight changes across any variant.</div>;
-                            return (
-                              <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 6 }}>
-                                {variantsWithChanges.map(({vid, diffs}) => (
-                                  <div key={vid} style={{ background: `rgba(255,255,255,0.03)`, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "7px 10px" }}>
-                                    <div style={{ fontSize: 8, fontWeight: 700, color: T2, marginBottom: 5, letterSpacing: .4 }}>{vid.replace(/_/g," ")}</div>
-                                    {diffs.map(d => <DiffRow key={d.key} d={d} />)}
-                                  </div>
-                                ))}
-                              </div>
-                            );
-                          } else {
-                            const diffs = makeDiffs(beforeRaw, afterRaw);
-                            if (!diffs.length) return <div style={{ fontSize: 8, color: T3, marginBottom: 6 }}>No weight changes.</div>;
-                            return <div style={{ marginBottom: 6 }}>{diffs.map(d => <DiffRow key={d.key} d={d} />)}</div>;
-                          }
                         })()}
                         {/* Reasoning lines */}
-                        {reasoning.slice(0, 6).map((line, idx) => {
+                        {reasoning.slice(0, 3).map((line, idx) => {
                           const text = typeof line === "string"
                             ? line
                             : line && typeof line === "object"
                               ? `${line.provider || "provider"}: ${line.error || line.summary || "failed"}`
                               : String(line ?? "");
-                          return <div key={idx} style={{ color: T3, fontSize: 8, marginBottom: 2, lineHeight: 1.4 }}>— {text}</div>;
+                          return <div key={idx} style={{ color: T3, fontSize: 8, marginBottom: 2 }}>— {text}</div>;
                         })}
                         {!auditSucceeded && attempts.length > 0 && (
                           <div style={{ color: T3, fontSize: 8, marginTop: 4 }}>
@@ -4041,6 +4025,77 @@ export default function App() {
                 )}
               </div>
             )}
+          </div>
+
+          {/* ── ML LEARNING CONSOLE ── */}
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8, marginBottom: 8, display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ color: GREEN }}>◉</span> ML Weight Adjustments
+              <span style={{ fontSize: 8, color: T3, fontWeight: 400 }}>{learningEvents.length} events</span>
+            </div>
+            <div style={{ background: "#050e1a", border: `1px solid ${GREEN}33`, borderRadius: 10, maxHeight: 320, overflowY: "auto", fontFamily: "'DM Mono',monospace", fontSize: 8 }}>
+              {learningEvents.length === 0 ? (
+                <div style={{ padding: "16px", color: T3, textAlign: "center", fontSize: 9 }}>No learning events yet — weights update automatically when trades close.</div>
+              ) : learningEvents.map((ev, i) => {
+                const LABELS = { rsi_momentum:"RSI", volume_surge:"VOL", overnight_gap_probability:"GAP", earnings_catalyst:"EARN", support_resistance:"S&R", relative_strength:"RS", sector_relative_strength:"SECT", vwap_reclaim:"VWAP", volatility_squeeze:"SQZE" };
+                const before = ev.weights_before || {};
+                const after = ev.weights_after || {};
+                const diffs = Object.keys(LABELS).map(k => ({
+                  k, label: LABELS[k],
+                  b: Math.round((before[k]||0)*100),
+                  a: Math.round((after[k]||0)*100),
+                  d: Math.round(((after[k]||0)-(before[k]||0))*100)
+                })).filter(x => x.d !== 0);
+                const isHit = ev.outcome === "hit";
+                const ts = new Date(ev.timestamp);
+                const timeStr = ts.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+                const dateStr = ts.toLocaleDateString([], {month:'short',day:'numeric'});
+                return (
+                  <div key={ev.id || i} style={{ padding: "7px 12px", borderBottom: `1px solid ${GREEN}15`, display: "flex", gap: 10, alignItems: "flex-start" }}>
+                    {/* Timestamp */}
+                    <div style={{ flexShrink: 0, width: 54, color: T3, lineHeight: 1.6 }}>
+                      <div style={{ fontSize: 7 }}>{dateStr}</div>
+                      <div style={{ fontSize: 7 }}>{timeStr}</div>
+                    </div>
+                    {/* Outcome badge */}
+                    <div style={{ flexShrink: 0, width: 32, paddingTop: 1 }}>
+                      <span style={{ fontSize: 8, fontWeight: 700, color: isHit ? GREEN : RED, background: isHit ? `${GREEN}15` : `${RED}15`, padding: "1px 4px", borderRadius: 3 }}>
+                        {isHit ? "HIT" : "MISS"}
+                      </span>
+                      {ev.actual_move != null && (
+                        <div style={{ fontSize: 7, color: isHit ? GREEN : RED, marginTop: 2 }}>
+                          {ev.actual_move > 0 ? "+" : ""}{Number(ev.actual_move).toFixed(1)}%
+                        </div>
+                      )}
+                    </div>
+                    {/* Variant */}
+                    <div style={{ flexShrink: 0, width: 70, color: T3, fontSize: 7, lineHeight: 1.5, paddingTop: 1 }}>
+                      {(ev.variant_id||"").replace(/_/g," ").replace("swingdesk ","").replace("all","").trim()}
+                    </div>
+                    {/* Weight diffs */}
+                    <div style={{ flex: 1 }}>
+                      {diffs.length === 0
+                        ? <span style={{ color: T3, fontSize: 7 }}>no change</span>
+                        : diffs.map(d => (
+                          <span key={d.k} style={{ display: "inline-flex", alignItems: "center", gap: 2, marginRight: 6, marginBottom: 2 }}>
+                            <span style={{ color: T3 }}>{d.label}</span>
+                            <span style={{ color: T2 }}>{d.b}%</span>
+                            <span style={{ color: T3 }}>→</span>
+                            <span style={{ color: T2 }}>{d.a}%</span>
+                            <span style={{ color: d.d > 0 ? GREEN : RED, fontWeight: 700 }}>{d.d > 0 ? "+" : ""}{d.d}%</span>
+                          </span>
+                        ))
+                      }
+                      {Array.isArray(ev.reasoning) && ev.reasoning.length > 0 && (
+                        <div style={{ marginTop: 3, color: T3, fontSize: 7, lineHeight: 1.4 }}>
+                          {ev.reasoning.slice(0,3).join(" · ")}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
 
           <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8, marginBottom: 10 }}>Signal weights</div>
