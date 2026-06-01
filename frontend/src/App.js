@@ -198,6 +198,10 @@ function EvidenceBadgeCompact({ evidence }) {
   );
 }
 
+function hasVisiblePicksPayload(payload = {}) {
+  return Boolean((payload.longs || []).length || (payload.shorts || []).length || (payload.recommended_longs || []).length || (payload.recommended_shorts || []).length);
+}
+
 function EvidenceValue({ evidence }) {
   const level = evidence?.level || "New";
   const color = evidenceColor(level);
@@ -563,7 +567,16 @@ function getTradeOpenPnlDollars(trade = {}, feeAdjusted = true) {
 }
 
 function getClosedTradePnlPercent(trade = {}) {
-  if (trade.actual_move != null && Number.isFinite(Number(trade.actual_move))) return Number(trade.actual_move);
+  if (trade.actual_move != null && Number.isFinite(Number(trade.actual_move))) {
+    const actual = Number(trade.actual_move);
+    if (Math.abs(actual) > 0.0001) return actual;
+    const invested = Number(trade.invested_amount || 0);
+    const net = Number(trade.net_pnl ?? NaN);
+    const gross = Number(trade.gross_pnl ?? NaN);
+    const dollar = Number.isFinite(net) && Math.abs(net) > 0.0001 ? net : gross;
+    if (invested > 0 && Number.isFinite(dollar) && Math.abs(dollar) > 0.0001) return (dollar / invested) * 100;
+    return actual;
+  }
   const buy = Number(trade.buy_price || trade.entry_price || 0);
   const sell = Number(trade.sell_price || trade.current_price || 0);
   if (buy > 0 && sell > 0) {
@@ -1082,9 +1095,9 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
       <CardActionRow
         borderColor={BORDER}
         actions={<>
+          <EvidenceBadgeCompact evidence={pick.evidence} />
           <StrategyBadge strategy={pick.strategy || strategyName} selectedStrategy={strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
           <CompactMethodTags methods={confluenceMethods} glowing={glowing} selectedStrategy={strategyName} />
-          <EvidenceBadgeCompact evidence={pick.evidence} />
           {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 && (
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
           )}
@@ -1142,15 +1155,15 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
               </div>
             </div>
             {showScoreContext && (
-              <div style={{ padding: "7px 8px", background: "#06101f", border: `1px solid ${BLUE}33`, borderRadius: 7 }}>
+              <div style={{ padding: "7px 8px", background: "#111113", border: `1px solid ${BORDER}`, borderRadius: 7 }}>
                 <div style={{ fontSize: 8, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .5, marginBottom: 6 }}>Score Context</div>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
                   {Object.entries({ rsi_momentum: "RSI", volume_surge: "Volume", overnight_gap_probability: "Gap", earnings_catalyst: "Earnings", support_resistance: "S&R", relative_strength: "Rel Str", sector_relative_strength: "Sector RS", vwap_reclaim: "VWAP", volatility_squeeze: "Squeeze" }).map(([key, label]) => {
                     const score = Number(signalData.scores?.[key] ?? 0);
                     const fired = signalData.fired.includes(key);
                     return (
-                      <div key={key} className={fired ? "tag-glow" : ""} style={{ display: "flex", justifyContent: "space-between", gap: 6, border: `1px solid ${fired ? BLUE + "55" : BORDER}`, borderRadius: 5, padding: "4px 6px", background: fired ? BLUE + "14" : "#000" }}>
-                        <span style={{ fontSize: 8, color: fired ? BLUE : T3, fontWeight: 700 }}>{label}</span>
+                      <div key={key} className={fired ? "tag-glow" : ""} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6, border: `1px solid ${fired ? BLUE + "55" : BORDER}`, borderRadius: 5, padding: "4px 6px", background: fired ? "#0b1220" : "#0a0a0b" }}>
+                        <span style={{ fontSize: 8, color: fired ? BLUE : T3, fontWeight: 800, letterSpacing: .25, padding: "1px 5px", background: fired ? "#0a1020" : "#121216", borderRadius: 3, border: `1px solid ${fired ? "#1a2a40" : BORDER}`, whiteSpace: "nowrap" }}>{label}</span>
                         <span style={{ fontSize: 8, color: T1, fontFamily: "'DM Mono',monospace" }}>{Math.round(score * 100)}%</span>
                       </div>
                     );
@@ -1236,9 +1249,9 @@ function PostCloseCard({ trade, onDismiss }) {
   );
 }
 
-function TodayClosedCard({ trade, expanded, onToggle, themeKey = "black" }) {
-  const pnlPct = Number(trade.actual_move || 0);
-  const gross = Number(trade.gross_pnl || 0);
+function TodayClosedCard({ trade, expanded, onToggle, themeKey = "black", feeAdjusted = true }) {
+  const pnlPct = getClosedTradePnlPercent(trade);
+  const dollars = getClosedTradePnlDollars(trade, feeAdjusted);
   const resultColor = trade.outcome === "hit" ? GREEN : trade.outcome === "partial" ? AMBER : RED;
   const pnlColor = pnlPct >= 0 ? GREEN : RED;
   const label = trade.outcome_label || (trade.outcome === "hit" ? "Closed in profit" : trade.outcome === "partial" ? "Partial" : "Losses cut");
@@ -1262,7 +1275,7 @@ function TodayClosedCard({ trade, expanded, onToggle, themeKey = "black" }) {
         </div>
         <div style={{ textAlign: "right", flexShrink: 0 }}>
           <div style={{ fontSize: 13, fontWeight: 800, color: pnlColor, fontFamily: "'DM Mono',monospace" }}>{pnlPct >= 0 ? "+" : ""}{pnlPct.toFixed(1)}%</div>
-          <div style={{ fontSize: 10, fontWeight: 700, color: gross >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace", marginTop: 2 }}>{gross >= 0 ? "+" : "-"}${Math.abs(gross).toFixed(2)}</div>
+          <div style={{ fontSize: 10, fontWeight: 700, color: dollars >= 0 ? GREEN : RED, fontFamily: "'DM Mono',monospace", marginTop: 2 }}>{dollars >= 0 ? "+" : "-"}${Math.abs(dollars).toFixed(2)}</div>
         </div>
       </div>
       {expanded && (
@@ -1434,9 +1447,9 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
         staleTime={isStale ? staleTime : null}
         borderColor={rulingColor}
         actions={<>
+          <EvidenceBadgeCompact evidence={trade.evidence} />
           <StrategyBadge strategy={trade.strategy || strategyName} selectedStrategy={strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
           <CompactMethodTags methods={confluenceMethods} glowing={glowing} selectedStrategy={strategyName} />
-          <EvidenceBadgeCompact evidence={trade.evidence} />
           {trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7 && (
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
           )}
@@ -2531,10 +2544,11 @@ export default function App() {
         // Auto-backfill lock_in_confidence for existing trades silently
         apiFetch("/backfill-lock-in-confidence", { method: "POST" }).catch(() => {});
 
-        setPicks({ longs: (picksData.longs || []).map(mapPickFields), shorts: (picksData.shorts || []).map(mapPickFields) });
+        const mappedPicks = { longs: (picksData.longs || []).map(mapPickFields), shorts: (picksData.shorts || []).map(mapPickFields) };
+        if (hasVisiblePicksPayload(mappedPicks)) setPicks(mappedPicks);
         setTotalScanned(picksData.total_scanned || 0);
         setLastScan(picksData.cache_time || picksData.generated_at || null);
-        localStorage.setItem("swingdesk_picks", JSON.stringify(picksData));
+        if (hasVisiblePicksPayload(picksData)) localStorage.setItem("swingdesk_picks", JSON.stringify(picksData));
 
         setOpenPositions(positions);
         if (uiPrefsData && typeof uiPrefsData.show_ticker_banner === "boolean") {
@@ -2551,7 +2565,7 @@ export default function App() {
         setPdtUsed(statsData.pdt_used || 0);
         setPdtRemaining(statsData.pdt_remaining ?? 3);
         buildPerfHistory(perfData, positions);
-        setNnPicks(nnPicksData || { recommended_longs: [], recommended_shorts: [] });
+        setNnPicks(prev => hasVisiblePicksPayload(nnPicksData || {}) ? nnPicksData : prev);
         setNnPositions(nnPositionsData || []);
         setNnStats(nnStatsData);
         setNnPerfHistory(nnPerfData || []);
@@ -2561,7 +2575,7 @@ export default function App() {
         setDayPnlStatus(dayPnlData);
         setVariantStatus(variantStatusData);
         setVariantLeaderboard(variantBoardData || []);
-        setStrategyPreviewRows(variantPreviewData?.rows || []);
+        setStrategyPreviewRows(prev => (variantPreviewData?.rows || []).length ? variantPreviewData.rows : prev);
         setVariantDetailsById({
           ...(vectorUniverseData?.variant?.id ? { [vectorUniverseData.variant.id]: vectorUniverseData } : {}),
           ...(novaUniverseData?.variant?.id ? { [novaUniverseData.variant.id]: novaUniverseData } : {}),
@@ -2705,14 +2719,14 @@ export default function App() {
         setOpenPositions(positions);
         setTodayClosed(closedData || []);
         if (statsData?.open_execution) setOpenExecution(statsData.open_execution);
-        setNnPicks(nnPicksData || { recommended_longs: [], recommended_shorts: [] });
+        setNnPicks(prev => hasVisiblePicksPayload(nnPicksData || {}) ? nnPicksData : prev);
         setNnPositions(nnPositionsData || []);
         setNnStats(nnStatsData);
         setNnPerfHistory(nnPerfData || []);
         setDayPnlStatus(dayPnlData);
         setVariantStatus(variantStatusData);
         setVariantLeaderboard(variantBoardData || []);
-        setStrategyPreviewRows(variantPreviewData?.rows || []);
+        setStrategyPreviewRows(prev => (variantPreviewData?.rows || []).length ? variantPreviewData.rows : prev);
         if (selectedUniverseData?.variant?.id) {
           setVariantDetailsById(prev => ({ ...prev, [selectedUniverseData.variant.id]: selectedUniverseData }));
           setNovaUniverse(selectedUniverseData);
@@ -2811,6 +2825,7 @@ export default function App() {
   const novaUniverseTrades = allStrategySelected
     ? averageTradesByTicker(aggregateTrades, activeVariantBrain, feeAdjusted)
     : selectedUniverseTrades;
+  const rawSelectedVariantTrades = allStrategySelected ? aggregateTrades : selectedUniverseTrades;
   const novaUniverseOpen = novaUniverseTrades.filter(t => t.outcome === "open");
   const novaUniverseClosed = novaUniverseTrades.filter(t => t.outcome !== "open");
   const activeSimulationProjection = calculateSimulationProjection(novaUniverseClosed.length ? novaUniverseClosed : virtualTrades);
@@ -2820,7 +2835,7 @@ export default function App() {
     : selectedVariantMatchesTab && novaUniverse?.variant?.label
       ? novaUniverse.variant.label
       : `SwingDesk / ${activeVariantBrain} / 8:45 / All`;
-  const analyticsVariantTrades = selectedVariantMatchesTab ? novaUniverseTrades : virtualTrades;
+  const analyticsVariantTrades = selectedVariantMatchesTab ? rawSelectedVariantTrades : virtualTrades;
   const analyticsVariantLabel = selectedVariantMatchesTab ? activeVariantLabel : "Legacy SwingDesk";
 
   const openLongPositions = selectedVariantMatchesTab && activeVariantBrain === "Vector"
@@ -2893,7 +2908,11 @@ export default function App() {
       ? holdingPositions
       : openLongPositions;
   const sortedOpenFilteredPositions = sortPositions(openFilteredPositions);
-  const todayClosedVisible = todayClosed.filter(t => !dismissedClosed[t.id]);
+  const selectedVariantClosedVisible = selectedVariantMatchesTab
+    ? rawSelectedVariantTrades.filter(t => t.outcome !== "open" && !dismissedClosed[t.id])
+    : [];
+  const todayClosedVisible = (selectedVariantMatchesTab ? selectedVariantClosedVisible : todayClosed)
+    .filter(t => !dismissedClosed[t.id]);
 
   const activeOpenTickers = new Set(openLongPositions.map(t => t.ticker));
   const aggregateBuyPicks = allStrategySelected
@@ -3085,8 +3104,8 @@ export default function App() {
         ::-webkit-scrollbar{width:0}
         @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
         .fadeIn{animation:fadeUp .2s ease}
-        @keyframes tagGlow{0%{filter:none;opacity:1}50%{filter:drop-shadow(0 0 5px currentColor) drop-shadow(0 0 2px currentColor);opacity:.96}100%{filter:none;opacity:1}}
-        .tag-glow{animation:tagGlow 0.9s ease-in-out 0.25s;position:relative;z-index:2}
+        @keyframes tagGlow{0%,100%{filter:brightness(1);box-shadow:0 0 0 transparent;transform:none}35%,70%{filter:brightness(1.55);box-shadow:0 0 7px rgba(255,255,255,.9),0 0 14px rgba(96,165,250,.9),0 0 22px currentColor;transform:translateY(-1px)}}
+        .tag-glow{animation:tagGlow 1.35s ease-in-out 0.05s 2;position:relative;z-index:3;will-change:filter,box-shadow,transform}
       `}</style>
 
       {showTickerBanner && <TickerBanner openPositions={openPositions} />}
@@ -3589,6 +3608,7 @@ export default function App() {
                     <TodayClosedCard key={trade.id || trade.ticker}
                       trade={trade}
                       themeKey={themeKey}
+                      feeAdjusted={feeAdjusted}
                       expanded={expandedCards["today_closed_" + (trade.id || trade.ticker)]}
                       onToggle={key => setExpandedCards(prev => ({ ...prev, ["today_closed_" + key]: !prev["today_closed_" + key] }))}
                     />
@@ -3923,6 +3943,10 @@ export default function App() {
               }}>{label}</button>
             ))}
           </div>
+          {renderPortfolioControls(false)}
+          <div style={{ fontSize: 9, color: T3, margin: "-2px 0 12px", lineHeight: 1.4 }}>
+            Showing analytics for {analyticsVariantLabel}. Closed-trade All view lists every variant trade; open cards stay deduplicated by ticker.
+          </div>
 
           {analyticsPage === "performance" && (<>
           {/* ── Extended Runners ── */}
@@ -4087,6 +4111,7 @@ export default function App() {
                       const pnl = getClosedTradePnlPercent(trade);
                       const pnlDollars = getClosedTradePnlDollars(trade, feeAdjusted);
                       const conf = trade.lock_in_confidence || trade.confidence;
+                      const variantNote = trade.variant_id || trade.strategy || trade.brain;
                       return (
                         <div key={trade.id} style={{ display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", padding: "10px 14px", background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, borderLeft: `3px solid ${tradeColor}` }}>
                           <div>
@@ -4094,6 +4119,7 @@ export default function App() {
                               <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 14, fontWeight: 600, color: T1 }}>{trade.ticker}</span>
                               <span style={{ fontSize: 9, fontWeight: 700, color: tradeColor, letterSpacing: .3 }}>{trade.outcome === "hit" ? "WIN" : trade.outcome === "partial" ? "PARTIAL" : "LOSS"}</span>
                               {conf > 0 && <span style={{ fontSize: 8, color: confidenceColor(conf, themeKey), fontFamily: "'DM Mono',monospace" }}>{conf}%</span>}
+                              {variantNote && <span style={{ fontSize: 8, color: BLUE, fontFamily: "'DM Mono',monospace", whiteSpace: "nowrap" }}>{variantNote}</span>}
                             </div>
                             <div style={{ fontSize: 9, color: T3, marginTop: 2 }}>
                               {trade.sell_date} · {trade.sector || "—"}

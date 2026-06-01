@@ -5103,6 +5103,9 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
 
         # Calculate method confluence
         confluence = calculate_method_confluence(ticker, price_data)
+        long_signal_scores, long_fired_signals, long_signal_values = compute_signal_scores(
+            ticker, price_data, rsi, earnings_soon, weights, "long"
+        )
 
         scored_stocks.append({
             "ticker": ticker,
@@ -5132,6 +5135,14 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
             "news": stock_data.get("news", []),
             "confluence_count": confluence["count"],
             "confluence_methods": confluence["methods"],
+            "signal_scores_for_observation": long_signal_scores,
+            "signal_values_for_observation": long_signal_values,
+            "fired_signals_for_observation": long_fired_signals,
+            "signal_scores": {
+                "scores": long_signal_scores,
+                "values": long_signal_values,
+                "fired": long_fired_signals,
+            },
         })
 
     # Check if queue is locked (post 8:25 AM CST)
