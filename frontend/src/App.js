@@ -1659,6 +1659,7 @@ export default function App() {
   const [nnPerfTimeframe, setNnPerfTimeframe] = useState("M");
   const [variantStatus, setVariantStatus] = useState(null);
   const [variantLeaderboard, setVariantLeaderboard] = useState([]);
+  const [selectedVariantId, setSelectedVariantId] = useState("swingdesk_vector_0845_all");
   const [novaUniverse, setNovaUniverse] = useState(null);
   const [personalForm, setPersonalForm] = useState({
     ticker: "",
@@ -2030,6 +2031,20 @@ export default function App() {
     return () => clearInterval(interval);
   }, [loaded, monitorRunning]);
 
+  useEffect(() => {
+    if (!variantLeaderboard.length || portfolioTab === "personal") return;
+    const brain = portfolioTab === "neural" ? "Nova" : "Vector";
+    const options = variantLeaderboard.filter(v => v.brain === brain && v.strategy === selectedStrategy);
+    if (options.length && !options.some(v => v.id === selectedVariantId)) {
+      setSelectedVariantId(options[0].id);
+    }
+  }, [portfolioTab, selectedStrategy, variantLeaderboard, selectedVariantId]);
+
+  useEffect(() => {
+    if (!selectedVariantId) return;
+    apiFetch(`/variant/${selectedVariantId}`).then(data => setNovaUniverse(data)).catch(() => {});
+  }, [selectedVariantId]);
+
   const openTickers = new Set(openPositions.filter(t => t.outcome === "open").map(t => t.ticker));
   const allBuyPicks = picks.longs.filter(pick => !openTickers.has(pick.ticker));
   const allShortPicks = picks.shorts.filter(pick => !openTickers.has(pick.ticker));
@@ -2197,9 +2212,28 @@ export default function App() {
     const invested = Number(trade.invested_amount ?? 0);
     return sum + (current - invested);
   }, 0);
+  const novaSessionPnl = (() => {
+    const points = Array.isArray(novaUniverse?.equity_points) ? [...novaUniverse.equity_points] : [];
+    if (!points.length) return null;
+    points.sort((a, b) => new Date(a.timestamp || 0) - new Date(b.timestamp || 0));
+    const latestDate = points.reduce((max, p) => {
+      const d = (p.timestamp || "").slice(0, 10);
+      return d && d <= today && d > max ? d : max;
+    }, "");
+    if (!latestDate) return null;
+    const current = novaUniversePortfolio?.equity != null
+      ? Number(novaUniversePortfolio.equity)
+      : Number(points.filter(p => (p.timestamp || "").slice(0, 10) === latestDate).slice(-1)[0]?.equity || 1000);
+    const prior = [...points].reverse().find(p => (p.timestamp || "").slice(0, 10) < latestDate);
+    const baseline = prior ? Number(prior.equity || 1000) : Number(novaUniversePortfolio?.starting_cash || 1000);
+    return round2(current - baseline);
+  })();
+  const activeVariantBrain = portfolioTab === "neural" ? "Nova" : "Vector";
+  const variantOptions = variantLeaderboard.filter(v => v.brain === activeVariantBrain && v.strategy === selectedStrategy);
   const renderPortfolioControls = (padded = true) => (
     <div style={{ padding: padded ? "0 16px 14px" : "0 0 14px" }}>
-      <label style={{ display: "flex", alignItems: "center", gap: 6, width: "100%", minWidth: 0, height: 32, border: `1px solid ${BORDER}`, borderRadius: 8, background: CARD, padding: "0 9px", marginBottom: 6 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 6 }}>
+      <label style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, height: 32, border: `1px solid ${BORDER}`, borderRadius: 8, background: CARD, padding: "0 9px" }}>
         <span style={{ fontSize: 9, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6, flexShrink: 0 }}>Strategy:</span>
         <select value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
           style={{ minWidth: 0, width: "100%", border: "none", outline: "none", background: "transparent", color: T1, fontSize: 12, fontWeight: 800, cursor: "pointer", appearance: "none" }}>
@@ -2207,6 +2241,15 @@ export default function App() {
         </select>
         <span aria-hidden="true" style={{ color: T3, fontSize: 10, flexShrink: 0 }}>▼</span>
       </label>
+      <label style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, height: 32, border: `1px solid ${BORDER}`, borderRadius: 8, background: CARD, padding: "0 9px" }}>
+        <span style={{ fontSize: 9, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6, flexShrink: 0 }}>Variant:</span>
+        <select value={selectedVariantId} onChange={e => setSelectedVariantId(e.target.value)}
+          style={{ minWidth: 0, width: "100%", border: "none", outline: "none", background: "transparent", color: T1, fontSize: 12, fontWeight: 800, cursor: "pointer", appearance: "none" }}>
+          {variantOptions.map(v => <option key={v.id} value={v.id} style={{ background: "#111", color: T1 }}>{v.selection_mode || v.execution_time || v.id}</option>)}
+        </select>
+        <span aria-hidden="true" style={{ color: T3, fontSize: 10, flexShrink: 0 }}>â–¼</span>
+      </label>
+      </div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
         {[
           ["brain", "Vector", BLUE],
@@ -2782,7 +2825,7 @@ export default function App() {
                 const nnFirst = nnPerfTimeframe === "D"
                   ? (nnFiltered[0]?.virtual || nnLast)
                   : (nnFiltered[0]?.virtual || 1000);
-                const nnChange = round2(nnLast - nnFirst);
+                const nnChange = novaSessionPnl == null ? round2(nnLast - nnFirst) : novaSessionPnl;
                 const nnPercent = nnFirst > 0 ? (nnChange / nnFirst * 100) : 0;
                 const nnUp = nnChange >= 0;
                 return (

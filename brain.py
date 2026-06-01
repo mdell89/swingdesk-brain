@@ -7584,7 +7584,7 @@ def api_day_pnl():
             ORDER BY sell_date ASC
         """).fetchall()]
         open_rows = [dict(r) for r in db.execute("""
-            SELECT invested_amount, current_value, gross_current_value
+            SELECT buy_date, invested_amount, current_value, gross_current_value
             FROM virtual_trades
             WHERE outcome='open'
         """).fetchall()]
@@ -7594,13 +7594,18 @@ def api_day_pnl():
         previous_close = 1000.0
         today_settled = 0.0
         previous_close_date = None
+        activity_dates = [r["date"] for r in settled_rows if r.get("date")]
+        activity_dates += [r["buy_date"] for r in open_rows if r.get("buy_date")]
+        session_date = today
+        if activity_dates and today not in activity_dates:
+            session_date = max(d for d in activity_dates if d <= today)
         for row in settled_rows:
             daily = float(row.get("daily_pnl") or 0)
-            if row.get("date") and row["date"] < today:
+            if row.get("date") and row["date"] < session_date:
                 running += daily
                 previous_close = running
                 previous_close_date = row["date"]
-            elif row.get("date") == today:
+            elif row.get("date") == session_date:
                 today_settled += daily
 
         open_pnl = sum(
@@ -7613,6 +7618,7 @@ def api_day_pnl():
         return jsonify({
             "success": True,
             "label": "Day's P&L",
+            "session_date": session_date,
             "current_value": round(current_value, 2),
             "previous_close_value": round(previous_close, 2),
             "previous_close_date": previous_close_date,
