@@ -532,6 +532,28 @@ function JournalButton() {
   return null;
 }
 
+function StrategyBadge({ strategy, color = BLUE }) {
+  if (!strategy) return null;
+  return (
+    <span style={{
+      fontSize: 7,
+      fontWeight: 900,
+      color,
+      letterSpacing: .35,
+      padding: "1px 4px",
+      background: color + "16",
+      borderRadius: 3,
+      border: `1px solid ${color}44`,
+      textTransform: "uppercase",
+      whiteSpace: "nowrap",
+      maxWidth: 92,
+      overflow: "hidden",
+      textOverflow: "ellipsis",
+      flexShrink: 0,
+    }}>{strategy}</span>
+  );
+}
+
 function StaleBadge({ staleTime }) {
   if (!staleTime) return null;
   return (
@@ -712,7 +734,7 @@ const METHOD_DEFINITIONS = {
   "Vol Squeeze": "Historical Volatility Ratio measures compression. When a stock's recent volatility shrinks relative to its 20-day average, it's coiling. Volatility compression historically precedes explosive directional moves — the tighter the squeeze, the stronger the breakout.",
 };
 
-function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black", onAddToPersonal }) {
+function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black", strategyName, onAddToPersonal }) {
   const [expandedMethod, setExpandedMethod] = React.useState(null);
   const [glowing, setGlowing] = React.useState(false);
   const [journalAdded, setJournalAdded] = React.useState(false);
@@ -758,6 +780,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
       <CardActionRow
         borderColor={BORDER}
         actions={<>
+          <StrategyBadge strategy={strategyName || pick.strategy} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
           <EvidenceBadgeCompact evidence={pick.evidence} />
           {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 && (
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
@@ -940,7 +963,7 @@ function TodayClosedCard({ trade, expanded, onToggle, themeKey = "black" }) {
   );
 }
 
-function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClosed, onDone, onView, onClose, pdtRemaining = 3, themeKey = "black", onAddToPersonal }) {
+function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClosed, onDone, onView, onClose, pdtRemaining = 3, themeKey = "black", strategyName, onAddToPersonal }) {
   const [expandedMethod, setExpandedMethod] = React.useState(null);
   const [expandedSignal, setExpandedSignal] = React.useState(null);
   const [glowing, setGlowing] = React.useState(false);
@@ -1089,6 +1112,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
         staleTime={isStale ? staleTime : null}
         borderColor={rulingColor}
         actions={<>
+          <StrategyBadge strategy={strategyName || trade.strategy} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
           <EvidenceBadgeCompact evidence={trade.evidence} />
           {trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7 && (
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
@@ -1386,7 +1410,7 @@ function ExpandButton({ isExpanded, onToggle, totalCount, label }) {
 }
 
 // ─── TICKER BANNER ────────────────────────────────────────────────────────────
-const BANNER_TICKERS = ["VIX", "SPY", "QQQ", "IWM", "NVDA", "TLT", "BTC-USD", "GLD"];
+const BANNER_TICKERS = ["VIX", "SPY", "QQQ", "IWM", "NVDA", "TLT", "GLD"];
 const TICKER_GREEN   = "#22c55e";
 const TICKER_RED     = "#ef4444";
 const TICKER_FLAT    = "#666";
@@ -2581,6 +2605,7 @@ export default function App() {
                         <PickCard key={pick.ticker + "_l"} pick={pick} isLong={true}
                           expanded={expandedCards[pick.ticker + "_l"]}
                           themeKey={themeKey}
+                          strategyName={selectedStrategy}
                           onAddToPersonal={pick => handleAddToPersonal(pick, "brain")}
                           onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))} />
                       ))}
@@ -2730,12 +2755,13 @@ export default function App() {
                 {openLongPositions.length > 0 && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 12 }}>
                     {sellVisible.map(trade => (
-                      <PositionCard key={trade.id} trade={trade} isLong={true}
+                        <PositionCard key={trade.id} trade={trade} isLong={true}
                         expanded={expandedCards[trade.id || trade.ticker]}
                         isDone={doneCuts[trade.id || trade.ticker] === "done"}
                         isClosed={doneCuts[trade.id || trade.ticker] === "closed"}
                         pdtRemaining={pdtRemaining}
                         themeKey={themeKey}
+                        strategyName={selectedStrategy}
                         onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
                         onDone={key => { setDoneCuts(prev => ({ ...prev, [key]: "done" })); setExpandedCards(prev => ({ ...prev, [key]: false })); }}
                         onView={key => setDoneCuts(prev => ({ ...prev, [key]: "open" }))}
@@ -2761,6 +2787,7 @@ export default function App() {
                           isClosed={doneCuts[trade.id || trade.ticker] === "closed"}
                           pdtRemaining={pdtRemaining}
                           themeKey={themeKey}
+                          strategyName={selectedStrategy}
                           onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
                           onDone={key => { setDoneCuts(prev => ({ ...prev, [key]: "done" })); setExpandedCards(prev => ({ ...prev, [key]: false })); }}
                           onView={key => setDoneCuts(prev => ({ ...prev, [key]: "open" }))}
@@ -2780,12 +2807,13 @@ export default function App() {
                     </div>
                     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                       {sortedHolding.map(trade => (
-                        <PositionCard key={trade.id} trade={trade} isLong={true}
+                      <PositionCard key={trade.id} trade={trade} isLong={true}
                           expanded={expandedCards[trade.id || trade.ticker]}
                           isDone={doneCuts[trade.id || trade.ticker] === "done"}
                           isClosed={doneCuts[trade.id || trade.ticker] === "closed"}
                           pdtRemaining={pdtRemaining}
                           themeKey={themeKey}
+                          strategyName={selectedStrategy}
                           onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
                           onDone={key => { setDoneCuts(prev => ({ ...prev, [key]: "done" })); setExpandedCards(prev => ({ ...prev, [key]: false })); }}
                           onView={key => setDoneCuts(prev => ({ ...prev, [key]: "open" }))}
@@ -2835,7 +2863,7 @@ export default function App() {
           {portfolioTab === "neural" && (
             <div style={{ padding: "10px 16px 0" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, minHeight: 24 }}>
-                <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>SwingDesk / Nova / 8:45 / All</div>
+                <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>{novaUniverse?.variant?.label || "SwingDesk / Nova / 8:45 / All"}</div>
                 <div style={{ display: "flex", alignItems: "center", gap: 6, position: "relative" }}>
                   <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
                     <button onClick={() => setShowNetInfo(v => !v)}
@@ -3004,6 +3032,7 @@ export default function App() {
                       <PositionCard key={trade.id} trade={trade} isLong={true}
                         themeKey={themeKey}
                         pdtRemaining={pdtRemaining}
+                        strategyName={selectedStrategy}
                         expanded={expandedCards[trade.id]}
                         onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
                         onAddToPersonal={trade => handleAddToPersonal(trade, "neural")} />
@@ -3031,6 +3060,7 @@ export default function App() {
                     {nnPicks.recommended_longs.map(pick => (
                       <PickCard key={pick.ticker + "_nn"} pick={mapPickFields(pick)} isLong={true}
                         themeKey={themeKey}
+                        strategyName={selectedStrategy}
                         expanded={expandedCards[pick.ticker + "_nn"]}
                         onAddToPersonal={pick => handleAddToPersonal(pick, "neural")}
                         onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))} />

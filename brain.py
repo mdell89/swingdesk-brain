@@ -1303,10 +1303,8 @@ def initialize_database():
     default_variants = [
         ("swingdesk_vector_0845_all", "SwingDesk", "Vector", "08:45", "All", "time_or_thesis", "SwingDesk / Vector / 8:45 / All"),
         ("swingdesk_vector_0845_top1", "SwingDesk", "Vector", "08:45", "Top 1", "time_or_thesis", "SwingDesk / Vector / 8:45 / Top 1"),
-        ("swingdesk_vector_0845_top3", "SwingDesk", "Vector", "08:45", "Top 3", "time_or_thesis", "SwingDesk / Vector / 8:45 / Top 3"),
         ("swingdesk_nova_0845_all", "SwingDesk", "Nova", "08:45", "All", "time_or_thesis", "SwingDesk / Nova / 8:45 / All"),
         ("swingdesk_nova_0845_top1", "SwingDesk", "Nova", "08:45", "Top 1", "time_or_thesis", "SwingDesk / Nova / 8:45 / Top 1"),
-        ("swingdesk_nova_0845_top3", "SwingDesk", "Nova", "08:45", "Top 3", "time_or_thesis", "SwingDesk / Nova / 8:45 / Top 3"),
         ("darvas_vector_reg_all", "Darvas", "Vector", "reg", "All", "strategy_exit", "Darvas / Vector / Reg / All"),
         ("darvas_nova_reg_all", "Darvas", "Nova", "reg", "All", "strategy_exit", "Darvas / Nova / Reg / All"),
         ("gap_go_vector_reg_all", "Gap & Go", "Vector", "reg", "All", "strategy_exit", "Gap & Go / Vector / Reg / All"),
@@ -1343,6 +1341,18 @@ def initialize_database():
                 SELECT id FROM strategy_variants WHERE strategy IN ({','.join(['?'] * len(retired_strategies))})
             )""",
         [json.dumps(["retired_strategy_family_replaced_for_locked_swingdesk_12"]), now_iso, *retired_strategies],
+    )
+    retired_variant_ids = ("swingdesk_vector_0845_top3", "swingdesk_nova_0845_top3")
+    database.execute(
+        f"UPDATE strategy_variants SET status='retired', updated_at=? WHERE id IN ({','.join(['?'] * len(retired_variant_ids))})",
+        [now_iso, *retired_variant_ids],
+    )
+    database.execute(
+        f"""UPDATE variant_portfolios
+            SET lifecycle_status='archived', recommended_status='retired',
+                lifecycle_reasons=?, updated_at=?
+            WHERE variant_id IN ({','.join(['?'] * len(retired_variant_ids))})""",
+        [json.dumps(["top3_variant_retired_not_part_of_locked_architecture"]), now_iso, *retired_variant_ids],
     )
     for variant in default_variants:
         try:
@@ -8658,7 +8668,7 @@ def api_banner_prices():
         database.close()
 
         # ^VIX is the correct yfinance symbol for VIX index
-        base = ["^VIX", "SPY", "QQQ", "IWM", "NVDA", "TLT", "BTC-USD", "GLD"]
+        base = ["^VIX", "SPY", "QQQ", "IWM", "NVDA", "TLT", "GLD"]
         all_tickers = list(dict.fromkeys(base + open_tickers))
 
         results = {}
