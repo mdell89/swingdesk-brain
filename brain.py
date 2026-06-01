@@ -2673,7 +2673,6 @@ def is_long_pick_eligible(pick, open_tickers=None, confidence_floor=CONFIDENCE_F
         price > 0
         and confidence >= confidence_floor
         and expected_move >= MIN_EXPECTED_MOVE
-        and volume >= MIN_VOLUME_RATIO
         and not pick.get("earnings_soon")
     )
 
@@ -2715,10 +2714,10 @@ def explain_long_pick_gate(row, open_tickers=None, confidence_floor=CONFIDENCE_F
         reasons.append(f"Expected move {expected_move:.1f}% is below the {MIN_EXPECTED_MOVE:.1f}% minimum.")
     else:
         passes.append(f"Expected move {expected_move:.1f}% clears the minimum.")
-    if volume < MIN_VOLUME_RATIO:
-        reasons.append(f"Volume ratio {volume:.2f}x is below the {MIN_VOLUME_RATIO:.2f}x minimum.")
-    else:
+    if volume >= MIN_VOLUME_RATIO:
         passes.append(f"Volume ratio {volume:.2f}x clears the minimum.")
+    else:
+        passes.append(f"Volume ratio {volume:.2f}x is weak/neutral; it lowers score but no longer hard-blocks premarket picks.")
     if earnings_soon:
         reasons.append("Earnings are too close, so the setup is blocked.")
     else:
