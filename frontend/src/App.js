@@ -1,5 +1,14 @@
 import React, { useState, useEffect, useMemo } from "react";
 
+const MODEL_STOP_LOSS_REASONS = new Set(["model_stop_loss", "stop_loss"]);
+const isModelStopLoss = reason => MODEL_STOP_LOSS_REASONS.has(reason);
+const formatSellReason = reason => {
+  if (reason === "forced_close") return "Force closed 2:45 PM";
+  if (reason === "cut_loss") return "Cut at loss";
+  if (isModelStopLoss(reason)) return "Model stop loss";
+  return reason ? reason.replace(/_/g, " ") : "Closed";
+};
+
 /*
  * Overnight Swing Desk — Frontend v32 (Push 55)
  * ══════════════════════════════════════════════
@@ -1052,7 +1061,7 @@ function PostCloseCard({ trade, onDismiss }) {
   const pnlColor = pnl >= 0 ? GREEN : RED;
   const isWin = pnl >= 0;
   const closeReason = trade.sell_reason === "forced_close" ? "Force-closed at 2:45 PM" :
-                      trade.sell_reason === "stop_loss" ? "Vector cut losses" : "Vector closed";
+                      isModelStopLoss(trade.sell_reason) ? "Vector model stop" : "Vector closed";
   return (
     <div style={{ background: isWin ? "#0a1a0a" : "#1a0a0a", border: `1px solid ${isWin ? "#1a3a1a" : "#3a1a1a"}`, borderRadius: 10, borderLeft: `3px solid ${pnlColor}`, padding: "10px 12px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
       <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
@@ -3157,7 +3166,7 @@ export default function App() {
                       const isExpanded = expandedCards["closed_" + trade.id];
                       const outcomeColor = trade.outcome === "hit" ? GREEN : trade.outcome === "partial" ? AMBER : RED;
                       const outcomeLabel = trade.outcome === "hit" ? "WIN" : trade.outcome === "partial" ? "PARTIAL" : trade.sell_reason === "forced_close" ? "FORCE CLOSED" : "LOSS";
-                      const sellReasonLabel = trade.sell_reason === "forced_close" ? "Force closed 2:45 PM" : trade.sell_reason === "cut_loss" ? "Cut at loss" : trade.sell_reason === "stop_loss" ? "Stop loss" : trade.sell_reason || "Closed";
+                      const sellReasonLabel = formatSellReason(trade.sell_reason);
                       return (
                         <div key={trade.id} style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, borderLeft: `3px solid ${outcomeColor}`, overflow: "hidden" }}>
                           <div style={{ display: "flex", alignItems: "center", padding: "8px 12px", gap: 8 }}>
@@ -3730,7 +3739,7 @@ export default function App() {
             const today = new Date().toISOString().split("T")[0];
             const yesterday = new Date(Date.now() - 86400000).toISOString().split("T")[0];
             const cutTrades = virtualTrades.filter(t =>
-              (t.sell_reason === "stop_loss" || (t.actual_move != null && t.actual_move < -1)) &&
+              (isModelStopLoss(t.sell_reason) || (t.actual_move != null && t.actual_move < -1)) &&
               (t.sell_date === today || t.sell_date === yesterday)
             );
             if (cutTrades.length === 0) return null;
@@ -3824,7 +3833,7 @@ export default function App() {
           {analyticsPage === "closed" && (() => {
             const allClosed = virtualTrades.filter(t => t.outcome !== "open");
             const wins = allClosed.filter(t => t.outcome === "hit");
-            const cuts = allClosed.filter(t => t.outcome === "miss" || t.sell_reason === "cut_loss" || t.sell_reason === "stop_loss");
+            const cuts = allClosed.filter(t => t.outcome === "miss" || t.sell_reason === "cut_loss" || isModelStopLoss(t.sell_reason));
             const partials = allClosed.filter(t => t.outcome === "partial");
             const winRate = allClosed.length > 0 ? Math.round(wins.length / allClosed.length * 100) : null;
             const totalPnl = allClosed.reduce((s, t) => s + (t.gross_pnl || 0), 0);
@@ -3875,7 +3884,7 @@ export default function App() {
                             </div>
                             <div style={{ fontSize: 9, color: T3, marginTop: 2 }}>
                               {trade.sell_date} · {trade.sector || "—"}
-                              {trade.sell_reason && <span style={{ marginLeft: 6, color: T3 }}>· {trade.sell_reason.replace(/_/g, " ")}</span>}
+                              {trade.sell_reason && <span style={{ marginLeft: 6, color: T3 }}>· {formatSellReason(trade.sell_reason)}</span>}
                             </div>
                           </div>
                           <div style={{ textAlign: "right" }}>

@@ -165,6 +165,8 @@ MAX_SHORT_PICKS      = 10        # Maximum short recommendations per scan
 MIN_VOLUME_RATIO     = 1.2       # Minimum volume activity to confirm a real setup
 MAX_ALL_VARIANT_OPEN_POSITIONS = 50
 ARCHIVED_VARIANT_OUTCOMES = ("archived_excess_open",)
+MODEL_STOP_LOSS_REASON = "model_stop_loss"
+LEGACY_STOP_LOSS_REASONS = {"stop_loss", MODEL_STOP_LOSS_REASON}
 TIMEZONE_OFFSET      = -5        # CST = UTC-5 (CDT during summer)
 MONITOR_INTERVAL     = 300       # 5 minutes in seconds
 SCAN_BATCH_SIZE      = 100       # Tickers per yfinance batch call
@@ -4850,7 +4852,7 @@ def evaluate_sell_decision(trade, current_price, rsi=None, volume_ratio=None):
 
     # ── STOP LOSS — Cut losses on strong reversals ──
     if pnl_percent <= -5:
-        return True, "stop_loss", f"Exiting — reversal at {pnl_percent:+.1f}%"
+        return True, MODEL_STOP_LOSS_REASON, f"Exiting — model stop at {pnl_percent:+.1f}%"
 
     # ── MOMENTUM FADE — Small gain but volume dying ──
     if pnl_percent >= 2 and pnl_percent < 5 and volume_ratio and volume_ratio < 0.6:
@@ -5460,7 +5462,7 @@ def monitor_variant_universes(trigger="manual"):
                 sell_reason = "forced_close"
             elif pnl_pct <= -5:
                 should_close = True
-                sell_reason = "stop_loss"
+                sell_reason = MODEL_STOP_LOSS_REASON
 
             if should_close:
                 outcome = "hit" if pnl_pct > 0 else "miss"
@@ -6757,7 +6759,7 @@ def _monitor_open_positions_impl():
 
             # PDT check: if this would be a same-day close (day trade), verify we have capacity
             is_day_trade = position["buy_date"] == today
-            if should_sell and is_day_trade and reason in ("cut_loss", "stop_loss"):
+            if should_sell and is_day_trade and reason in ("cut_loss", *LEGACY_STOP_LOSS_REASONS):
                 if not can_day_trade():
                     log.warning(f"PDT limit reached — cannot CUT {ticker} today (day trade #{get_pdt_count()+1}). Downgrading to WEAK.")
                     should_sell = False
@@ -7578,7 +7580,7 @@ def api_day_trade_status():
         """, [five_days_ago]).fetchall()]
         database.close()
 
-        pdt_relevant_reasons = {"cut_loss", "stop_loss", "momentum_fade", "rsi_exhaustion", "target_hit"}
+        pdt_relevant_reasons = {"cut_loss", *LEGACY_STOP_LOSS_REASONS, "momentum_fade", "rsi_exhaustion", "target_hit"}
         pdt_relevant_same_day = []
         excluded_same_day = []
         for row in same_day_rows:
@@ -9733,7 +9735,7 @@ def api_today_closed():
             if sell_reason == "forced_close":
                 label = "Force closed 2:45 PM"
                 label_type = "force"
-            elif sell_reason in ("cut_loss", "stop_loss"):
+            elif sell_reason in ("cut_loss", *LEGACY_STOP_LOSS_REASONS):
                 label = "Losses cut"
                 label_type = "cut"
             elif pnl_pct >= 0:
@@ -9857,7 +9859,7 @@ def api_all_closed():
             if sell_reason in ("force_close", "forced_close"):
                 label = "Force closed"
                 label_type = "force"
-            elif sell_reason in ("cut_loss", "stop_loss"):
+            elif sell_reason in ("cut_loss", *LEGACY_STOP_LOSS_REASONS):
                 label = "Cut"
                 label_type = "cut"
             elif outcome == "hit":
