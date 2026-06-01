@@ -8012,6 +8012,7 @@ def api_variant_detail(variant_id):
         trades = [dict(r) for r in db.execute("""
             SELECT * FROM variant_virtual_trades
             WHERE variant_id=?
+              AND outcome NOT IN ('archived_excess_open')
             ORDER BY buy_date DESC, created_at DESC
             LIMIT 200
         """, [variant_id]).fetchall()]
@@ -8668,7 +8669,7 @@ def api_banner_prices():
         database.close()
 
         # ^VIX is the correct yfinance symbol for VIX index
-        base = ["^VIX", "SPY", "QQQ", "IWM", "NVDA", "TLT", "GLD"]
+        base = ["^VIX", "SPY", "QQQ", "IWM", "NVDA", "TLT", "GLD", "BTC-USD"]
         all_tickers = list(dict.fromkeys(base + open_tickers))
 
         results = {}

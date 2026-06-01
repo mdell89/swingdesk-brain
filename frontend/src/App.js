@@ -1410,7 +1410,7 @@ function ExpandButton({ isExpanded, onToggle, totalCount, label }) {
 }
 
 // ─── TICKER BANNER ────────────────────────────────────────────────────────────
-const BANNER_TICKERS = ["VIX", "SPY", "QQQ", "IWM", "NVDA", "TLT", "GLD"];
+const BANNER_TICKERS = ["VIX", "SPY", "QQQ", "IWM", "NVDA", "TLT", "GLD", "BTC-USD"];
 const TICKER_GREEN   = "#22c55e";
 const TICKER_RED     = "#ef4444";
 const TICKER_FLAT    = "#666";
@@ -1659,6 +1659,8 @@ export default function App() {
 
   // Refresh all color tokens + body bg synchronously before render
   refreshThemeTokens(themeKey);
+  const timeframeActiveBg = themeKey === "navy" ? BLUE + "22" : "#1e1e24";
+  const timeframeActiveBorder = themeKey === "navy" ? `1px solid ${BLUE}44` : "none";
 
   const [picks, setPicks] = useState({ longs: [], shorts: [] });
   const [extendedRunners, setExtendedRunners] = useState([]);
@@ -2108,10 +2110,15 @@ export default function App() {
   const today = new Date().toISOString().split("T")[0];
   const activeVariantBrain = portfolioTab === "neural" ? "Nova" : "Vector";
   const novaUniversePortfolio = novaUniverse?.portfolio || null;
-  const novaUniverseTrades = Array.isArray(novaUniverse?.trades) ? novaUniverse.trades : [];
+  const novaUniverseTrades = Array.isArray(novaUniverse?.trades)
+    ? novaUniverse.trades.filter(t => t.outcome !== "archived_excess_open")
+    : [];
   const novaUniverseOpen = novaUniverseTrades.filter(t => t.outcome === "open");
   const novaUniverseClosed = novaUniverseTrades.filter(t => t.outcome !== "open");
   const selectedVariantMatchesTab = novaUniverse?.variant?.brain === activeVariantBrain;
+  const activeVariantLabel = selectedVariantMatchesTab && novaUniverse?.variant?.label
+    ? novaUniverse.variant.label
+    : `SwingDesk / ${activeVariantBrain} / 8:45 / All`;
 
   const openLongPositions = selectedVariantMatchesTab && activeVariantBrain === "Vector" && novaUniverseOpen.length
     ? novaUniverseOpen.filter(t => (t.direction || "long") === "long")
@@ -2308,7 +2315,7 @@ export default function App() {
             height: HOME_CONTROL_H, padding: 0, borderRadius: HOME_CONTROL_RADIUS, fontSize: 12, fontWeight: 800,
             border: `1px solid ${portfolioTab === id ? color + "66" : BORDER}`,
             cursor: "pointer", letterSpacing: .4, background: portfolioTab === id ? color + "18" : "transparent",
-            color: portfolioTab === id ? color : T3,
+            color,
           }}>{label}</button>
         ))}
       </div>
@@ -2389,7 +2396,7 @@ export default function App() {
                   padding: "7px 0", borderRadius: 7, fontSize: 11, fontWeight: 800,
                   border: `1px solid ${portfolioTab === id ? color + "66" : BORDER}`,
                   cursor: "pointer", letterSpacing: .4, background: portfolioTab === id ? color + "18" : "transparent",
-                  color: portfolioTab === id ? color : T3,
+                  color,
                 }}>{label}</button>
               ))}
             </div>
@@ -2400,7 +2407,7 @@ export default function App() {
           <div style={{ padding: "10px 16px 14px" }}>
             {/* SwingDesk Brain row — evenly spaced across full width */}
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, minHeight: 24 }}>
-              <div style={{ fontSize: 10, color: T3, fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>SwingDesk / Vector / 8:45 / All</div>
+              <div style={{ fontSize: 10, color: BLUE, fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>{activeVariantBrain === "Vector" ? activeVariantLabel : "SwingDesk / Vector / 8:45 / All"}</div>
               <div style={{ display: "flex", alignItems: "center", gap: 6, position: "relative" }}>
                 <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
                   <button onClick={() => setShowNetInfo(v => !v)}
@@ -2455,7 +2462,7 @@ export default function App() {
             <div style={{ display: "flex", alignItems: "center", marginTop: 8, position: "relative" }}>
               <div style={{ flex: 1, display: "flex", justifyContent: "center", gap: 4 }}>
                 {["D", "W", "M", "3M", "Y", "ALL"].map(tf => (
-                  <button key={tf} onClick={() => setPerfTimeframe(tf)} style={{ padding: "5px 12px", borderRadius: 20, fontSize: 11, fontWeight: 500, border: "none", cursor: "pointer", background: perfTimeframe === tf ? "#1e1e24" : BG, color: perfTimeframe === tf ? T1 : T3 }}>
+                  <button key={tf} onClick={() => setPerfTimeframe(tf)} style={{ padding: "5px 12px", borderRadius: 20, fontSize: 11, fontWeight: 500, border: perfTimeframe === tf ? timeframeActiveBorder : "none", cursor: "pointer", background: perfTimeframe === tf ? timeframeActiveBg : BG, color: perfTimeframe === tf ? T1 : T3 }}>
                     {tf === "D" ? "1D" : tf === "W" ? "1W" : tf === "M" ? "1M" : tf === "Y" ? "1Y" : tf}
                   </button>
                 ))}
@@ -2920,7 +2927,7 @@ export default function App() {
                     <div style={{ display: "flex", alignItems: "center", marginTop: 8, position: "relative" }}>
                       <div style={{ flex: 1, display: "flex", justifyContent: "center", gap: 4 }}>
                       {["D", "W", "M", "3M", "Y", "ALL"].map(tf => (
-                        <button key={tf} onClick={() => setNnPerfTimeframe(tf)} style={{ padding: "5px 12px", borderRadius: 20, fontSize: 11, fontWeight: 500, border: "none", cursor: "pointer", background: nnPerfTimeframe === tf ? "#1e1e24" : BG, color: nnPerfTimeframe === tf ? T1 : T3 }}>
+                        <button key={tf} onClick={() => setNnPerfTimeframe(tf)} style={{ padding: "5px 12px", borderRadius: 20, fontSize: 11, fontWeight: 500, border: nnPerfTimeframe === tf ? timeframeActiveBorder : "none", cursor: "pointer", background: nnPerfTimeframe === tf ? timeframeActiveBg : BG, color: nnPerfTimeframe === tf ? T1 : T3 }}>
                           {tf === "D" ? "1D" : tf === "W" ? "1W" : tf === "M" ? "1M" : tf === "Y" ? "1Y" : tf}
                         </button>
                       ))}
