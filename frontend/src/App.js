@@ -1,22 +1,13 @@
 import React, { useState, useEffect, useMemo } from "react";
 
 /*
- * Overnight Swing Desk — Frontend v32 (Push 54)
+ * Overnight Swing Desk — Frontend v32 (Push 55)
  * ══════════════════════════════════════════════
- * Changes in Push 54:
- *   - ScanPanel component in Brain tab: full-width scan trigger box
- *     live ticker chip stream, progress bar, phase labels, polling at 1.2s
- *     POST /api/shared-scan-now → polls /api/nn-scan-status until done
- *
- * Push 48–53: Codex (see git log)
- *
- * Push 47:
- *   - Net view label restored (was renamed to Fees off/on, now back to Net view)
- *   - Nova: added ⓘ info icon with tooltip matching Vector
- *   - Day's P&L paddingTop: 6 on both Vector and Nova
- *   - Removed vs $X.XX baseline note from Vector
- *   - Nova metric row: grid → flex, borderRadius 10, fontSize 16/9, fontWeight 600
- *   - Nova percent row font-matched to Vector (13/500, 12)
+ * Changes in Push 55:
+ *   - ScanPanel in Brain tab: full-width scan trigger, live ticker chips,
+ *     progress bar, phase labels, warning note, polling at 1.2s
+ *   - Audit entries now show per-signal weight diffs (before → after + delta bar)
+ *   - Reasoning lines shown with actual data references
  *
  * Changes in Push 46:
  *   - SettingsDrawer: Telegram bot info section — shows configured/not configured
@@ -1692,15 +1683,11 @@ class ErrorBoundary extends React.Component {
   }
 }
 
-export default 
-// ═══════════════════════════════════════════════
-// SCAN PANEL — comprehensive ticker scan trigger
-// ═══════════════════════════════════════════════
+// ─── SCAN PANEL ──────────────────────────────────────────────────────────────
 function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
-  const [scanState, setScanState] = React.useState("idle"); // idle | running | done | error
+  const [state, setState] = React.useState("idle"); // idle | running | done | error
   const [phase, setPhase] = React.useState("");
   const [totalScanned, setTotalScanned] = React.useState(0);
-  const [totalUniverse, setTotalUniverse] = React.useState(0);
   const [currentTicker, setCurrentTicker] = React.useState("");
   const [scannedTickers, setScannedTickers] = React.useState([]);
   const [qualified, setQualified] = React.useState(0);
@@ -1709,11 +1696,11 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
   const [finishedAt, setFinishedAt] = React.useState(null);
   const [errorMsg, setErrorMsg] = React.useState("");
   const pollRef = React.useRef(null);
-  const tickerScrollRef = React.useRef(null);
+  const scrollRef = React.useRef(null);
 
   const stopPolling = () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
 
-  const pollStatus = React.useCallback(async () => {
+  const poll = React.useCallback(async () => {
     try {
       const res = await fetch(`${API}/nn-scan-status`);
       const d = await res.json();
@@ -1725,180 +1712,157 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
       setPicks(d.picks || 0);
       if (d.started_at) setStartedAt(d.started_at);
       if (d.status === "running") {
-        setScanState("running");
+        setState("running");
       } else if (d.status === "success" || d.status === "degraded") {
-        setScanState("done");
+        setState("done");
         setFinishedAt(d.finished_at || new Date().toISOString());
         stopPolling();
       } else if (d.status === "error" || d.status === "stalled") {
-        setScanState("error");
-        setErrorMsg(d.error || "Scan stalled or failed.");
+        setState("error");
+        setErrorMsg(d.error || "Scan stalled.");
         stopPolling();
       }
-    } catch (e) {
-      // network hiccup — keep polling
-    }
+    } catch (_) {}
   }, [API]);
 
-  // On mount check if a scan is already running
-  React.useEffect(() => {
-    pollStatus();
-  }, []);
-
-  // Auto-scroll ticker list
-  React.useEffect(() => {
-    if (tickerScrollRef.current) {
-      tickerScrollRef.current.scrollLeft = tickerScrollRef.current.scrollWidth;
-    }
-  }, [scannedTickers]);
-
-  const triggerScan = async () => {
-    setScanState("running");
-    setPhase("starting");
-    setTotalScanned(0);
-    setScannedTickers([]);
-    setCurrentTicker("");
-    setQualified(0);
-    setPicks(0);
-    setErrorMsg("");
-    setStartedAt(new Date().toISOString());
-    setFinishedAt(null);
-    try {
-      await fetch(`${API}/shared-scan-now`, { method: "POST" });
-    } catch (e) { /* fire and forget */ }
-    stopPolling();
-    pollRef.current = setInterval(pollStatus, 1200);
-  };
-
+  React.useEffect(() => { poll(); }, []);
+  React.useEffect(() => { if (scrollRef.current) scrollRef.current.scrollLeft = scrollRef.current.scrollWidth; }, [scannedTickers]);
   React.useEffect(() => () => stopPolling(), []);
 
+  const trigger = async () => {
+    setState("running"); setPhase("starting"); setTotalScanned(0);
+    setScannedTickers([]); setCurrentTicker(""); setQualified(0);
+    setPicks(0); setErrorMsg(""); setStartedAt(new Date().toISOString()); setFinishedAt(null);
+    try { await fetch(`${API}/shared-scan-now`, { method: "POST" }); } catch (_) {}
+    stopPolling();
+    pollRef.current = setInterval(poll, 1200);
+  };
+
   const elapsed = startedAt ? Math.round((new Date(finishedAt || Date.now()) - new Date(startedAt)) / 1000) : 0;
-  const progressPct = totalUniverse > 0 ? Math.min(100, Math.round(totalScanned / totalUniverse * 100)) : (totalScanned > 0 ? Math.min(99, Math.round(totalScanned / 1.5)) : 0);
-
-  const phaseLabel = {
-    "starting": "Initializing...",
-    "fetching_prices": "Fetching price data...",
-    "scoring": `Scoring tickers...`,
-    "": scanState === "running" ? "Scanning..." : "",
-  }[phase] || phase;
-
-  const accentColor = scanState === "done" ? GREEN : scanState === "error" ? RED : BLUE;
+  const pct = totalScanned > 0 ? Math.min(98, Math.round(totalScanned / 1.5)) : 0;
+  const accent = state === "done" ? GREEN : state === "error" ? RED : BLUE;
+  const phaseLabel = { starting: "Initializing…", fetching_prices: "Fetching price data…", scoring: "Scoring tickers…" }[phase] || (state === "running" ? "Scanning…" : "");
 
   return (
-    <div style={{ marginBottom: 16 }}>
-      {/* Main scan button / status box */}
-      <div style={{
-        background: CARD,
-        border: `1.5px solid ${accentColor}`,
-        borderRadius: 12,
-        overflow: "hidden",
-        transition: "border-color 0.3s",
-      }}>
-
-        {/* Header row */}
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ background: CARD, border: `1.5px solid ${accent}`, borderRadius: 12, overflow: "hidden", transition: "border-color .3s" }}>
+        {/* Header */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 14px 10px" }}>
           <div>
             <div style={{ fontSize: 13, fontWeight: 700, color: T1, letterSpacing: .3 }}>
-              {scanState === "running" ? "⚡ Scanning..." : scanState === "done" ? "✓ Scan complete" : scanState === "error" ? "✗ Scan failed" : "Comprehensive Scan"}
+              {state === "running" ? "⚡ Scanning…" : state === "done" ? "✓ Scan complete" : state === "error" ? "✗ Scan failed" : "Comprehensive Scan"}
             </div>
             <div style={{ fontSize: 9, color: T3, marginTop: 2, fontFamily: "'DM Mono',monospace" }}>
-              {scanState === "running"
+              {state === "running"
                 ? `${totalScanned} tickers scored${elapsed > 0 ? ` · ${elapsed}s` : ""}`
-                : scanState === "done"
+                : state === "done"
                 ? `${totalScanned} scanned · ${qualified} qualified · ${picks} picks · ${elapsed}s`
-                : scanState === "error"
-                ? errorMsg.slice(0, 60)
-                : "Vector + Nova · all tickers · live data"}
+                : state === "error" ? errorMsg.slice(0, 60)
+                : "Vector + Nova · full universe · live data"}
             </div>
           </div>
-          <button
-            onClick={triggerScan}
-            disabled={scanState === "running"}
-            style={{
-              background: scanState === "running" ? "transparent" : accentColor,
-              border: `1.5px solid ${accentColor}`,
-              borderRadius: 8,
-              padding: "7px 14px",
-              fontSize: 10,
-              fontWeight: 700,
-              color: scanState === "running" ? accentColor : "#000",
-              cursor: scanState === "running" ? "default" : "pointer",
-              fontFamily: "'DM Mono',monospace",
-              letterSpacing: 1,
-              whiteSpace: "nowrap",
-              opacity: scanState === "running" ? 0.7 : 1,
-            }}
-          >
-            {scanState === "running" ? "RUNNING" : scanState === "done" ? "RUN AGAIN" : "SCAN NOW"}
+          <button onClick={trigger} disabled={state === "running"} style={{ background: state === "running" ? "transparent" : accent, border: `1.5px solid ${accent}`, borderRadius: 8, padding: "7px 14px", fontSize: 10, fontWeight: 700, color: state === "running" ? accent : "#000", cursor: state === "running" ? "default" : "pointer", fontFamily: "'DM Mono',monospace", letterSpacing: 1, whiteSpace: "nowrap", opacity: state === "running" ? 0.7 : 1 }}>
+            {state === "running" ? "RUNNING" : state === "done" ? "RUN AGAIN" : "SCAN NOW"}
           </button>
         </div>
 
         {/* Progress bar */}
-        {(scanState === "running" || scanState === "done") && (
-          <div style={{ height: 3, background: `${BORDER}`, margin: "0 14px" }}>
-            <div style={{
-              height: "100%",
-              width: scanState === "done" ? "100%" : `${Math.max(4, progressPct)}%`,
-              background: accentColor,
-              borderRadius: 2,
-              transition: "width 0.8s ease",
-            }} />
+        {(state === "running" || state === "done") && (
+          <div style={{ height: 3, background: BORDER, margin: "0 14px" }}>
+            <div style={{ height: "100%", width: state === "done" ? "100%" : `${Math.max(4, pct)}%`, background: accent, borderRadius: 2, transition: "width .8s ease" }} />
           </div>
         )}
 
-        {/* Phase label + current ticker */}
-        {scanState === "running" && (
-          <div style={{ padding: "6px 14px 4px", display: "flex", alignItems: "center", gap: 8 }}>
+        {/* Phase + current ticker */}
+        {state === "running" && (
+          <div style={{ padding: "5px 14px 3px", display: "flex", alignItems: "center", gap: 8 }}>
             <span style={{ fontSize: 9, color: T3, fontFamily: "'DM Mono',monospace" }}>{phaseLabel}</span>
-            {currentTicker && (
-              <span style={{ fontSize: 9, color: BLUE, fontFamily: "'DM Mono',monospace", fontWeight: 700 }}>
-                → {currentTicker}
-              </span>
-            )}
+            {currentTicker && <span style={{ fontSize: 9, color: BLUE, fontFamily: "'DM Mono',monospace", fontWeight: 700 }}>→ {currentTicker}</span>}
           </div>
         )}
 
-        {/* Ticker stream */}
+        {/* Ticker chip stream */}
         {scannedTickers.length > 0 && (
-          <div
-            ref={tickerScrollRef}
-            style={{
-              display: "flex",
-              gap: 5,
-              padding: "6px 14px 12px",
-              overflowX: "auto",
-              scrollbarWidth: "none",
-              WebkitOverflowScrolling: "touch",
-            }}
-          >
+          <div ref={scrollRef} style={{ display: "flex", gap: 5, padding: "5px 14px 11px", overflowX: "auto", scrollbarWidth: "none" }}>
             {scannedTickers.map((t, i) => {
-              const isLatest = i === scannedTickers.length - 1 && scanState === "running";
+              const latest = i === scannedTickers.length - 1 && state === "running";
               return (
-                <div key={t + i} style={{
-                  flexShrink: 0,
-                  padding: "3px 7px",
-                  borderRadius: 5,
-                  fontSize: 9,
-                  fontWeight: isLatest ? 700 : 500,
-                  fontFamily: "'DM Mono',monospace",
-                  background: isLatest ? `${BLUE}22` : `${BORDER}`,
-                  color: isLatest ? BLUE : T3,
-                  border: `1px solid ${isLatest ? BLUE : "transparent"}`,
-                  transition: "all 0.2s",
-                }}>
+                <div key={t + i} style={{ flexShrink: 0, padding: "3px 7px", borderRadius: 5, fontSize: 9, fontWeight: latest ? 700 : 500, fontFamily: "'DM Mono',monospace", background: latest ? `${BLUE}22` : BORDER, color: latest ? BLUE : T3, border: `1px solid ${latest ? BLUE : "transparent"}`, transition: "all .2s" }}>
                   {t}
                 </div>
               );
             })}
           </div>
         )}
+      </div>
 
+      {/* Warning */}
+      <div style={{ fontSize: 9, color: T3, marginTop: 5, paddingLeft: 2, lineHeight: 1.5 }}>
+        ⚠️ Scans consume API quota. Avoid triggering more than once per hour during market hours — the scheduler runs automatically at 8:15 AM and throughout the session.
       </div>
     </div>
   );
 }
 
-function App() {
+// ─── AUDIT BUTTON ─────────────────────────────────────────────────────────────
+function AuditButton({ API, T1, T2, T3, BORDER, CARD, GREEN, AMBER, RED, onComplete }) {
+  const [state, setState] = React.useState("idle"); // idle | running | done | error
+  const [result, setResult] = React.useState(null);
+
+  const trigger = async () => {
+    setState("running");
+    setResult(null);
+    try {
+      const res = await fetch(`${API}/audit`, { method: "POST" });
+      const d = await res.json();
+      setResult(d);
+      setState(d.success ? "done" : "error");
+      if (onComplete) onComplete();
+    } catch (e) {
+      setState("error");
+      setResult({ summary: "Network error — could not reach audit endpoint." });
+    }
+  };
+
+  const accent = state === "done" ? GREEN : state === "error" ? RED : AMBER;
+
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ background: CARD, border: `1.5px solid ${accent}`, borderRadius: 12, padding: "12px 14px", transition: "border-color .3s" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: T1, letterSpacing: .3 }}>
+              {state === "running" ? "⏳ Running audit…" : state === "done" ? "✓ Audit complete" : state === "error" ? "✗ Audit failed" : "Run Self-Audit"}
+            </div>
+            <div style={{ fontSize: 9, color: T3, marginTop: 2 }}>
+              {state === "running"
+                ? "Calling LLM — takes 5–15 seconds…"
+                : state === "done" && result
+                ? `${result.provider || "LLM"} · ${result.confidence || "?"} confidence`
+                : state === "error" && result
+                ? (result.summary || "Failed").slice(0, 70)
+                : "Analyzes recent trades and adjusts signal weights via LLM"}
+            </div>
+          </div>
+          <button onClick={trigger} disabled={state === "running"} style={{ background: state === "running" ? "transparent" : accent, border: `1.5px solid ${accent}`, borderRadius: 8, padding: "7px 14px", fontSize: 10, fontWeight: 700, color: state === "running" ? accent : "#000", cursor: state === "running" ? "default" : "pointer", fontFamily: "'DM Mono',monospace", letterSpacing: 1, whiteSpace: "nowrap", opacity: state === "running" ? 0.6 : 1 }}>
+            {state === "running" ? "RUNNING" : state === "done" ? "RUN AGAIN" : "AUDIT NOW"}
+          </button>
+        </div>
+        {state === "done" && result?.summary && (
+          <div style={{ marginTop: 8, fontSize: 9, color: T2, lineHeight: 1.6, borderTop: `1px solid ${BORDER}`, paddingTop: 8 }}>
+            {result.summary}
+          </div>
+        )}
+      </div>
+      <div style={{ fontSize: 9, color: T3, marginTop: 5, paddingLeft: 2, lineHeight: 1.5 }}>
+        ⚠️ Audit consumes LLM API credits. Runs automatically at 11:55 PM — only trigger manually to test changes or after a significant batch of new trades resolves.
+      </div>
+    </div>
+  );
+}
+
+
+export default function App() {
   const [loadProgress, setLoadProgress] = useState(0);
   const [loadStatus, setLoadStatus] = useState("Connecting to brain...");
   const [loaded, setLoaded] = useState(false);
@@ -3936,8 +3900,8 @@ function App() {
         <div className="fadeIn" style={{ padding: "10px 16px 0" }}>
           {tabLoading && <div style={{ textAlign: "center", padding: 20, fontSize: 11, color: T3 }}>Loading...</div>}
 
-          {/* ── SCAN PANEL ── */}
-          <ScanPanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} />
+              <ScanPanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} />
+          <AuditButton API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} AMBER={AMBER} RED={RED} onComplete={() => apiFetch("/audit/log").then(data => setAuditLog(data || [])).catch(() => {})} />
 
           <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
             <div style={{ fontSize: 14, fontWeight: 600, color: T1, marginBottom: 4 }}>Self-audit engine</div>
@@ -3995,29 +3959,61 @@ function App() {
                       })();
                       const auditSucceeded = entry.audit_success === undefined || entry.audit_success === null ? true : Boolean(Number(entry.audit_success));
                       return (
-                      <div key={entry.id || i} style={{ fontSize: 9, color: T1, padding: "6px 0", borderBottom: i < auditLog.length - 1 ? `1px solid ${BORDER}` : "none", lineHeight: 1.6 }}>
+                      <div key={entry.id || i} style={{ fontSize: 9, color: T1, padding: "8px 0", borderBottom: i < auditLog.length - 1 ? `1px solid ${BORDER}` : "none", lineHeight: 1.6 }}>
                         <div style={{ fontSize: 8, color: T3, marginBottom: 3 }}>{new Date(entry.timestamp).toLocaleString()}</div>
                         <div style={{ color: auditSucceeded ? GREEN : RED, marginBottom: 3, fontWeight: 700 }}>
                           {auditSucceeded
                             ? `LLM audit passed${entry.audit_provider ? ` via ${entry.audit_provider}` : ""}${entry.weights_changed === false ? " (weights unchanged)" : ""}`
                             : "LLM audit failed. Weights unchanged."}
                         </div>
-                        <div style={{ color: T2, marginBottom: 4 }}>{entry.summary || "Audit recorded."}</div>
-                        <div style={{ display: "flex", gap: 8, color: T3, fontFamily: "'DM Mono',monospace", marginBottom: reasoning.length ? 4 : 0 }}>
+                        <div style={{ color: T2, marginBottom: 6, lineHeight: 1.5 }}>{entry.summary || "Audit recorded."}</div>
+                        <div style={{ display: "flex", gap: 8, color: T3, fontFamily: "'DM Mono',monospace", marginBottom: 6 }}>
                           <span>{entry.resolved_count || 0} resolved</span>
                           <span>{entry.hit_count || 0} hits</span>
                           <span>{entry.win_rate != null ? `${Math.round(Number(entry.win_rate) * 100)}%` : "-"} win</span>
                         </div>
-                        {reasoning.slice(0, 2).map((line, idx) => {
+                        {/* Weight diffs */}
+                        {auditSucceeded && entry.weights_before && entry.weights_after && (() => {
+                          const LABELS = { rsi_momentum: "RSI Momentum", volume_surge: "Volume Surge", overnight_gap_probability: "Overnight Gap", earnings_catalyst: "Earnings Catalyst", support_resistance: "S&R", relative_strength: "Relative Strength", sector_relative_strength: "Sector RS", vwap_reclaim: "VWAP Reclaim", volatility_squeeze: "Vol Squeeze" };
+                          let before, after;
+                          try { before = typeof entry.weights_before === "string" ? JSON.parse(entry.weights_before) : entry.weights_before; } catch { before = {}; }
+                          try { after = typeof entry.weights_after === "string" ? JSON.parse(entry.weights_after) : entry.weights_after; } catch { after = {}; }
+                          const diffs = Object.keys(LABELS).map(k => {
+                            const b = Math.round((before[k] || 0) * 100);
+                            const a = Math.round((after[k] || 0) * 100);
+                            return { key: k, label: LABELS[k], b, a, delta: a - b };
+                          }).filter(d => d.delta !== 0).sort((x, y) => Math.abs(y.delta) - Math.abs(x.delta));
+                          if (!diffs.length) return <div style={{ fontSize: 8, color: T3, marginBottom: 4 }}>No weight changes this audit.</div>;
+                          return (
+                            <div style={{ marginBottom: 6 }}>
+                              {diffs.map(d => (
+                                <div key={d.key} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+                                  <span style={{ fontSize: 8, color: T3, minWidth: 90 }}>{d.label}</span>
+                                  <span style={{ fontSize: 9, fontFamily: "'DM Mono',monospace", color: T2 }}>{d.b}%</span>
+                                  <span style={{ fontSize: 8, color: T3 }}>→</span>
+                                  <span style={{ fontSize: 9, fontFamily: "'DM Mono',monospace", color: T2 }}>{d.a}%</span>
+                                  <span style={{ fontSize: 9, fontFamily: "'DM Mono',monospace", fontWeight: 700, color: d.delta > 0 ? GREEN : RED }}>
+                                    {d.delta > 0 ? "+" : ""}{d.delta}%
+                                  </span>
+                                  <div style={{ flex: 1, height: 2, background: BORDER, borderRadius: 1, overflow: "hidden" }}>
+                                    <div style={{ width: `${d.a}%`, height: "100%", background: d.delta > 0 ? GREEN : RED, borderRadius: 1 }} />
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          );
+                        })()}
+                        {/* Reasoning lines */}
+                        {reasoning.slice(0, 3).map((line, idx) => {
                           const text = typeof line === "string"
                             ? line
                             : line && typeof line === "object"
                               ? `${line.provider || "provider"}: ${line.error || line.summary || "failed"}`
                               : String(line ?? "");
-                          return <div key={idx} style={{ color: T2 }}>- {text}</div>;
+                          return <div key={idx} style={{ color: T3, fontSize: 8, marginBottom: 2 }}>— {text}</div>;
                         })}
                         {!auditSucceeded && attempts.length > 0 && (
-                          <div style={{ color: T3, marginTop: 4 }}>
+                          <div style={{ color: T3, fontSize: 8, marginTop: 4 }}>
                             Attempts: {attempts.slice(0, 4).map(a => `${a.provider}: ${a.error || "failed"}`).join(" | ")}
                           </div>
                         )}
