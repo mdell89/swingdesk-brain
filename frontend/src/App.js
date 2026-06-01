@@ -180,14 +180,14 @@ function EvidenceBadge({ evidence }) {
 }
 EvidenceBadge.displayName = "EvidenceBadge";
 
-function EvidenceBadgeCompact({ evidence }) {
+function EvidenceBadgeCompact({ evidence, glowing = false }) {
   if (!evidence) return null;
   const level = evidence.level || "New";
   if (level === "New") return null;
   const color = evidenceColor(level);
   const title = evidence.description || `Evidence: ${level}`;
   return (
-    <span className="tag-glow" title={title} style={{
+    <span className={glowing ? "tag-glow" : ""} title={title} style={{
       fontSize: 7, fontWeight: 800, color, letterSpacing: .25,
       padding: "1px 4px", background: color + "16", borderRadius: 3,
       border: `1px solid ${color}55`, whiteSpace: "nowrap", flexShrink: 0,
@@ -1068,6 +1068,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
   const visibleMethods = visibleStrategyTags(confluenceMethods, strategyName);
   const signalData = getSignalData(pick);
   const signalCount = signalData.fired.length;
+  const hasSignalScores = Object.keys(signalData.scores || {}).length > 0;
   const cardKey = cardKeyOverride || (pick.ticker + "_" + (isLong ? "l" : "s"));
 
   return (
@@ -1095,7 +1096,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
       <CardActionRow
         borderColor={BORDER}
         actions={<>
-          <EvidenceBadgeCompact evidence={pick.evidence} />
+          <EvidenceBadgeCompact evidence={pick.evidence} glowing={glowing} />
           <StrategyBadge strategy={pick.strategy || strategyName} selectedStrategy={strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
           <CompactMethodTags methods={confluenceMethods} glowing={glowing} selectedStrategy={strategyName} />
           {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 && (
@@ -1157,18 +1158,24 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
             {showScoreContext && (
               <div style={{ padding: "7px 8px", background: "#111113", border: `1px solid ${BORDER}`, borderRadius: 7 }}>
                 <div style={{ fontSize: 8, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .5, marginBottom: 6 }}>Score Context</div>
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
-                  {Object.entries({ rsi_momentum: "RSI", volume_surge: "Volume", overnight_gap_probability: "Gap", earnings_catalyst: "Earnings", support_resistance: "S&R", relative_strength: "Rel Str", sector_relative_strength: "Sector RS", vwap_reclaim: "VWAP", volatility_squeeze: "Squeeze" }).map(([key, label]) => {
-                    const score = Number(signalData.scores?.[key] ?? 0);
-                    const fired = signalData.fired.includes(key);
-                    return (
-                      <div key={key} className={fired ? "tag-glow" : ""} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6, border: `1px solid ${fired ? BLUE + "55" : BORDER}`, borderRadius: 5, padding: "4px 6px", background: fired ? "#0b1220" : "#0a0a0b" }}>
-                        <span style={{ fontSize: 8, color: fired ? BLUE : T3, fontWeight: 800, letterSpacing: .25, padding: "1px 5px", background: fired ? "#0a1020" : "#121216", borderRadius: 3, border: `1px solid ${fired ? "#1a2a40" : BORDER}`, whiteSpace: "nowrap" }}>{label}</span>
-                        <span style={{ fontSize: 8, color: T1, fontFamily: "'DM Mono',monospace" }}>{Math.round(score * 100)}%</span>
-                      </div>
-                    );
-                  })}
-                </div>
+                {!hasSignalScores ? (
+                  <div style={{ fontSize: 9, color: T3, lineHeight: 1.45, padding: "3px 1px" }}>
+                    Signal-score payload is missing on this cached pick. Fresh full scans after the backend deploy will populate this tray.
+                  </div>
+                ) : (
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
+                    {Object.entries({ rsi_momentum: "RSI", volume_surge: "Volume", overnight_gap_probability: "Gap", earnings_catalyst: "Earnings", support_resistance: "S&R", relative_strength: "Rel Str", sector_relative_strength: "Sector RS", vwap_reclaim: "VWAP", volatility_squeeze: "Squeeze" }).map(([key, label]) => {
+                      const score = Number(signalData.scores?.[key] ?? 0);
+                      const fired = signalData.fired.includes(key);
+                      return (
+                        <div key={key} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6, border: `1px solid ${fired ? BLUE + "55" : BORDER}`, borderRadius: 5, padding: "4px 6px", background: fired ? "#0b1220" : "#0a0a0b" }}>
+                          <span className="tag-glow" style={{ fontFamily: "'DM Mono',monospace", fontSize: 8, fontWeight: 800, color: BLUE, letterSpacing: .25, padding: "1px 5px", background: "#0a1020", borderRadius: 3, border: "1px solid #1a2a40", whiteSpace: "nowrap" }}>{label}</span>
+                          <span style={{ fontSize: 8, color: T1, fontFamily: "'DM Mono',monospace" }}>{Math.round(score * 100)}%</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             )}
             {visibleMethods.length > 0 && (
@@ -1447,7 +1454,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
         staleTime={isStale ? staleTime : null}
         borderColor={rulingColor}
         actions={<>
-          <EvidenceBadgeCompact evidence={trade.evidence} />
+          <EvidenceBadgeCompact evidence={trade.evidence} glowing={glowing} />
           <StrategyBadge strategy={trade.strategy || strategyName} selectedStrategy={strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
           <CompactMethodTags methods={confluenceMethods} glowing={glowing} selectedStrategy={strategyName} />
           {trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7 && (
@@ -3104,8 +3111,8 @@ export default function App() {
         ::-webkit-scrollbar{width:0}
         @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
         .fadeIn{animation:fadeUp .2s ease}
-        @keyframes tagGlow{0%,100%{filter:brightness(1);box-shadow:0 0 0 transparent;transform:none}35%,70%{filter:brightness(1.55);box-shadow:0 0 7px rgba(255,255,255,.9),0 0 14px rgba(96,165,250,.9),0 0 22px currentColor;transform:translateY(-1px)}}
-        .tag-glow{animation:tagGlow 1.35s ease-in-out 0.05s 2;position:relative;z-index:3;will-change:filter,box-shadow,transform}
+        @keyframes tagGlow{0%{filter:none;opacity:1}50%{filter:drop-shadow(0 0 5px currentColor) drop-shadow(0 0 2px currentColor);opacity:.96}100%{filter:none;opacity:1}}
+        .tag-glow{animation:tagGlow 0.9s ease-in-out 0.25s;position:relative;z-index:2}
       `}</style>
 
       {showTickerBanner && <TickerBanner openPositions={openPositions} />}
