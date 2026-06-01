@@ -1,5 +1,11 @@
 """
-brain.py — Overnight Swing Desk Backend v19b (Push 47b)
+brain.py — Overnight Swing Desk Backend v19b (Push 54)
+
+Changes in Push 54:
+  - Scoring loop emits per-ticker progress every 5 tickers via record_nn_scan_status()
+    writes: current_ticker, total_scanned, scanned_tickers (last 40) to app_state
+    surfaces through existing /api/nn-scan-status endpoint — no new routes
+
 ════════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
@@ -4887,7 +4893,8 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
     all_open_tickers = open_long_tickers | open_short_tickers
 
     scored_stocks = []
-    for ticker in universe:
+    _scan_ticker_log = []
+    for _scan_i, ticker in enumerate(universe):
         if ticker not in price_data:
             continue
         # Skip tickers with open positions — they're already committed
@@ -4895,6 +4902,16 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         if ticker in all_open_tickers:
             continue
         stock_data = price_data[ticker]
+        _scan_ticker_log.append(ticker)
+        if _scan_i % 5 == 0 or _scan_i == len(universe) - 1:
+            record_nn_scan_status(
+                status="running",
+                phase="scoring",
+                current_ticker=ticker,
+                total_scanned=len(_scan_ticker_log),
+                scanned_tickers=_scan_ticker_log[-40:],
+                scan_event_id=scan_event_id,
+            )
         rsi = rsi_values.get(ticker, 50.0)
         has_earnings = ticker in earnings_soon
 

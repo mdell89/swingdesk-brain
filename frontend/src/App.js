@@ -1,8 +1,23 @@
 import React, { useState, useEffect, useMemo } from "react";
 
 /*
- * Overnight Swing Desk — Frontend v32 (Push 46)
+ * Overnight Swing Desk — Frontend v32 (Push 54)
  * ══════════════════════════════════════════════
+ * Changes in Push 54:
+ *   - ScanPanel component in Brain tab: full-width scan trigger box
+ *     live ticker chip stream, progress bar, phase labels, polling at 1.2s
+ *     POST /api/shared-scan-now → polls /api/nn-scan-status until done
+ *
+ * Push 48–53: Codex (see git log)
+ *
+ * Push 47:
+ *   - Net view label restored (was renamed to Fees off/on, now back to Net view)
+ *   - Nova: added ⓘ info icon with tooltip matching Vector
+ *   - Day's P&L paddingTop: 6 on both Vector and Nova
+ *   - Removed vs $X.XX baseline note from Vector
+ *   - Nova metric row: grid → flex, borderRadius 10, fontSize 16/9, fontWeight 600
+ *   - Nova percent row font-matched to Vector (13/500, 12)
+ *
  * Changes in Push 46:
  *   - SettingsDrawer: Telegram bot info section — shows configured/not configured
  *     provider label updates (Telegram vs Twilio) on notification toggle
@@ -1677,7 +1692,213 @@ class ErrorBoundary extends React.Component {
   }
 }
 
-export default function App() {
+export default 
+// ═══════════════════════════════════════════════
+// SCAN PANEL — comprehensive ticker scan trigger
+// ═══════════════════════════════════════════════
+function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
+  const [scanState, setScanState] = React.useState("idle"); // idle | running | done | error
+  const [phase, setPhase] = React.useState("");
+  const [totalScanned, setTotalScanned] = React.useState(0);
+  const [totalUniverse, setTotalUniverse] = React.useState(0);
+  const [currentTicker, setCurrentTicker] = React.useState("");
+  const [scannedTickers, setScannedTickers] = React.useState([]);
+  const [qualified, setQualified] = React.useState(0);
+  const [picks, setPicks] = React.useState(0);
+  const [startedAt, setStartedAt] = React.useState(null);
+  const [finishedAt, setFinishedAt] = React.useState(null);
+  const [errorMsg, setErrorMsg] = React.useState("");
+  const pollRef = React.useRef(null);
+  const tickerScrollRef = React.useRef(null);
+
+  const stopPolling = () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
+
+  const pollStatus = React.useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/nn-scan-status`);
+      const d = await res.json();
+      setPhase(d.phase || "");
+      setTotalScanned(d.total_scanned || 0);
+      setCurrentTicker(d.current_ticker || "");
+      setScannedTickers(d.scanned_tickers || []);
+      setQualified(d.qualified || 0);
+      setPicks(d.picks || 0);
+      if (d.started_at) setStartedAt(d.started_at);
+      if (d.status === "running") {
+        setScanState("running");
+      } else if (d.status === "success" || d.status === "degraded") {
+        setScanState("done");
+        setFinishedAt(d.finished_at || new Date().toISOString());
+        stopPolling();
+      } else if (d.status === "error" || d.status === "stalled") {
+        setScanState("error");
+        setErrorMsg(d.error || "Scan stalled or failed.");
+        stopPolling();
+      }
+    } catch (e) {
+      // network hiccup — keep polling
+    }
+  }, [API]);
+
+  // On mount check if a scan is already running
+  React.useEffect(() => {
+    pollStatus();
+  }, []);
+
+  // Auto-scroll ticker list
+  React.useEffect(() => {
+    if (tickerScrollRef.current) {
+      tickerScrollRef.current.scrollLeft = tickerScrollRef.current.scrollWidth;
+    }
+  }, [scannedTickers]);
+
+  const triggerScan = async () => {
+    setScanState("running");
+    setPhase("starting");
+    setTotalScanned(0);
+    setScannedTickers([]);
+    setCurrentTicker("");
+    setQualified(0);
+    setPicks(0);
+    setErrorMsg("");
+    setStartedAt(new Date().toISOString());
+    setFinishedAt(null);
+    try {
+      await fetch(`${API}/shared-scan-now`, { method: "POST" });
+    } catch (e) { /* fire and forget */ }
+    stopPolling();
+    pollRef.current = setInterval(pollStatus, 1200);
+  };
+
+  React.useEffect(() => () => stopPolling(), []);
+
+  const elapsed = startedAt ? Math.round((new Date(finishedAt || Date.now()) - new Date(startedAt)) / 1000) : 0;
+  const progressPct = totalUniverse > 0 ? Math.min(100, Math.round(totalScanned / totalUniverse * 100)) : (totalScanned > 0 ? Math.min(99, Math.round(totalScanned / 1.5)) : 0);
+
+  const phaseLabel = {
+    "starting": "Initializing...",
+    "fetching_prices": "Fetching price data...",
+    "scoring": `Scoring tickers...`,
+    "": scanState === "running" ? "Scanning..." : "",
+  }[phase] || phase;
+
+  const accentColor = scanState === "done" ? GREEN : scanState === "error" ? RED : BLUE;
+
+  return (
+    <div style={{ marginBottom: 16 }}>
+      {/* Main scan button / status box */}
+      <div style={{
+        background: CARD,
+        border: `1.5px solid ${accentColor}`,
+        borderRadius: 12,
+        overflow: "hidden",
+        transition: "border-color 0.3s",
+      }}>
+
+        {/* Header row */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 14px 10px" }}>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: T1, letterSpacing: .3 }}>
+              {scanState === "running" ? "⚡ Scanning..." : scanState === "done" ? "✓ Scan complete" : scanState === "error" ? "✗ Scan failed" : "Comprehensive Scan"}
+            </div>
+            <div style={{ fontSize: 9, color: T3, marginTop: 2, fontFamily: "'DM Mono',monospace" }}>
+              {scanState === "running"
+                ? `${totalScanned} tickers scored${elapsed > 0 ? ` · ${elapsed}s` : ""}`
+                : scanState === "done"
+                ? `${totalScanned} scanned · ${qualified} qualified · ${picks} picks · ${elapsed}s`
+                : scanState === "error"
+                ? errorMsg.slice(0, 60)
+                : "Vector + Nova · all tickers · live data"}
+            </div>
+          </div>
+          <button
+            onClick={triggerScan}
+            disabled={scanState === "running"}
+            style={{
+              background: scanState === "running" ? "transparent" : accentColor,
+              border: `1.5px solid ${accentColor}`,
+              borderRadius: 8,
+              padding: "7px 14px",
+              fontSize: 10,
+              fontWeight: 700,
+              color: scanState === "running" ? accentColor : "#000",
+              cursor: scanState === "running" ? "default" : "pointer",
+              fontFamily: "'DM Mono',monospace",
+              letterSpacing: 1,
+              whiteSpace: "nowrap",
+              opacity: scanState === "running" ? 0.7 : 1,
+            }}
+          >
+            {scanState === "running" ? "RUNNING" : scanState === "done" ? "RUN AGAIN" : "SCAN NOW"}
+          </button>
+        </div>
+
+        {/* Progress bar */}
+        {(scanState === "running" || scanState === "done") && (
+          <div style={{ height: 3, background: `${BORDER}`, margin: "0 14px" }}>
+            <div style={{
+              height: "100%",
+              width: scanState === "done" ? "100%" : `${Math.max(4, progressPct)}%`,
+              background: accentColor,
+              borderRadius: 2,
+              transition: "width 0.8s ease",
+            }} />
+          </div>
+        )}
+
+        {/* Phase label + current ticker */}
+        {scanState === "running" && (
+          <div style={{ padding: "6px 14px 4px", display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 9, color: T3, fontFamily: "'DM Mono',monospace" }}>{phaseLabel}</span>
+            {currentTicker && (
+              <span style={{ fontSize: 9, color: BLUE, fontFamily: "'DM Mono',monospace", fontWeight: 700 }}>
+                → {currentTicker}
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* Ticker stream */}
+        {scannedTickers.length > 0 && (
+          <div
+            ref={tickerScrollRef}
+            style={{
+              display: "flex",
+              gap: 5,
+              padding: "6px 14px 12px",
+              overflowX: "auto",
+              scrollbarWidth: "none",
+              WebkitOverflowScrolling: "touch",
+            }}
+          >
+            {scannedTickers.map((t, i) => {
+              const isLatest = i === scannedTickers.length - 1 && scanState === "running";
+              return (
+                <div key={t + i} style={{
+                  flexShrink: 0,
+                  padding: "3px 7px",
+                  borderRadius: 5,
+                  fontSize: 9,
+                  fontWeight: isLatest ? 700 : 500,
+                  fontFamily: "'DM Mono',monospace",
+                  background: isLatest ? `${BLUE}22` : `${BORDER}`,
+                  color: isLatest ? BLUE : T3,
+                  border: `1px solid ${isLatest ? BLUE : "transparent"}`,
+                  transition: "all 0.2s",
+                }}>
+                  {t}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+function App() {
   const [loadProgress, setLoadProgress] = useState(0);
   const [loadStatus, setLoadStatus] = useState("Connecting to brain...");
   const [loaded, setLoaded] = useState(false);
@@ -3714,6 +3935,10 @@ export default function App() {
       {tab === "intel" && (
         <div className="fadeIn" style={{ padding: "10px 16px 0" }}>
           {tabLoading && <div style={{ textAlign: "center", padding: 20, fontSize: 11, color: T3 }}>Loading...</div>}
+
+          {/* ── SCAN PANEL ── */}
+          <ScanPanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} />
+
           <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
             <div style={{ fontSize: 14, fontWeight: 600, color: T1, marginBottom: 4 }}>Self-audit engine</div>
             <div style={{ fontSize: 10, color: T3 }}>{lastAudit ? `Last audit attempt: ${new Date(lastAudit).toLocaleString()}` : "No audit attempts yet."}</div>
