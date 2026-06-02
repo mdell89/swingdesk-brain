@@ -2419,6 +2419,19 @@ def canonicalize_signal_map(blob):
         normalized[canonical_signal_key(key)] = value
     return normalized
 
+def extract_signal_score_map(payload):
+    """Return canonical signal scores from flat, nested, or JSON string payloads."""
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload or "{}")
+        except Exception:
+            payload = {}
+    if isinstance(payload, dict) and isinstance(payload.get("scores"), dict):
+        payload = payload.get("scores") or {}
+    if not isinstance(payload, dict):
+        return {}
+    return canonicalize_signal_map(payload)
+
 def split_price_context(ticker, price_context):
     """
     Accept either a full universe price map or a single ticker data row.
@@ -2446,15 +2459,8 @@ def get_variant_signal_weights(database, variant_id):
 
 def variant_weighted_signal_score(pick, weights):
     scores = pick.get("signal_scores_for_observation") or pick.get("signal_scores") or {}
-    if isinstance(scores, str):
-        try:
-            scores = json.loads(scores)
-        except Exception:
-            scores = {}
-    if isinstance(scores, dict) and "scores" in scores:
-        scores = scores.get("scores") or {}
     base_conf, _ = pick_confidence_and_move(pick)
-    scores = canonicalize_signal_map(scores)
+    scores = extract_signal_score_map(scores)
     if not isinstance(scores, dict) or not scores:
         return float(base_conf)
     weighted = sum(float(scores.get(k, 0.5) or 0.5) * float(weights.get(k, 0)) for k in canonical_signal_weights())
@@ -2471,7 +2477,7 @@ def learn_variant_from_closed_trade(database, trade_row, outcome, actual_move):
     scores = scores_blob.get("scores") if isinstance(scores_blob, dict) else {}
     if not isinstance(scores, dict):
         scores = scores_blob if isinstance(scores_blob, dict) else {}
-    scores = canonicalize_signal_map(scores)
+    scores = extract_signal_score_map(scores)
     after = dict(before)
     reasoning = []
     status = "updated"
@@ -2722,11 +2728,7 @@ def variant_strategy_matches(strategy, pick):
         return gap >= 2.5 and day_change > 2 and volume >= 1.1
     if strategy == "vwap reclaim":
         scores = pick.get("signal_scores_for_observation") or pick.get("signal_scores") or {}
-        if isinstance(scores, str):
-            try:
-                scores = json.loads(scores)
-            except Exception:
-                scores = {}
+        scores = extract_signal_score_map(scores)
         return float(scores.get("vwap_reclaim") or 0) >= 0.65 or "vwap" in method_text
     if strategy == "inside day":
         return abs(gap) <= 4 and day_change > 0.5 and volume >= 0.8 and 45 <= rsi <= 65
@@ -2738,11 +2740,7 @@ def variant_strategy_matches(strategy, pick):
         return volume >= 1.4 and day_change > 0.5 and confidence >= 60
     if strategy == "vol squeeze breakout":
         scores = pick.get("signal_scores_for_observation") or pick.get("signal_scores") or {}
-        if isinstance(scores, str):
-            try:
-                scores = json.loads(scores)
-            except Exception:
-                scores = {}
+        scores = extract_signal_score_map(scores)
         return float(scores.get("volatility_squeeze") or 0) >= 0.5 and day_change > 1
     if strategy == "relative strength pullback":
         return confidence >= 62 and day_change > 0 and regular_open_change <= 1.5 and 42 <= rsi <= 62 and volume >= 1.0
