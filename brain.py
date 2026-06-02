@@ -5499,7 +5499,7 @@ def get_cached_picks():
     return None
 
 # ── NEURAL NETWORK SCAN ──────────────────────────────────────────────────────
-def run_variant_universes_from_cache(trigger="manual", buy_time=None):
+def run_variant_universes_from_cache(trigger="manual", buy_time=None, require_fresh=True):
     """Open simulated trades for every active strategy universe from cached shared scan outputs."""
     status = {
         "success": True,
@@ -5518,7 +5518,7 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None):
     target_execution_time = buy_time[:5]
     database = get_database()
     try:
-        snapshot, refusal = variant_cache_snapshot(database, require_fresh=True)
+        snapshot, refusal = variant_cache_snapshot(database, require_fresh=require_fresh)
         if refusal:
             status.update(refusal)
             database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_variant_run', ?)", [json.dumps(status)])
@@ -8621,6 +8621,7 @@ def api_variant_status():
             payload["cache_issue"] = refusal
         now = current_time_cst()
         last_run_date = str((last_run or {}).get("ran_at") or "")[:10]
+        last_run_succeeded = bool((last_run or {}).get("success", True)) and not bool((last_run or {}).get("refused"))
         today = now.strftime("%Y-%m-%d")
         has_openable_snapshot = bool((payload.get("vector_pick_count") or 0) + (payload.get("nova_pick_count") or 0))
         after_primary_execution = now.hour > 8 or (now.hour == 8 and now.minute >= 50)
@@ -8628,10 +8629,10 @@ def api_variant_status():
             after_primary_execution and
             has_openable_snapshot and
             int(payload.get("open_positions") or 0) == 0 and
-            last_run_date != today
+            (last_run_date != today or not last_run_succeeded)
         )
         payload["missed_variant_open_reason"] = (
-            "Cached Vector/Nova picks exist after 8:50 AM Central, but no variant universe has open positions and last_variant_run is not from today."
+            "Cached Vector/Nova picks exist after 8:50 AM Central, but no variant universe has open positions and last_variant_run did not successfully open today."
             if payload["missed_variant_open_alert"] else None
         )
         return jsonify(payload)
@@ -8937,7 +8938,11 @@ def api_recover_missed_variant_open():
     try:
         body = request.get_json(silent=True) or {}
         buy_time = body.get("buy_time") or "08:45:00"
-        result = run_variant_universes_from_cache(trigger="manual_recovery_0845", buy_time=buy_time)
+        result = run_variant_universes_from_cache(
+            trigger="manual_recovery_0845",
+            buy_time=buy_time,
+            require_fresh=False,
+        )
         return jsonify(result), 200 if result.get("success", True) else 500
     except Exception as e:
         log.error(f"Manual missed variant-open recovery failed: {e}")
