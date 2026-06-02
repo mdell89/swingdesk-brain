@@ -677,7 +677,7 @@ function calculateSimulationProjection(trades = []) {
   };
 }
 
-function strategyTagList(item = {}) {
+function confluenceMethodTagList(item = {}) {
   return uniqueList([
     ...parseList(item.confluence_methods),
     ...parseList(item.strategy_methods),
@@ -685,7 +685,7 @@ function strategyTagList(item = {}) {
   ]).filter(method => normalizeStrategyName(method) !== "all");
 }
 
-function visibleStrategyTags(methods = [], selectedStrategy = "") {
+function visibleConfluenceMethodTags(methods = [], selectedStrategy = "") {
   const list = uniqueList(methods);
   if (normalizeStrategyName(selectedStrategy) === "all") return list;
   return list.filter(method => normalizeStrategyName(method) !== normalizeStrategyName(selectedStrategy));
@@ -701,7 +701,7 @@ function averageTradesByTicker(trades = [], brain = "", feeAdjusted = true) {
   });
   return Array.from(groups.values()).map(group => {
     const base = group[0] || {};
-    const methods = uniqueList(group.flatMap(strategyTagList));
+    const methods = uniqueList(group.flatMap(confluenceMethodTagList));
     const invested = avg(group.map(t => Number(t.invested_amount || 0)));
     const current = avg(group.map(t => getValuationFields(t, feeAdjusted).current));
     return {
@@ -789,7 +789,7 @@ function StrategyBadge({ strategy, selectedStrategy, color = BLUE }) {
 }
 
 function CompactMethodTags({ methods = [], glowing = false, selectedStrategy = "" }) {
-  const list = visibleStrategyTags(methods, selectedStrategy);
+  const list = visibleConfluenceMethodTags(methods, selectedStrategy);
   return list.slice(0, 3).map(method => (
     <span key={method} className={glowing ? "tag-glow" : ""} style={{
       fontSize: 7,
@@ -1039,8 +1039,8 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
   const borderColor = confidenceColor(confidence, themeKey);
   const dayChange = pick.dayChg || 0;
   const dayUp = dayChange >= 0;
-  const confluenceMethods = strategyTagList(pick);
-  const visibleMethods = visibleStrategyTags(confluenceMethods, strategyName);
+  const confluenceMethods = confluenceMethodTagList(pick);
+  const visibleMethods = visibleConfluenceMethodTags(confluenceMethods, strategyName);
   const signalData = getSignalData(pick);
   const signalCount = signalData.fired.length;
   const hasSignalScores = Object.keys(signalData.scores || {}).length > 0;
@@ -1298,8 +1298,8 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
   const companyContext = getCompanyContext(trade);
 
   // Safe parse — confluence_methods may arrive as JSON string from DB
-  const confluenceMethods = strategyTagList(trade);
-  const visibleMethods = visibleStrategyTags(confluenceMethods, strategyName);
+  const confluenceMethods = confluenceMethodTagList(trade);
+  const visibleMethods = visibleConfluenceMethodTags(confluenceMethods, strategyName);
   const signalData = getSignalData(trade);
   const signalCount = signalData.fired.length;
 
@@ -2239,6 +2239,9 @@ export default function App() {
     { id: "oldest",     label: "Oldest"     },
     { id: "newest",     label: "Newest"     },
   ];
+  // Taxonomy note: this UI list includes the primary SwingDesk strategy plus
+  // method-derived experimental universes. Confluence methods are evidence tags;
+  // only audited rows should be treated as mature standalone strategies.
   const STRATEGY_OPTIONS = [
     "SwingDesk",
     "Darvas",
@@ -3934,10 +3937,7 @@ export default function App() {
                     const returnPct = Number(row.return_pct || 0);
                     const winColor = winRate == null ? T3 : winRate >= 60 ? GREEN : winRate >= 45 ? AMBER : RED;
                     const brainColor = row.brain === "Nova" ? "#a78bfa" : BLUE;
-                    const method = row.id;
-                    const METHOD_INFO = {
-                      [row.id]: `Live variant ledger for ${row.strategy} / ${row.brain} / ${row.execution_time || "Reg"} / ${row.selection_mode || "All"}. This is the same universe ledger used by the Brain tab.`,
-                    };
+                    const universeInfo = `Live simulation-universe ledger for ${row.strategy} / ${row.brain} / ${row.execution_time || "Reg"} / ${row.selection_mode || "All"}. Some method-named universes are still experimental filters over the shared scan stream until their standalone entry/exit rules are audited.`;
                     const stats = {
                       total_signals: closedCount + openCount,
                       win_rate: winRate,
@@ -3970,7 +3970,7 @@ export default function App() {
 
                         {isExpanded && (
                           <div style={{ padding: "0 14px 14px", borderTop: `1px solid ${BORDER}` }}>
-                            <div style={{ fontSize: 10, color: T3, lineHeight: 1.6, paddingTop: 10, marginBottom: 12 }}>{METHOD_INFO[method]}</div>
+                            <div style={{ fontSize: 10, color: T3, lineHeight: 1.6, paddingTop: 10, marginBottom: 12 }}>{universeInfo}</div>
 
                             {stats && stats.total_signals > 0 ? (
                               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginBottom: 12 }}>

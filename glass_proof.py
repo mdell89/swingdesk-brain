@@ -208,7 +208,8 @@ def build_variant_ledger_proof(database, variant, snapshot=None, get_weights=Non
 def proof_contract():
     """Human-readable contract surfaced by the glass-house endpoint."""
     return {
-        "variant_alive": "Active variant has a portfolio and can evaluate the latest shared Vector/Nova snapshot.",
+        "taxonomy": "Confluence methods are evidence tags; strategies are standalone systems; variants are controlled experiments inside a strategy; strategy_variants rows are simulation universes.",
+        "variant_alive": "Active simulation universe has a portfolio and can evaluate the latest shared Vector/Nova snapshot.",
         "evaluation": "selected_count explains live picks; evaluated_no_pick rows include source/qualified counts and filter reasons when the source list was non-empty.",
         "ledger": "equity must equal cash plus open_value; open_value and realized_pnl must tie to variant_virtual_trades.",
         "learning": "daily learning may only consume closed trades with sell_date; every eligible closed trade must produce either a weight-change event or an explicit no-op event.",

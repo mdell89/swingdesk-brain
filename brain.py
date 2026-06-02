@@ -905,6 +905,9 @@ def initialize_database():
         );
 
         CREATE TABLE IF NOT EXISTS strategy_variants (
+            -- Historical table name. Each row is a simulation universe:
+            -- strategy/method label + brain + entry time + selection mode + exit mode.
+            -- Not every row is a fully independent standalone strategy.
             id TEXT PRIMARY KEY,
             strategy TEXT NOT NULL,
             brain TEXT NOT NULL,
@@ -3905,10 +3908,14 @@ def calculate_support_resistance(ticker, price_data):
 
 def calculate_method_confluence(ticker, price_data, scored_stocks=None):
     """
-    Score a ticker against 8 trading methods and return confluence count.
-    Each method returns True/False based on its rules applied to daily OHLCV data.
+    Score a ticker against confluence methods and return agreement count.
 
-    Methods:
+    Confluence methods are descriptive tags: they show that a stock resembles
+    a known setup. They are not automatically standalone strategies with their
+    own independent entry/exit lifecycle. If a method later becomes a strategy,
+    it must get a separate strategy audit and execution contract.
+
+    Confluence methods:
     1.  Darvas Box          — near 52W high + volume + positive gap
     2.  Gap and Go          — gap up >2% + volume surge
     3.  Donchian Channel    — price above 20-day high
@@ -8450,7 +8457,12 @@ def api_method_stats():
 
 @app.route("/api/strategy-variants")
 def api_strategy_variants():
-    """Return registered strategy/model/execution variants."""
+    """Return registered simulation universes.
+
+    Historical route/table naming uses "strategy variants", but each row is a
+    universe combining strategy/method label, brain, entry time, selection mode,
+    exit mode, and portfolio ledger.
+    """
     try:
         db = get_database()
         rows = [dict(r) for r in db.execute("""
