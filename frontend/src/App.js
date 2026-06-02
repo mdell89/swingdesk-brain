@@ -1033,7 +1033,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
           )}
           <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center", flexShrink: 0 }}>{confluenceMethods.length}/{strategyTotal}</span>
-          <span className={showScoreContext ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: BLUE, letterSpacing: .3, padding: "1px 4px", background: "#0a1020", borderRadius: 3, border: "1px solid #1a2a40", textAlign: "center", flexShrink: 0 }}>{signalCount}/9</span>
+          <span className={expanded && showScoreContext ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: BLUE, letterSpacing: .3, padding: "1px 4px", background: "#0a1020", borderRadius: 3, border: "1px solid #1a2a40", textAlign: "center", flexShrink: 0 }}>{signalCount}/9</span>
         </>}
       />
       {expanded && (
@@ -2868,8 +2868,8 @@ export default function App() {
         ::-webkit-scrollbar{width:0}
         @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
         .fadeIn{animation:fadeUp .2s ease}
-        @keyframes tagGlow{0%{filter:drop-shadow(0 0 1px currentColor);opacity:1}50%{filter:drop-shadow(0 0 5px currentColor) drop-shadow(0 0 2px currentColor);opacity:.96}100%{filter:drop-shadow(0 0 3px currentColor);opacity:1}}
-        .tag-glow{animation:tagGlow 0.9s ease-in-out 0.25s;filter:drop-shadow(0 0 3px currentColor);position:relative;z-index:2}
+        @keyframes tagGlow{0%{box-shadow:none;opacity:1}50%{box-shadow:0 0 4px 1px currentColor;opacity:.85}100%{box-shadow:none;opacity:1}}
+        .tag-glow{animation:tagGlow 0.9s ease-in-out 0.3s;position:relative;z-index:2}
       `}</style>
 
       {showTickerBanner && <TickerBanner openPositions={openPositions} />}
