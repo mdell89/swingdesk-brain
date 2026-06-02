@@ -8948,6 +8948,138 @@ def api_recover_missed_variant_open():
         log.error(f"Manual missed variant-open recovery failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
+@app.route("/api/recover-missed-variant-open-from-executions", methods=["POST"])
+def api_recover_missed_variant_open_from_executions():
+    """Recover primary SwingDesk 8:45 simulation universes from real open executions.
+
+    Use this when the main Vector/Nova opening engines succeeded but the variant
+    universe runner missed its 8:45 job. It only reconstructs the primary
+    SwingDesk 8:45 universes, using the real open rows as the source of truth.
+    """
+    database = get_database()
+    today = current_time_cst().strftime("%Y-%m-%d")
+    status = {
+        "success": True,
+        "trigger": "manual_recovery_from_executions",
+        "ran_at": current_time_cst().isoformat(),
+        "variants": 0,
+        "opened_count": 0,
+        "skipped_count": 0,
+        "opened": [],
+        "skipped": [],
+        "errors": [],
+    }
+    try:
+        source_tables = {
+            "Vector": "virtual_trades",
+            "Nova": "nn_virtual_trades",
+        }
+        variants = [dict(row) for row in database.execute("""
+            SELECT sv.*, vp.cash, vp.equity
+            FROM strategy_variants sv
+            JOIN variant_portfolios vp ON vp.variant_id = sv.id
+            WHERE sv.status='active'
+              AND vp.lifecycle_status!='archived'
+              AND sv.strategy='SwingDesk'
+              AND sv.execution_time='08:45'
+        """).fetchall()]
+        status["variants"] = len(variants)
+        for variant in variants:
+            source_table = source_tables.get(variant.get("brain"))
+            if not source_table:
+                continue
+            source_rows = [dict(row) for row in database.execute(f"""
+                SELECT *
+                FROM {source_table}
+                WHERE outcome='open'
+                  AND buy_date=?
+                  AND COALESCE(direction, 'long')='long'
+                ORDER BY buy_time ASC, ticker ASC
+            """, [today]).fetchall()]
+            if not source_rows:
+                status["skipped_count"] += 1
+                status["skipped"].append({"variant_id": variant["id"], "reason": f"no {variant.get('brain')} open executions today"})
+                update_variant_portfolio(database, variant["id"], note="recovery_no_source_opens")
+                continue
+            existing_open_count = int(database.execute(
+                "SELECT COUNT(*) AS n FROM variant_virtual_trades WHERE variant_id=? AND outcome='open'",
+                [variant["id"]],
+            ).fetchone()["n"] or 0)
+            open_cap = variant_open_position_cap(variant)
+            variant_opened = 0
+            for rank, source in enumerate(source_rows, start=1):
+                if existing_open_count + variant_opened >= open_cap:
+                    break
+                ticker = source.get("ticker")
+                trade_id = f"{variant['id']}_{ticker}_{today}_long"
+                if database.execute("SELECT id FROM variant_virtual_trades WHERE id=?", [trade_id]).fetchone():
+                    status["skipped_count"] += 1
+                    status["skipped"].append({"variant_id": variant["id"], "ticker": ticker, "reason": "already recovered/executed today"})
+                    continue
+                portfolio = dict(database.execute("SELECT * FROM variant_portfolios WHERE variant_id=?", [variant["id"]]).fetchone())
+                invested = variant_investment_amount(portfolio)
+                buy_price = float(source.get("buy_price") or source.get("current_price") or 0)
+                if invested <= 0 or buy_price <= 0:
+                    status["skipped_count"] += 1
+                    status["skipped"].append({"variant_id": variant["id"], "ticker": ticker, "reason": "missing cash or buy price"})
+                    continue
+                confidence = int(source.get("lock_in_confidence") or source.get("nn_confidence") or source.get("confidence") or 0)
+                expected_move = float(source.get("expected_move") or 0)
+                signal_scores = source.get("signal_scores") or json.dumps({"scores": {}, "fired": [], "values": {}})
+                confluence_methods = source.get("confluence_methods") or "[]"
+                if not isinstance(confluence_methods, str):
+                    confluence_methods = json.dumps(confluence_methods)
+                confluence_count = int(source.get("confluence_count") or 0)
+                fee_quote = calculate_stock_fee_model(invested, buy_price, buy_price, "long")
+                database.execute(f"""
+                    INSERT INTO variant_virtual_trades
+                    (id, variant_id, strategy, brain, ticker, direction, buy_date, buy_time,
+                     buy_price, invested_amount, current_value, confidence, expected_move,
+                     {FEE_MODEL_INSERT_COLUMNS},
+                     outcome, sector, reasoning, signal_scores, confluence_count, confluence_methods, source_scan_time, source_rank,
+                     created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 'long', ?, ?, ?, ?, ?, ?, ?, {FEE_MODEL_INSERT_PLACEHOLDERS}, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    trade_id, variant["id"], variant["strategy"], variant["brain"], ticker, today, source.get("buy_time") or "08:45:00",
+                    buy_price, round(invested, 4), fee_quote["net_current_value"], confidence, expected_move,
+                    *fee_model_values(fee_quote),
+                    source.get("sector") or get_sector(ticker),
+                    source.get("reasoning") or f"{variant['brain']} execution recovery",
+                    signal_scores,
+                    confluence_count,
+                    confluence_methods,
+                    source.get("source_scan_time") or source.get("created_at") or status["ran_at"],
+                    rank,
+                    status["ran_at"],
+                    status["ran_at"],
+                ])
+                database.execute("""
+                    UPDATE variant_portfolios
+                    SET cash=ROUND(cash - ?, 4), updated_at=?
+                    WHERE variant_id=?
+                """, [round(invested, 4), status["ran_at"], variant["id"]])
+                status["opened_count"] += 1
+                variant_opened += 1
+                status["opened"].append({
+                    "variant_id": variant["id"],
+                    "ticker": ticker,
+                    "buy_price": buy_price,
+                    "invested_amount": round(invested, 4),
+                    "source_table": source_table,
+                })
+            update_variant_portfolio(database, variant["id"], note="recovery_from_executions")
+        database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_variant_run', ?)", [json.dumps(status)])
+        database.commit()
+        return jsonify(status)
+    except Exception as error:
+        database.rollback()
+        status["success"] = False
+        status["errors"].append(str(error))
+        log.error(f"recover missed variant open from executions failed: {error}")
+        return jsonify(status), 500
+    finally:
+        database.close()
+
 @app.route("/api/variant-monitor-now", methods=["POST"])
 def api_variant_monitor_now():
     """Manually refresh all open universe simulations."""
