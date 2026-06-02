@@ -125,25 +125,12 @@ const formatSellReason = reason => {
  */
 
 // ─── BACKEND API ──────────────────────────────────────────────────────────────
-const API = "https://swingdesk-brain-production-205e.up.railway.app/api";
+const API_BASE = "https://swingdesk-brain-production-205e.up.railway.app";
+const API = `${API_BASE}/api`;
 async function apiFetch(path, opts = {}) {
   const response = await fetch(API + path, { headers: { "Content-Type": "application/json" }, ...opts });
   if (!response.ok) throw new Error(`API ${path} → ${response.status}`);
   return response.json();
-}
-
-// Brain offline fallback — returns last known data with a stale flag
-async function apiFetchWithFallback(path, fallbackPath = "/last-known") {
-  try {
-    return await apiFetch(path);
-  } catch {
-    try {
-      const fallback = await apiFetch(fallbackPath);
-      return { ...fallback, offline: true };
-    } catch {
-      return null;
-    }
-  }
 }
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -161,24 +148,6 @@ function evidenceColor(level) {
   if (level === "Thin") return AMBER;
   return T3;
 }
-
-function EvidenceBadge({ evidence }) {
-  if (!evidence) return null;
-  const level = evidence.level || "New";
-  const color = evidenceColor(level);
-  const title = evidence.description || `Evidence: ${level}`;
-  return (
-    <span title={title} style={{
-      fontSize: 7, fontWeight: 800, color, letterSpacing: .25,
-      padding: "1px 4px", background: color + "16", borderRadius: 3,
-      border: `1px solid ${color}55`, whiteSpace: "nowrap", flexShrink: 0,
-      display: "inline-flex", alignItems: "center", gap: 3,
-    }}>
-      EVID {level} <span aria-hidden="true" style={{ fontSize: 8, lineHeight: 1 }}>ⓘ</span>
-    </span>
-  );
-}
-EvidenceBadge.displayName = "EvidenceBadge";
 
 function EvidenceBadgeCompact({ evidence, glowing = false }) {
   if (!evidence) return null;
@@ -237,37 +206,7 @@ function mapPickFields(pick) {
   };
 }
 
-function getBuyLabel(hasOpenPositions) {
-  // Returns "Buy today", "Bought today", or "Bought Friday" based on context
-  const now = new Date();
-  const cst = new Date(now.toLocaleString("en-US", { timeZone: "America/Chicago" }));
-  const day = cst.getDay(); // 0=Sun, 1=Mon...6=Sat
-  const isWeekend = day === 0 || day === 6;
-  const afterOpen = cst.getHours() > 8 || (cst.getHours() === 8 && cst.getMinutes() >= 45);
-
-  if (isWeekend || hasOpenPositions) {
-    // Find last trading day name
-    if (day === 0) return "Bought Friday"; // Sunday
-    if (day === 6) return "Bought Friday"; // Saturday
-    if (day === 1) return "Bought Friday"; // Monday (bought last Friday)
-    return "Bought today";
-  }
-  if (afterOpen) return "Bought today";
-  return "Buy today";
-}
-
 // ─── SENTIMENT ENGINE ─────────────────────────────────────────────────────────
-function getTimeElapsedFraction() {
-  // Returns 0-1 representing how far through the trading day we are (8:45 AM - 2:45 PM CST)
-  const now = new Date();
-  const cst = new Date(now.toLocaleString("en-US", { timeZone: "America/Chicago" }));
-  const isWeekday = cst.getDay() >= 1 && cst.getDay() <= 5;
-  if (!isWeekday) return 0; // Weekend — no time pressure
-  const minutesSinceOpen = (cst.getHours() - 8) * 60 + (cst.getMinutes() - 45);
-  const totalTradingMinutes = 360; // 8:45 AM to 2:45 PM
-  return Math.max(0, Math.min(1, minutesSinceOpen / totalTradingMinutes));
-}
-
 function getSentimentLabel(pnlPercent, frozenTarget, sentimentIcon, pdtRemaining) {
   const now = new Date();
   const cst = new Date(now.toLocaleString("en-US", { timeZone: "America/Chicago" }));
@@ -638,10 +577,6 @@ function getSignalData(item = {}) {
   return { fired: uniqueList(fired), scores, values };
 }
 
-function getSignalCount(item = {}) {
-  return getSignalData(item).fired.length;
-}
-
 function withNormalizedSignals(item = {}) {
   const signalData = getSignalData(item);
   return { ...item, signal_fired: signalData.fired, signal_scores: signalData.scores, signal_values: signalData.values };
@@ -804,10 +739,6 @@ function averagePicksByTicker(rows = [], brain = "") {
 function formatSignedCurrency(value = 0) {
   const n = Number(value || 0);
   return `${n < 0 ? "-" : "+"}$${Math.abs(n).toFixed(2)}`;
-}
-
-function JournalButton() {
-  return null;
 }
 
 function StrategyBadge({ strategy, selectedStrategy, color = BLUE }) {
@@ -1044,11 +975,10 @@ const METHOD_DEFINITIONS = {
   "Vol Squeeze": "Historical Volatility Ratio measures compression. When a stock's recent volatility shrinks relative to its 20-day average, it's coiling. Volatility compression historically precedes explosive directional moves — the tighter the squeeze, the stronger the breakout.",
 };
 
-function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black", strategyName, strategyTotal = 10, cardKeyOverride, onAddToPersonal }) {
+function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black", strategyName, strategyTotal = 10, cardKeyOverride }) {
   const [expandedMethod, setExpandedMethod] = React.useState(null);
   const [showScoreContext, setShowScoreContext] = React.useState(false);
   const [glowing, setGlowing] = React.useState(false);
-  const [journalAdded, setJournalAdded] = React.useState(false);
   React.useEffect(() => {
     if (expanded) {
       const t = setTimeout(() => setGlowing(true), 50);
@@ -1104,17 +1034,6 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
           )}
           <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center", flexShrink: 0 }}>{confluenceMethods.length}/{strategyTotal}</span>
           <span className={showScoreContext ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: BLUE, letterSpacing: .3, padding: "1px 4px", background: "#0a1020", borderRadius: 3, border: "1px solid #1a2a40", textAlign: "center", flexShrink: 0 }}>{signalCount}/9</span>
-          {false && onAddToPersonal && <JournalButton
-            compact
-            state={journalAdded}
-            onClick={(e) => {
-              e.stopPropagation();
-              Promise.resolve(onAddToPersonal(pick)).then(ok => {
-                setJournalAdded(ok === false ? "error" : "added");
-                setTimeout(() => setJournalAdded(false), 1500);
-              });
-            }}
-          />}
         </>}
       />
       {expanded && (
@@ -1228,34 +1147,6 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
     </div>
   );
 }
-// ─── POST-CLOSE CARD ──────────────────────────────────────────────────────────
-function PostCloseCard({ trade, onDismiss }) {
-  const pnl = trade.actual_move || 0;
-  const pnlColor = pnl >= 0 ? GREEN : RED;
-  const isWin = pnl >= 0;
-  const closeReason = trade.sell_reason === "forced_close" ? "Force-closed at 2:45 PM" :
-                      isModelStopLoss(trade.sell_reason) ? "Vector model stop" : "Vector closed";
-  return (
-    <div style={{ background: isWin ? "#0a1a0a" : "#1a0a0a", border: `1px solid ${isWin ? "#1a3a1a" : "#3a1a1a"}`, borderRadius: 10, borderLeft: `3px solid ${pnlColor}`, padding: "10px 12px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-      <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 14, fontWeight: 600, color: T1 }}>{trade.ticker}</span>
-          <span style={{ fontSize: 8, fontWeight: 700, color: pnlColor, letterSpacing: .5, padding: "1px 5px", background: pnlColor + "22", borderRadius: 3, border: `1px solid ${pnlColor}44` }}>{isWin ? "WIN" : "LOSS"}</span>
-        </div>
-        <span style={{ fontSize: 9, color: T3 }}>{closeReason} · {trade.sell_time || ""}</span>
-      </div>
-      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <div style={{ textAlign: "right" }}>
-          <div style={{ fontSize: 14, fontWeight: 700, color: pnlColor, fontFamily: "'DM Mono',monospace" }}>{pnl >= 0 ? "+" : ""}{pnl.toFixed(1)}%</div>
-          <div style={{ fontSize: 9, color: T3 }}>${trade.sell_price ? trade.sell_price.toFixed(2) : "—"}</div>
-        </div>
-        <button onClick={() => onDismiss && onDismiss(trade.id)}
-          style={{ background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 3, color: T3, fontSize: 8, fontWeight: 700, padding: "2px 6px", cursor: "pointer" }}>DONE</button>
-      </div>
-    </div>
-  );
-}
-
 function TodayClosedCard({ trade, expanded, onToggle, themeKey = "black", feeAdjusted = true }) {
   const pnlPct = getClosedTradePnlPercent(trade);
   const dollars = getClosedTradePnlDollars(trade, feeAdjusted);
@@ -1308,11 +1199,10 @@ function TodayClosedCard({ trade, expanded, onToggle, themeKey = "black", feeAdj
   );
 }
 
-function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClosed, onDone, onView, onClose, pdtRemaining = 3, themeKey = "black", strategyName, strategyTotal = 10, onAddToPersonal, feeAdjusted = true }) {
+function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClosed, onDone, onView, onClose, pdtRemaining = 3, themeKey = "black", strategyName, strategyTotal = 10, feeAdjusted = true }) {
   const [expandedMethod, setExpandedMethod] = React.useState(null);
   const [expandedSignal, setExpandedSignal] = React.useState(null);
   const [glowing, setGlowing] = React.useState(false);
-  const [journalAdded, setJournalAdded] = React.useState(false);
   const longPressTimer = React.useRef(null);
 
   React.useEffect(() => {
@@ -1468,17 +1358,6 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
               DONE
             </button>
           )}
-          {false && onAddToPersonal && <JournalButton
-            compact
-            state={journalAdded}
-            onClick={(e) => {
-              e.stopPropagation();
-              Promise.resolve(onAddToPersonal(trade)).then(ok => {
-                setJournalAdded(ok === false ? "error" : "added");
-                setTimeout(() => setJournalAdded(false), 1500);
-              });
-            }}
-          />}
         </>}
       />
 
@@ -1882,7 +1761,6 @@ function SettingsIcon({ color }) {
 }
 
 function SettingsDrawer({ open, onClose, T1, T2, T3, BORDER, BG, CARD, GREEN, BLUE, AMBER, showTickerBanner = true, onShowTickerBannerChange }) {
-  const API = "https://swingdesk-brain-production-205e.up.railway.app";
   const [notifyOn, setNotifyOn] = React.useState(true);
   const [testStatus, setTestStatus] = React.useState(null);
   const [loaded, setLoaded] = React.useState(false);
@@ -1890,7 +1768,7 @@ function SettingsDrawer({ open, onClose, T1, T2, T3, BORDER, BG, CARD, GREEN, BL
 
   React.useEffect(() => {
     if (open && !loaded) {
-      fetch(`${API}/api/notification-settings`)
+      fetch(`${API_BASE}/api/notification-settings`)
         .then(r => r.json())
         .then(d => { setNotifyOn(d.notify_on_close !== false); setSettings(d); setLoaded(true); })
         .catch(() => setLoaded(true));
@@ -1901,7 +1779,7 @@ function SettingsDrawer({ open, onClose, T1, T2, T3, BORDER, BG, CARD, GREEN, BL
     const newVal = !notifyOn;
     setNotifyOn(newVal);
     try {
-      await fetch(`${API}/api/notification-settings`, {
+      await fetch(`${API_BASE}/api/notification-settings`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ notify_on_close: newVal })
@@ -1912,7 +1790,7 @@ function SettingsDrawer({ open, onClose, T1, T2, T3, BORDER, BG, CARD, GREEN, BL
   const sendTest = async () => {
     setTestStatus("sending");
     try {
-      const r = await fetch(`${API}/api/test-notification`, { method: "POST" });
+      const r = await fetch(`${API_BASE}/api/test-notification`, { method: "POST" });
       const d = await r.json();
       setTestStatus(d.success ? "sent" : "error");
     } catch(e) {
@@ -1925,7 +1803,7 @@ function SettingsDrawer({ open, onClose, T1, T2, T3, BORDER, BG, CARD, GREEN, BL
     const next = !showTickerBanner;
     onShowTickerBannerChange && onShowTickerBannerChange(next);
     try {
-      await fetch(`${API}/api/ui-preferences`, {
+      await fetch(`${API_BASE}/api/ui-preferences`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ show_ticker_banner: next })
@@ -2226,64 +2104,6 @@ function WhyNotPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED })
   );
 }
 
-// ─── AUDIT BUTTON ─────────────────────────────────────────────────────────────
-function AuditButton({ API, T1, T2, T3, BORDER, CARD, GREEN, AMBER, RED, onComplete }) {
-  const [state, setState] = React.useState("idle"); // idle | running | done | error
-  const [result, setResult] = React.useState(null);
-
-  const trigger = async () => {
-    setState("running");
-    setResult(null);
-    try {
-      const res = await fetch(`${API}/audit`, { method: "POST" });
-      const d = await res.json();
-      setResult(d);
-      setState(d.success ? "done" : "error");
-      if (onComplete) onComplete();
-    } catch (e) {
-      setState("error");
-      setResult({ summary: "Network error — could not reach audit endpoint." });
-    }
-  };
-
-  const accent = state === "done" ? GREEN : state === "error" ? RED : AMBER;
-
-  return (
-    <div style={{ marginBottom: 14 }}>
-      <div style={{ background: CARD, border: `1.5px solid ${accent}`, borderRadius: 12, padding: "12px 14px", transition: "border-color .3s" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <div>
-            <div style={{ fontSize: 13, fontWeight: 700, color: T1, letterSpacing: .3 }}>
-              {state === "running" ? "⏳ Running audit…" : state === "done" ? "✓ Audit complete" : state === "error" ? "✗ Audit failed" : "Run Self-Audit"}
-            </div>
-            <div style={{ fontSize: 9, color: T3, marginTop: 2 }}>
-              {state === "running"
-                ? "Calling LLM — takes 5–15 seconds…"
-                : state === "done" && result
-                ? `${result.provider || "LLM"} · ${result.confidence || "?"} confidence`
-                : state === "error" && result
-                ? (result.summary || "Failed").slice(0, 70)
-                : "Reads ML-adjusted weights and generates a human-readable summary — does not change weights"}
-            </div>
-          </div>
-          <button onClick={trigger} disabled={state === "running"} style={{ background: state === "running" ? "transparent" : accent, border: `1.5px solid ${accent}`, borderRadius: 8, padding: "7px 14px", fontSize: 10, fontWeight: 700, color: state === "running" ? accent : "#000", cursor: state === "running" ? "default" : "pointer", fontFamily: "'DM Mono',monospace", letterSpacing: 1, whiteSpace: "nowrap", opacity: state === "running" ? 0.6 : 1 }}>
-            {state === "running" ? "RUNNING" : state === "done" ? "RUN AGAIN" : "AUDIT NOW"}
-          </button>
-        </div>
-        {state === "done" && result?.summary && (
-          <div style={{ marginTop: 8, fontSize: 9, color: T2, lineHeight: 1.6, borderTop: `1px solid ${BORDER}`, paddingTop: 8 }}>
-            {result.summary}
-          </div>
-        )}
-      </div>
-      <div style={{ fontSize: 9, color: T3, marginTop: 5, paddingLeft: 2, lineHeight: 1.5 }}>
-        Audit recap runs automatically at 7:00 PM Central after daily batch learning.
-      </div>
-    </div>
-  );
-}
-
-
 export default function App() {
   const [loadProgress, setLoadProgress] = useState(0);
   const [loadStatus, setLoadStatus] = useState("Connecting to brain...");
@@ -2327,7 +2147,6 @@ export default function App() {
   const [queueStatus, setQueueStatus] = useState(null);
   const [openExecution, setOpenExecution] = useState(null);
   const [recoveringOpen, setRecoveringOpen] = useState(false);
-  const [monitorStatus, setMonitorStatus] = useState(null);
   const [monitorRunning, setMonitorRunning] = useState(false);
   const [dayPnlStatus, setDayPnlStatus] = useState(null);
 
@@ -2344,7 +2163,6 @@ export default function App() {
   const [nnStats, setNnStats] = useState(null);
   const [nnPerfHistory, setNnPerfHistory] = useState([]);
   const [nnPerfTimeframe, setNnPerfTimeframe] = useState("M");
-  const [variantStatus, setVariantStatus] = useState(null);
   const [variantLeaderboard, setVariantLeaderboard] = useState([]);
   const [selectedVariantId, setSelectedVariantId] = useState("swingdesk_vector_0845_all");
   const [novaUniverse, setNovaUniverse] = useState(null);
@@ -2357,7 +2175,6 @@ export default function App() {
     direction: "long",
   });
   const [personalTrades, setPersonalTrades] = useState([]);
-  const [addingToPersonal, setAddingToPersonal] = useState({});
   const [sortMode, setSortMode] = useState("smart");
   const SORT_OPTIONS = [
     { id: "smart",      label: "Smart"      },
@@ -2390,12 +2207,9 @@ export default function App() {
   ];
   const [expandedCards, setExpandedCards] = useState({});
   const [doneCuts, setDoneCuts] = useState({});
-  const [expandedRunners, setExpandedRunners] = useState({});
-  const [hiddenRunners, setHiddenRunners] = useState({});
   const [buyListExpanded, setBuyListExpanded] = useState(false);
   const [sellListExpanded, setSellListExpanded] = useState(false);
   const [openDayFilter, setOpenDayFilter] = useState("all");
-  const [dismissedPostClose, setDismissedPostClose] = useState({});
   const [queueLogOpen, setQueueLogOpen] = useState(false);
 
   const [perfTimeframe, setPerfTimeframe] = useState("M");
@@ -2405,35 +2219,6 @@ export default function App() {
   const [showNetInfo, setShowNetInfo] = useState(false);
   const [showTickerBanner, setShowTickerBanner] = useState(true);
 
-
-  const handleAddToPersonal = async (item, sourcePortfolio = "brain") => {
-    const ticker = item.ticker || item.pick?.ticker;
-    if (!ticker || addingToPersonal[ticker]) return;
-    setAddingToPersonal(prev => ({ ...prev, [ticker]: true }));
-    try {
-      const body = {
-        ticker,
-        direction: item.direction || "long",
-        buy_price: item.buy_price || item.price || 0,
-        invested_amount: item.invested_amount || 10,
-        sector: item.sector,
-        source_portfolio: sourcePortfolio,
-      };
-      const result = await apiFetch("/personal-trades/add", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (result.success) {
-        const fresh = await apiFetch("/personal-trades").catch(() => []);
-        setPersonalTrades(fresh);
-        setAddingToPersonal(prev => ({ ...prev, [ticker]: false }));
-        return true;
-      }
-    } catch {}
-    setAddingToPersonal(prev => ({ ...prev, [ticker]: false }));
-    return false;
-  };
 
   const addManualPersonalTrade = async () => {
     const ticker = personalForm.ticker.trim().toUpperCase();
@@ -2484,24 +2269,11 @@ export default function App() {
   const refreshMonitorStatus = async () => {
     const status = await apiFetch("/monitor-open-status").catch(() => null);
     if (status) {
-      setMonitorStatus(status);
       setMonitorRunning(status.status === "running" || status.status === "queued");
     }
     return status;
   };
 
-  const runOpenMonitor = async () => {
-    if (monitorRunning) return;
-    setMonitorRunning(true);
-    try {
-      const result = await apiFetch("/monitor-open-now", { method: "POST" });
-      if (result?.status) setMonitorStatus(result.status);
-      await refreshMonitorStatus();
-    } catch (error) {
-      setMonitorStatus(prev => ({ ...(prev || {}), status: "failed", error: error.message }));
-      setMonitorRunning(false);
-    }
-  };
   // ── Initial data load ──
   useEffect(() => {
     (async () => {
@@ -2527,7 +2299,7 @@ export default function App() {
         // Fire all requests in parallel
         const [picksData, positions, statsData, runnersData, perfData, closedData,
                nnPicksData, nnPositionsData, nnStatsData, nnPerfData, personalData, monitorData,
-               dayPnlData, variantStatusData, variantBoardData, variantPreviewData, vectorUniverseData, novaUniverseData, uiPrefsData] = await Promise.all([
+               dayPnlData, variantBoardData, variantPreviewData, vectorUniverseData, novaUniverseData, uiPrefsData] = await Promise.all([
           apiFetch("/picks").catch(() => ({ longs: [], shorts: [] })),
           apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
           apiFetch("/stats").catch(() => ({})),
@@ -2541,7 +2313,6 @@ export default function App() {
           apiFetch("/personal-trades").catch(() => []),
           apiFetch("/monitor-open-status").catch(() => null),
           apiFetch(`/day-pnl${feeQuery}`).catch(() => null),
-          apiFetch("/variant-status").catch(() => null),
           apiFetch("/variant-leaderboard").catch(() => []),
           apiFetch("/variant-strategy-preview").catch(() => null),
           apiFetch("/variant/swingdesk_vector_0845_all").catch(() => null),
@@ -2578,10 +2349,8 @@ export default function App() {
         setNnStats(nnStatsData);
         setNnPerfHistory(nnPerfData || []);
         setPersonalTrades(personalData || []);
-        setMonitorStatus(monitorData);
         setMonitorRunning(monitorData?.status === "running" || monitorData?.status === "queued");
         setDayPnlStatus(dayPnlData);
-        setVariantStatus(variantStatusData);
         setVariantLeaderboard(variantBoardData || []);
         setStrategyPreviewRows(prev => (variantPreviewData?.rows || []).length ? variantPreviewData.rows : prev);
         setVariantDetailsById({
@@ -2710,7 +2479,7 @@ export default function App() {
       try {
         const [positions, perfData, closedData, statsData,
                nnPicksData, nnPositionsData, nnStatsData, nnPerfData,
-               dayPnlData, variantStatusData, variantBoardData, variantPreviewData, selectedUniverseData] = await Promise.all([
+               dayPnlData, variantBoardData, variantPreviewData, selectedUniverseData] = await Promise.all([
           apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
           apiFetch(`/perf-history${feeQuery}`).catch(() => []),
           apiFetch("/today-closed").catch(() => []),
@@ -2720,7 +2489,6 @@ export default function App() {
           apiFetch("/nn-stats").catch(() => null),
           apiFetch("/nn-perf-history").catch(() => []),
           apiFetch(`/day-pnl${feeQuery}`).catch(() => null),
-          apiFetch("/variant-status").catch(() => null),
           apiFetch("/variant-leaderboard").catch(() => []),
           apiFetch("/variant-strategy-preview").catch(() => null),
           selectedVariantId === "__all__" ? Promise.resolve(null) : apiFetch(`/variant/${selectedVariantId}`).catch(() => null),
@@ -2733,7 +2501,6 @@ export default function App() {
         setNnStats(nnStatsData);
         setNnPerfHistory(nnPerfData || []);
         setDayPnlStatus(dayPnlData);
-        setVariantStatus(variantStatusData);
         setVariantLeaderboard(variantBoardData || []);
         setStrategyPreviewRows(prev => (variantPreviewData?.rows || []).length ? variantPreviewData.rows : prev);
         if (selectedUniverseData?.variant?.id) {
@@ -2808,7 +2575,6 @@ export default function App() {
 
   const openTickers = new Set(openPositions.filter(t => t.outcome === "open").map(t => t.ticker));
   const allBuyPicks = picks.longs.filter(pick => !openTickers.has(pick.ticker));
-  const allShortPicks = picks.shorts.filter(pick => !openTickers.has(pick.ticker));
   const today = new Date().toISOString().split("T")[0];
   const activeVariantBrain = portfolioTab === "neural" ? "Nova" : "Vector";
   const allStrategySelected = selectedStrategy === "All";
@@ -2855,7 +2621,6 @@ export default function App() {
   const openLongPositions = selectedVariantMatchesTab && activeVariantBrain === "Vector"
     ? novaUniverseOpen.filter(t => (t.direction || "long") === "long")
     : openPositions.filter(t => t.direction === "long" && t.outcome === "open");
-  const openShortPositions = openPositions.filter(t => t.direction === "short" && t.outcome === "open");
   const activeOpenPnl = openLongPositions.reduce((sum, trade) => sum + getTradeOpenPnlDollars(trade, feeAdjusted), 0);
 
   const isWeekendNow = (() => { const d = new Date().getDay(); return d === 0 || d === 6; })();
@@ -2863,7 +2628,6 @@ export default function App() {
   const sellTodayPositions = isWeekendNow ? openLongPositions : openLongPositions.filter(t => t.buy_date < today);
   // Holding = current session positions (opened today)
   const holdingPositions = openLongPositions.filter(t => t.buy_date === today);
-  const shortCoverList = isWeekendNow ? [] : openPositions.filter(t => t.buy_date < today && t.outcome === "open" && t.direction === "short");
 
   // Recently closed = closed positions not yet dismissed, within 30 days
   const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString().split("T")[0];
@@ -2912,10 +2676,6 @@ export default function App() {
     }
   }
 
-  const sortedSellToday = sortPositions(sellTodayPositions);
-  const sortedHolding = sortPositions(holdingPositions);
-  const sortedLongPositions = sortPositions(openLongPositions);
-  const sortedShortPositions = sortPositions(openShortPositions);
   const openFilteredPositions = openDayFilter === "day2"
     ? sellTodayPositions
     : openDayFilter === "day1"
@@ -2935,26 +2695,6 @@ export default function App() {
   const activeBuyPicks = (aggregateBuyPicks || allBuyPicks).filter(pick => !activeOpenTickers.has(pick.ticker));
   const buyVisible = buyListExpanded ? activeBuyPicks : activeBuyPicks.slice(0, 20);
   const sellVisible = sellListExpanded ? sortedOpenFilteredPositions : sortedOpenFilteredPositions.slice(0, 20);
-  const monitorUpdated = Number(monitorStatus?.updated_count || 0);
-  const monitorTotal = Number(monitorStatus?.total_open_positions || openLongPositions.length || 0);
-  const monitorStatusText = monitorStatus?.status === "running" || monitorStatus?.status === "queued"
-    ? `Scanning open positions: ${monitorUpdated}/${monitorTotal} updated`
-    : monitorStatus?.status === "failed"
-      ? `Open-position monitor failed${monitorStatus?.error ? `: ${monitorStatus.error}` : ""}`
-      : monitorStatus?.status === "complete"
-        ? `Open-position monitor complete: ${monitorUpdated}/${monitorTotal} updated`
-        : monitorStatus?.last_success_at
-          ? `Last monitor update ${relativeTime(monitorStatus.last_success_at)}`
-          : "Monitor status waiting";
-  const monitorTickerText = monitorStatus?.current_ticker
-    ? `Now checking ${monitorStatus.current_ticker}`
-    : monitorStatus?.finished_at
-      ? `Finished ${relativeTime(monitorStatus.finished_at)}`
-      : "";
-  const monitorLastSuccessMs = monitorStatus?.last_success_at ? new Date(monitorStatus.last_success_at).getTime() : null;
-  const monitorAgeMinutes = monitorLastSuccessMs ? Math.floor((Date.now() - monitorLastSuccessMs) / 60000) : null;
-  const monitorStale = openLongPositions.length > 0 && (monitorStatus?.status === "failed" || monitorAgeMinutes == null || monitorAgeMinutes >= 10);
-
   // Open P&L from currently held positions
   const livePnl = openPositions.reduce((total, trade) => total + getTradeOpenPnlDollars(trade, feeAdjusted), 0);
 
@@ -3026,7 +2766,6 @@ export default function App() {
     : null;
   const activeNovaBuyPicks = aggregateNovaBuyPicks || (nnPicks.recommended_longs || []);
   const novaUniverseBalance = novaUniversePortfolio?.equity != null ? Number(novaUniversePortfolio.equity) : null;
-  const novaLeader = variantLeaderboard.find(v => v.id === "swingdesk_nova_0845_all");
   const novaOpenPnl = novaOpenPositions.reduce((sum, trade) => sum + getTradeOpenPnlDollars(trade, feeAdjusted), 0);
   const novaStartingCash = Number(novaUniversePortfolio?.starting_cash || 1000);
   const novaRealizedPnl = novaUniversePortfolio?.realized_pnl != null && activeVariantBrain === "Nova"
@@ -3297,31 +3036,6 @@ export default function App() {
             </div>
           </div>
 
-          {false && variantLeaderboard.length > 0 && (
-            <div style={{ margin: `0 16px ${HOME_ROW_GAP}px`, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "9px 10px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 7 }}>
-                <div style={{ fontSize: 9, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .7 }}>Universe leaders</div>
-                <div style={{ fontSize: 8, color: T3 }}>{variantStatus?.variants || variantLeaderboard.length} live</div>
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-                {variantLeaderboard.slice(0, 3).map(row => (
-                  <div key={row.id} style={{ display: "grid", gridTemplateColumns: "18px 1fr auto", gap: 7, alignItems: "center" }}>
-                    <div style={{ fontSize: 10, color: row.brain === "Nova" ? "#a78bfa" : BLUE, fontWeight: 900, fontFamily: "'DM Mono',monospace" }}>#{row.rank}</div>
-                    <div style={{ minWidth: 0 }}>
-                      <div style={{ fontSize: 10, color: T1, fontWeight: 800, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.label}</div>
-                      <div style={{ fontSize: 8, color: T3 }}>{row.open_count || 0} open · {row.closed_count || 0} closed</div>
-                    </div>
-                    <div style={{ fontSize: 11, color: Number(row.return_pct || 0) >= 0 ? GREEN : RED, fontWeight: 900, fontFamily: "'DM Mono',monospace" }}>
-                      {Number(row.return_pct || 0) >= 0 ? "+" : ""}{Number(row.return_pct || 0).toFixed(2)}%
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-
-
           {/* SUB TOGGLE — Picks/Open + Sort */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 42px", margin: `0 16px ${HOME_ROW_GAP}px`, gap: HOME_ROW_GAP, alignItems: "stretch" }}>
             {[
@@ -3389,7 +3103,6 @@ export default function App() {
                           themeKey={themeKey}
                           strategyName={selectedStrategy}
                           strategyTotal={strategyTotal}
-                          onAddToPersonal={pick => handleAddToPersonal(pick, "brain")}
                           onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))} />
                       ))}
                       <ExpandButton isExpanded={buyListExpanded} onToggle={() => setBuyListExpanded(e => !e)} totalCount={activeBuyPicks.length} label="picks" />
@@ -3498,43 +3211,6 @@ export default function App() {
                   </CardMetricGrid>
                 )}
 
-                {false && openLongPositions.length > 0 && (
-                  <div style={{
-                    display: "flex", alignItems: "center", justifyContent: "space-between",
-                    gap: 8, margin: "0 0 8px", padding: "7px 8px",
-                    background: monitorStale ? "#160909" : CARD,
-                    border: `1px solid ${monitorStale ? RED + "55" : BORDER}`,
-                    borderRadius: 7,
-                  }}>
-                    <div style={{ minWidth: 0, flex: 1 }}>
-                      <div style={{ fontSize: 9, color: monitorStale ? RED : T2, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                        {monitorStatusText}
-                      </div>
-                      {monitorTickerText && (
-                        <div style={{ fontSize: 8, color: T3, marginTop: 2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{monitorTickerText}</div>
-                      )}
-                    </div>
-                    <button
-                      onClick={runOpenMonitor}
-                      disabled={monitorRunning}
-                      style={{
-                        border: `1px solid ${monitorRunning ? BORDER : BLUE + "66"}`,
-                        background: monitorRunning ? "transparent" : BLUE + "12",
-                        color: monitorRunning ? T3 : BLUE,
-                        borderRadius: 5,
-                        padding: "4px 7px",
-                        fontSize: 8.5,
-                        fontWeight: 800,
-                        letterSpacing: .3,
-                        whiteSpace: "nowrap",
-                        cursor: monitorRunning ? "default" : "pointer",
-                      }}
-                    >
-                      {monitorRunning ? "RUNNING" : "RUN MONITOR"}
-                    </button>
-                  </div>
-                )}
-
                 {openLongPositions.length > 0 && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 12 }}>
                     {sellVisible.map(trade => (
@@ -3550,64 +3226,9 @@ export default function App() {
                         onDone={key => { setDoneCuts(prev => ({ ...prev, [key]: "done" })); setExpandedCards(prev => ({ ...prev, [key]: false })); }}
                         onView={key => setDoneCuts(prev => ({ ...prev, [key]: "open" }))}
                         onClose={key => setDoneCuts(prev => ({ ...prev, [key]: "closed" }))}
-                        onAddToPersonal={trade => handleAddToPersonal(trade, "brain")}
                       />
                     ))}
                     <ExpandButton isExpanded={sellListExpanded} onToggle={() => setSellListExpanded(e => !e)} totalCount={openFilteredPositions.length} label="positions" />
-                  </div>
-                )}
-
-                {/* ── Sell Today ── */}
-                {false && sellTodayPositions.length > 0 && (
-                  <div style={{ marginBottom: 12 }}>
-                    <div style={{ fontSize: 9, color: AMBER, fontWeight: 700, textTransform: "uppercase", letterSpacing: .8, padding: "4px 0 6px" }}>
-                      Sell Today ({sellTodayPositions.length})
-                    </div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                      {sortedSellToday.map(trade => (
-                        <PositionCard key={trade.id} trade={trade} isLong={true} feeAdjusted={feeAdjusted}
-                          expanded={expandedCards[trade.id || trade.ticker]}
-                          isDone={doneCuts[trade.id || trade.ticker] === "done"}
-                          isClosed={doneCuts[trade.id || trade.ticker] === "closed"}
-                          pdtRemaining={pdtRemaining}
-                          themeKey={themeKey}
-                          strategyName={selectedStrategy}
-                          strategyTotal={strategyTotal}
-                          onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
-                          onDone={key => { setDoneCuts(prev => ({ ...prev, [key]: "done" })); setExpandedCards(prev => ({ ...prev, [key]: false })); }}
-                          onView={key => setDoneCuts(prev => ({ ...prev, [key]: "open" }))}
-                          onClose={key => setDoneCuts(prev => ({ ...prev, [key]: "closed" }))}
-                          onAddToPersonal={trade => handleAddToPersonal(trade, "brain")}
-                        />
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {/* ── Holding ── */}
-                {false && holdingPositions.length > 0 && (
-                  <div style={{ marginBottom: 12 }}>
-                    <div style={{ fontSize: 9, color: T3, fontWeight: 700, textTransform: "uppercase", letterSpacing: .8, padding: "4px 0 6px" }}>
-                      Holding ({holdingPositions.length})
-                    </div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                      {sortedHolding.map(trade => (
-                      <PositionCard key={trade.id} trade={trade} isLong={true} feeAdjusted={feeAdjusted}
-                          expanded={expandedCards[trade.id || trade.ticker]}
-                          isDone={doneCuts[trade.id || trade.ticker] === "done"}
-                          isClosed={doneCuts[trade.id || trade.ticker] === "closed"}
-                          pdtRemaining={pdtRemaining}
-                          themeKey={themeKey}
-                          strategyName={selectedStrategy}
-                          strategyTotal={strategyTotal}
-                          onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
-                          onDone={key => { setDoneCuts(prev => ({ ...prev, [key]: "done" })); setExpandedCards(prev => ({ ...prev, [key]: false })); }}
-                          onView={key => setDoneCuts(prev => ({ ...prev, [key]: "open" }))}
-                          onClose={key => setDoneCuts(prev => ({ ...prev, [key]: "closed" }))}
-                          onAddToPersonal={trade => handleAddToPersonal(trade, "brain")}
-                        />
-                      ))}
-                    </div>
                   </div>
                 )}
 
@@ -3772,21 +3393,6 @@ export default function App() {
                   </select>
                 </div>
               </div>
-              {false && novaLeader && (
-                <div style={{ background: "#140f24", border: "1px solid #a78bfa55", borderRadius: 8, padding: "7px 10px", marginBottom: 12, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
-                  {[
-                    ["Rank", `#${novaLeader.rank}`, "#a78bfa"],
-                    ["Return", `${Number(novaLeader.return_pct || 0).toFixed(2)}%`, Number(novaLeader.return_pct || 0) >= 0 ? GREEN : RED],
-                    ["Trades", `${novaLeader.open_count || 0} open`, T2],
-                  ].map(([label, value, color]) => (
-                    <div key={label}>
-                      <div style={{ fontSize: 8, color: T3, textTransform: "uppercase", fontWeight: 800, letterSpacing: .5 }}>{label}</div>
-                      <div style={{ fontSize: 12, color, fontWeight: 800, fontFamily: "'DM Mono',monospace" }}>{value}</div>
-                    </div>
-                  ))}
-                </div>
-              )}
-
               {/* NN Open Positions */}
               {longSub === "sell" && novaOpenPositions.length > 0 && (
                 <div style={{ marginBottom: 16 }}>
@@ -3826,7 +3432,7 @@ export default function App() {
                         strategyTotal={strategyTotal}
                         expanded={expandedCards[trade.id]}
                         onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
-                        onAddToPersonal={trade => handleAddToPersonal(trade, "neural")} />
+                        />
                     ))}
                   </div>
                 </div>
@@ -3855,7 +3461,6 @@ export default function App() {
                         strategyTotal={strategyTotal}
                         expanded={expandedCards[pick.ticker + "_nn"]}
                         cardKeyOverride={pick.ticker + "_nn"}
-                        onAddToPersonal={pick => handleAddToPersonal(pick, "neural")}
                         onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))} />
                     ))}
                   </div>
@@ -3891,7 +3496,7 @@ export default function App() {
             <div style={{ padding: "10px 16px 0" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 10 }}>
                 <div style={{ fontSize: 10, color: AMBER, fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>Personal Portfolio</div>
-                <div style={{ fontSize: 9, color: T3, textAlign: "right", lineHeight: 1.2 }}>Add positions from Vector or Nova</div>
+                <div style={{ fontSize: 9, color: T3, textAlign: "right", lineHeight: 1.2 }}>Track personal positions manually</div>
               </div>
 
               <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 10, marginBottom: 12 }}>
@@ -3912,7 +3517,7 @@ export default function App() {
               {personalTrades.length === 0 ? (
                 <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 24, textAlign: "center" }}>
                   <div style={{ fontSize: 13, color: T2, marginBottom: 6 }}>No personal positions yet.</div>
-                  <div style={{ fontSize: 11, color: T3 }}>Tap ADD on any Vector or Nova stock card.</div>
+                  <div style={{ fontSize: 11, color: T3 }}>Use the form above to add a position.</div>
                 </div>
               ) : (
                 <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
@@ -3988,36 +3593,6 @@ export default function App() {
               </div>
             </div>
           )}
-
-          {/* ── Cut Log ── */}
-          {false && (() => {
-            const today = new Date().toISOString().split("T")[0];
-            const yesterday = new Date(Date.now() - 86400000).toISOString().split("T")[0];
-            const cutTrades = virtualTrades.filter(t =>
-              (isModelStopLoss(t.sell_reason) || (t.actual_move != null && t.actual_move < -1)) &&
-              (t.sell_date === today || t.sell_date === yesterday)
-            );
-            if (cutTrades.length === 0) return null;
-            return (
-              <div style={{ marginBottom: 16 }}>
-                <div style={{ fontSize: 11, fontWeight: 600, color: RED, textTransform: "uppercase", letterSpacing: .8, marginBottom: 8 }}>Cut log</div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  {cutTrades.map(trade => (
-                    <div key={trade.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", background: "#120a0a", border: `1px solid #200f0f`, borderRadius: 10, borderLeft: `3px solid ${RED}` }}>
-                      <div>
-                        <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 13, fontWeight: 600, color: T1 }}>{trade.ticker}</span>
-                        <span style={{ fontSize: 9, color: T3, marginLeft: 8 }}>{trade.buy_date}</span>
-                      </div>
-                      <div style={{ textAlign: "right" }}>
-                        <div style={{ fontSize: 11, color: RED, fontWeight: 500 }}>{trade.actual_move != null ? `${trade.actual_move >= 0 ? "+" : ""}${trade.actual_move.toFixed(1)}%` : "open"}</div>
-                        <div style={{ fontSize: 9, color: RED, fontWeight: 700, marginTop: 2 }}>CUT</div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            );
-          })()}
 
           {/* ── Analytics Stats ── */}
           {(() => {
@@ -4237,7 +3812,6 @@ export default function App() {
           {(() => {
             const METHOD_INFO = METHOD_DEFINITIONS;
             const allMethods = Object.keys(METHOD_INFO);
-            const openPositionTickers = new Set(openPositions.filter(t => t.outcome === "open").map(t => t.ticker));
 
             return (
               <div style={{ marginTop: 16 }}>
