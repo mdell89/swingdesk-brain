@@ -138,6 +138,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
+from glass_proof import build_variant_ledger_proof as build_variant_ledger_proof_core, proof_contract
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8493,6 +8494,65 @@ def api_variant_health():
         log.error(f"variant-health error: {e}")
         return jsonify({"success": False, "error": str(e), "rows": []}), 500
 
+@app.route("/api/variant-ledger-proof")
+def api_variant_ledger_proof():
+    """Glass-house proof for variant aliveness, closed-trade learning, and ledger reconciliation."""
+    try:
+        db = get_database()
+        snapshot, refusal = variant_cache_snapshot(db, require_fresh=False)
+        variants = [dict(r) for r in db.execute("""
+            SELECT sv.id, sv.strategy, sv.brain, sv.execution_time, sv.selection_mode,
+                   sv.exit_mode, sv.label, sv.status
+            FROM strategy_variants sv
+            WHERE sv.status='active'
+            ORDER BY sv.brain, sv.strategy, sv.execution_time, sv.selection_mode
+        """).fetchall()]
+        rows = [
+            build_variant_ledger_proof_core(
+                db,
+                variant,
+                snapshot=snapshot,
+                get_weights=get_variant_signal_weights,
+                filter_picks=filter_variant_strategy_picks,
+                select_picks=select_variant_picks,
+            )
+            for variant in variants
+        ]
+        db.close()
+
+        ok_rows = [row for row in rows if row["health"] == "ok"]
+        ledger_mismatches = [row for row in rows if not row["ledger_ok"]]
+        learned_open = [
+            row for row in rows
+            if row["learning"]["learned_open_trade_ids"]
+        ]
+        unlearned_closed = [
+            row for row in rows
+            if row["learning"]["unlearned_closed_trade_count"] > 0
+        ]
+        no_pick_rows = [
+            row for row in rows
+            if row["evaluation_state"] == "evaluated_no_pick"
+        ]
+
+        return jsonify({
+            "success": True,
+            "shared_snapshot": bool(snapshot),
+            "cache_issue": refusal,
+            "variant_count": len(rows),
+            "ok_count": len(ok_rows),
+            "attention_count": len(rows) - len(ok_rows),
+            "ledger_mismatch_count": len(ledger_mismatches),
+            "learned_open_trade_count": len(learned_open),
+            "unlearned_closed_variant_count": len(unlearned_closed),
+            "evaluated_no_pick_count": len(no_pick_rows),
+            "rows": rows,
+            "contract": proof_contract(),
+        })
+    except Exception as e:
+        log.error(f"variant-ledger-proof error: {e}")
+        return jsonify({"success": False, "error": str(e), "rows": []}), 500
+
 @app.route("/api/variant-strategy-preview")
 def api_variant_strategy_preview():
     """Show how each active strategy would filter the current shared snapshot."""
@@ -10855,10 +10915,11 @@ def backfill_nn_missed_closes():
     except Exception as e:
         log.error(f"NN startup backfill failed: {e}")
 
-backfill_missed_closes()
-backfill_nn_missed_closes()
-threading.Thread(target=run_scheduler, daemon=True).start()
-threading.Thread(target=keep_server_alive, daemon=True).start()
+if os.environ.get("SWINGDESK_DISABLE_STARTUP_TASKS") != "1":
+    backfill_missed_closes()
+    backfill_nn_missed_closes()
+    threading.Thread(target=run_scheduler, daemon=True).start()
+    threading.Thread(target=keep_server_alive, daemon=True).start()
 log.info("Brain v4 initialized — full trading engine with self-regulating queue system + SwingDeskNet NN")
 
 if __name__ == "__main__":

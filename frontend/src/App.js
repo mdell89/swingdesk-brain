@@ -2138,6 +2138,7 @@ export default function App() {
   const [learningPage, setLearningPage] = useState(0);
   const [variantCounterPage, setVariantCounterPage] = useState(0);
   const [variantHealth, setVariantHealth] = useState(null);
+  const [variantProof, setVariantProof] = useState(null);
   const [perfHistory, setPerfHistory] = useState([]);
   const [lastAudit, setLastAudit] = useState(null);
   const [lastAuditSuccess, setLastAuditSuccess] = useState(null);
@@ -2463,6 +2464,7 @@ export default function App() {
       loadAuditPage(auditPage).catch(() => {});
       loadLearningPage(learningPage).catch(() => {});
       apiFetch("/variant-health").then(data => setVariantHealth(data || null)).catch(() => {});
+      apiFetch("/variant-ledger-proof").then(data => setVariantProof(data || null)).catch(() => {});
     }
     if (tab === "intel" && predictions.length === 0) {
       setTabLoading(true);
@@ -4033,15 +4035,15 @@ export default function App() {
           </div>
 
           {variantHealth && (
-            <div style={{ background: CARD, border: `1px solid ${variantHealth.attention_count ? AMBER : GREEN}55`, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
+            <div style={{ background: CARD, border: `1px solid ${(variantHealth.attention_count || variantProof?.attention_count) ? AMBER : GREEN}55`, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
                 <div style={{ fontSize: 12, fontWeight: 800, color: T1 }}>Variant health</div>
-                <div style={{ fontSize: 10, color: variantHealth.attention_count ? AMBER : GREEN, fontFamily: "'DM Mono',monospace" }}>
+                <div style={{ fontSize: 10, color: (variantHealth.attention_count || variantProof?.attention_count) ? AMBER : GREEN, fontFamily: "'DM Mono',monospace" }}>
                   {variantHealth.ok_count || 0}/{variantHealth.variant_count || 0} ok
                 </div>
               </div>
               <div style={{ fontSize: 9, color: T3, lineHeight: 1.45, marginBottom: 8 }}>{variantHealth.note}</div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginBottom: variantProof ? 8 : 0 }}>
                 <div style={{ background: "#000", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
                   <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>Vector Source</div>
                   <div style={{ fontSize: 12, color: BLUE, fontFamily: "'DM Mono',monospace" }}>{variantHealth.rows?.find(r => r.brain === "Vector")?.source_count ?? 0}</div>
@@ -4055,6 +4057,28 @@ export default function App() {
                   <div style={{ fontSize: 12, color: variantHealth.attention_count ? AMBER : GREEN, fontFamily: "'DM Mono',monospace" }}>{variantHealth.attention_count || 0}</div>
                 </div>
               </div>
+              {variantProof && (
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
+                  <div style={{ background: "#000", border: `1px solid ${variantProof.ledger_mismatch_count ? RED + "66" : BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
+                    <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>Ledger</div>
+                    <div style={{ fontSize: 12, color: variantProof.ledger_mismatch_count ? RED : GREEN, fontFamily: "'DM Mono',monospace" }}>
+                      {variantProof.ledger_mismatch_count || 0} mismatch
+                    </div>
+                  </div>
+                  <div style={{ background: "#000", border: `1px solid ${variantProof.learned_open_trade_count ? RED + "66" : BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
+                    <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>Learning</div>
+                    <div style={{ fontSize: 12, color: variantProof.learned_open_trade_count ? RED : GREEN, fontFamily: "'DM Mono',monospace" }}>
+                      {variantProof.learned_open_trade_count ? `${variantProof.learned_open_trade_count} open` : "closed only"}
+                    </div>
+                  </div>
+                  <div style={{ background: "#000", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
+                    <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>No Pick</div>
+                    <div style={{ fontSize: 12, color: T2, fontFamily: "'DM Mono',monospace" }}>
+                      {variantProof.evaluated_no_pick_count || 0} variants
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
