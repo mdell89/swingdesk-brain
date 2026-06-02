@@ -36,7 +36,8 @@ def make_database():
             current_value REAL,
             actual_move REAL,
             gross_pnl REAL,
-            net_pnl REAL
+            net_pnl REAL,
+            signal_scores TEXT DEFAULT '{}'
         );
         CREATE TABLE variant_learning_events (
             id TEXT PRIMARY KEY,
@@ -63,8 +64,8 @@ class VariantLedgerProofTest(unittest.TestCase):
         """)
         db.execute("""
             INSERT INTO variant_virtual_trades
-            (id, variant_id, outcome, invested_amount, current_value)
-            VALUES ('open1', 'v1', 'open', 10, 11.5)
+            (id, variant_id, outcome, invested_amount, current_value, signal_scores)
+            VALUES ('open1', 'v1', 'open', 10, 11.5, '{"scores":{"rsi_momentum":0.7}}')
         """)
         db.execute("""
             INSERT INTO variant_virtual_trades
@@ -85,6 +86,7 @@ class VariantLedgerProofTest(unittest.TestCase):
         self.assertTrue(proof["learning"]["closed_trades_only"])
         self.assertEqual(proof["learning"]["unlearned_closed_trade_count"], 0)
         self.assertEqual(proof["learning"]["state"], "current")
+        self.assertEqual(proof["learning"]["open_missing_signal_score_count"], 0)
 
     def test_flags_ledger_mismatch_and_learning_on_open_trade(self):
         db = make_database()

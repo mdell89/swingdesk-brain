@@ -2466,6 +2466,49 @@ def variant_weighted_signal_score(pick, weights):
     weighted = sum(float(scores.get(k, 0.5) or 0.5) * float(weights.get(k, 0)) for k in canonical_signal_weights())
     return round(base_conf * 0.65 + weighted * 100 * 0.35, 4)
 
+def build_signal_payload_json_from_pick(pick, ticker, buy_price, weights, direction="long"):
+    """Build the persisted signal payload used by UI context and daily learning."""
+    raw_payload = pick.get("signal_scores") or {}
+    raw_values = {}
+    raw_fired = []
+    if isinstance(raw_payload, str):
+        try:
+            raw_payload = json.loads(raw_payload or "{}")
+        except Exception:
+            raw_payload = {}
+    if isinstance(raw_payload, dict):
+        raw_values = raw_payload.get("values") if isinstance(raw_payload.get("values"), dict) else {}
+        raw_fired = raw_payload.get("fired") if isinstance(raw_payload.get("fired"), list) else []
+
+    scores = extract_signal_score_map(raw_payload or pick.get("signal_scores_for_observation") or {})
+    values = raw_values or pick.get("signal_values_for_observation") or {}
+    fired = raw_fired or pick.get("fired_signals_for_observation") or [
+        key for key, value in scores.items()
+        if float(value or 0) >= 0.65
+    ]
+    if scores:
+        return json.dumps({"scores": scores, "fired": fired, "values": values})
+
+    open_price_data = {ticker: {
+        "price": buy_price,
+        "open": pick.get("open_price") or buy_price,
+        "previous_close": pick.get("prev_close") or pick.get("previous_close") or buy_price,
+        "volume_ratio": pick.get("vol_ratio", pick.get("volume_ratio", 1.0)),
+        "gap_percent": pick.get("overnight_gap_pct", pick.get("gap_percent", 0)),
+        "day_change_percent": pick.get("day_change_pct", pick.get("day_change_percent", 0)),
+        "daily_history": pick.get("daily_history") or [],
+    }}
+    try:
+        earnings = check_upcoming_earnings([ticker])
+        computed_scores, computed_fired, computed_values = compute_signal_scores(
+            ticker, open_price_data, pick.get("rsi", 50.0), earnings, weights, direction
+        )
+        return json.dumps({"scores": computed_scores, "fired": computed_fired, "values": computed_values})
+    except Exception as signal_error:
+        log.warning(f"Variant signal snapshot failed for {ticker}: {signal_error}")
+        neutral_scores = {key: 0.5 for key in canonical_signal_weights()}
+        return json.dumps({"scores": neutral_scores, "fired": [], "values": {}})
+
 def learn_variant_from_closed_trade(database, trade_row, outcome, actual_move):
     """Learn from one resolved variant trade and always leave an audit trail."""
     variant_id = trade_row.get("variant_id")
@@ -5467,9 +5510,9 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None):
                     continue
 
                 confidence, expected_move = pick_confidence_and_move(pick, brain)
-                signal_scores = pick.get("signal_scores") or pick.get("signal_scores_for_observation") or {}
-                if not isinstance(signal_scores, str):
-                    signal_scores = json.dumps(signal_scores)
+                signal_scores = build_signal_payload_json_from_pick(
+                    pick, ticker, buy_price, variant_weights, "long"
+                )
                 confluence_methods = pick.get("confluence_methods") or pick.get("confluence_methods_for_observation") or []
                 if not isinstance(confluence_methods, str):
                     confluence_methods = json.dumps(confluence_methods)
@@ -5786,6 +5829,11 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
                 "signal_scores_for_observation": sig_scores,
                 "signal_values_for_observation": sig_values,
                 "fired_signals_for_observation": fired,
+                "signal_scores": {
+                    "scores": sig_scores,
+                    "values": sig_values,
+                    "fired": fired,
+                },
             }
             nova_pick["nn_executable"] = is_long_pick_eligible(
                 nova_pick,

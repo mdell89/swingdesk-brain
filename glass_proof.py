@@ -1,3 +1,18 @@
+import json
+
+
+def _extract_signal_scores(payload):
+    """Return score map from a persisted trade payload without importing brain.py."""
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload or "{}")
+        except Exception:
+            payload = {}
+    if isinstance(payload, dict) and isinstance(payload.get("scores"), dict):
+        return payload.get("scores") or {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def build_variant_ledger_proof(database, variant, snapshot=None, get_weights=None, filter_picks=None, select_picks=None):
     """Return one variant's aliveness and ledger reconciliation proof."""
     variant = dict(variant)
@@ -77,6 +92,10 @@ def build_variant_ledger_proof(database, variant, snapshot=None, get_weights=Non
         r["id"] for r in closed_rows
         if r.get("sell_date") and r.get("id") not in learned_trade_ids
     ]
+    open_missing_signal_scores = [
+        r["id"] for r in open_rows
+        if not _extract_signal_scores(r.get("signal_scores"))
+    ]
     learned_open_trade_ids = sorted([
         trade_id for trade_id in learned_trade_ids
         if any(r.get("id") == trade_id for r in open_rows)
@@ -137,6 +156,8 @@ def build_variant_ledger_proof(database, variant, snapshot=None, get_weights=Non
             "learned_open_trade_ids": learned_open_trade_ids[:25],
             "closed_trades_only": not learned_open_trade_ids,
             "state": learning_state,
+            "open_missing_signal_score_count": len(open_missing_signal_scores),
+            "open_missing_signal_score_ids": open_missing_signal_scores[:25],
         },
         "issues": proof_issues,
         "health": "ok" if not proof_issues else "attention",
