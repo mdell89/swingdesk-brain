@@ -783,6 +783,28 @@ function CompactMethodTags({ methods = [], glowing = false, selectedStrategy = "
   ));
 }
 
+function BrainAgreementTags({ brains = [], glowing = false }) {
+  return uniqueList(brains).map(brain => {
+    const isNova = brain === "Nova";
+    const color = isNova ? "#a78bfa" : BLUE;
+    const background = isNova ? "#170f26" : "#0a1020";
+    return (
+      <span key={brain} className={glowing ? "tag-glow" : ""} style={{
+        fontSize: 7,
+        fontWeight: 900,
+        color,
+        letterSpacing: .35,
+        padding: "1px 5px",
+        background,
+        borderRadius: 3,
+        border: `1px solid ${color}66`,
+        whiteSpace: "nowrap",
+        flexShrink: 0,
+      }}>{brain}</span>
+    );
+  });
+}
+
 function StaleBadge({ staleTime }) {
   if (!staleTime) return null;
   return (
@@ -975,7 +997,7 @@ const METHOD_DEFINITIONS = {
   "Vol Squeeze": "Historical Volatility Ratio measures compression. When a stock's recent volatility shrinks relative to its 20-day average, it's coiling. Volatility compression historically precedes explosive directional moves — the tighter the squeeze, the stronger the breakout.",
 };
 
-function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black", strategyName, strategyTotal = 10, cardKeyOverride }) {
+function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black", strategyName, strategyTotal = 10, cardKeyOverride, brainTags = [] }) {
   const [expandedMethod, setExpandedMethod] = React.useState(null);
   const [showScoreContext, setShowScoreContext] = React.useState(false);
   const [glowing, setGlowing] = React.useState(false);
@@ -1026,6 +1048,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
       <CardActionRow
         borderColor={BORDER}
         actions={<>
+          <BrainAgreementTags brains={brainTags} glowing={glowing} />
           <EvidenceBadgeCompact evidence={pick.evidence} glowing={glowing} />
           <StrategyBadge strategy={pick.strategy || strategyName} selectedStrategy={strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
           <CompactMethodTags methods={confluenceMethods} glowing={glowing} selectedStrategy={strategyName} />
@@ -1199,7 +1222,7 @@ function TodayClosedCard({ trade, expanded, onToggle, themeKey = "black", feeAdj
   );
 }
 
-function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClosed, onDone, onView, onClose, pdtRemaining = 3, themeKey = "black", strategyName, strategyTotal = 10, feeAdjusted = true }) {
+function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClosed, onDone, onView, onClose, pdtRemaining = 3, themeKey = "black", strategyName, strategyTotal = 10, feeAdjusted = true, brainTags = [] }) {
   const [expandedMethod, setExpandedMethod] = React.useState(null);
   const [expandedSignal, setExpandedSignal] = React.useState(null);
   const [glowing, setGlowing] = React.useState(false);
@@ -1344,6 +1367,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
         staleTime={isStale ? staleTime : null}
         borderColor={rulingColor}
         actions={<>
+          <BrainAgreementTags brains={brainTags} glowing={glowing} />
           <EvidenceBadgeCompact evidence={trade.evidence} glowing={glowing} />
           <StrategyBadge strategy={trade.strategy || strategyName} selectedStrategy={strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
           <CompactMethodTags methods={confluenceMethods} glowing={glowing} selectedStrategy={strategyName} />
@@ -2767,6 +2791,23 @@ export default function App() {
     ? averagePicksByTicker(strategyPreviewRows, "Nova").filter(pick => !new Set(novaOpenPositions.map(t => t.ticker)).has(pick.ticker))
     : null;
   const activeNovaBuyPicks = aggregateNovaBuyPicks || (nnPicks.recommended_longs || []);
+  const vectorPickTickers = new Set(activeBuyPicks.map(row => String(row?.ticker || "").toUpperCase()).filter(Boolean));
+  const novaPickTickers = new Set(activeNovaBuyPicks.map(row => String(row?.ticker || "").toUpperCase()).filter(Boolean));
+  const vectorOpenTickers = new Set(openLongPositions.map(row => String(row?.ticker || "").toUpperCase()).filter(Boolean));
+  const novaOpenTickers = new Set(novaOpenPositions.map(row => String(row?.ticker || "").toUpperCase()).filter(Boolean));
+  const brainTagsForTicker = (ticker, currentBrain, listType) => {
+    const normalizedTicker = String(ticker || "").toUpperCase();
+    if (!normalizedTicker) return [];
+    if (listType === "pick") {
+      if (currentBrain === "Vector" && novaPickTickers.has(normalizedTicker)) return ["Nova"];
+      if (currentBrain === "Nova" && vectorPickTickers.has(normalizedTicker)) return ["Vector"];
+    }
+    if (listType === "open") {
+      if (currentBrain === "Vector" && novaOpenTickers.has(normalizedTicker)) return ["Nova"];
+      if (currentBrain === "Nova" && vectorOpenTickers.has(normalizedTicker)) return ["Vector"];
+    }
+    return [];
+  };
   const novaUniverseBalance = novaUniversePortfolio?.equity != null ? Number(novaUniversePortfolio.equity) : null;
   const novaOpenPnl = novaOpenPositions.reduce((sum, trade) => sum + getTradeOpenPnlDollars(trade, feeAdjusted), 0);
   const novaStartingCash = Number(novaUniversePortfolio?.starting_cash || 1000);
@@ -2977,7 +3018,7 @@ export default function App() {
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
               <span style={{ fontSize: 13, fontWeight: 500, color: backendDayUp ? GREEN : RED }}>{perfUp ? "↑" : "↓"} {Math.abs(perfPercent).toFixed(2)}%</span>
               <span style={{ fontSize: 12, color: T3 }}>{formatSignedCurrency(perfChange)}</span>
-              <span style={{ fontSize: 10, color: T3 }}>realized {formatSignedCurrency(activeRealizedPnl)} + open {formatSignedCurrency(activeOpenPnl)}</span>
+              <span style={{ fontSize: 10, color: T3 }}>(realized + open)</span>
             </div>
             <MiniChart data={perfHistory} timeframe={perfTimeframe} feeAdjusted={feeAdjusted} />
             <ProjectionLine projection={activeSimulationProjection} T3={T3} BLUE={BLUE} />
@@ -3110,6 +3151,7 @@ export default function App() {
                         <PickCard key={pick.ticker + "_l"} pick={pick} isLong={true}
                           expanded={expandedCards[pick.ticker + "_l"]}
                           cardKeyOverride={pick.ticker + "_l"}
+                          brainTags={brainTagsForTicker(pick.ticker, "Vector", "pick")}
                           themeKey={themeKey}
                           strategyName={selectedStrategy}
                           strategyTotal={strategyTotal}
@@ -3232,6 +3274,7 @@ export default function App() {
                         themeKey={themeKey}
                         strategyName={selectedStrategy}
                         strategyTotal={strategyTotal}
+                        brainTags={brainTagsForTicker(trade.ticker, "Vector", "open")}
                         onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
                         onDone={key => { setDoneCuts(prev => ({ ...prev, [key]: "done" })); setExpandedCards(prev => ({ ...prev, [key]: false })); }}
                         onView={key => setDoneCuts(prev => ({ ...prev, [key]: "open" }))}
@@ -3333,7 +3376,7 @@ export default function App() {
                     <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
                       <span style={{ fontSize: 13, fontWeight: 500, color: nnUp ? GREEN : RED }}>{nnUp ? "↑" : "↓"} {Math.abs(nnPercent).toFixed(2)}%</span>
                       <span style={{ fontSize: 12, color: T3 }}>{formatSignedCurrency(nnChange)}</span>
-                      <span style={{ fontSize: 10, color: T3 }}>realized {formatSignedCurrency(novaRealizedPnl)} + open {formatSignedCurrency(novaOpenPnl)}</span>
+                      <span style={{ fontSize: 10, color: T3 }}>(realized + open)</span>
                     </div>
                     <MiniChart data={nnPerfHistory} timeframe={nnPerfTimeframe} feeAdjusted={feeAdjusted} />
                     <ProjectionLine projection={novaSimulationProjection} T3={T3} BLUE={"#a78bfa"} />
@@ -3440,6 +3483,7 @@ export default function App() {
                         pdtRemaining={pdtRemaining}
                         strategyName={selectedStrategy}
                         strategyTotal={strategyTotal}
+                        brainTags={brainTagsForTicker(trade.ticker, "Nova", "open")}
                         expanded={expandedCards[trade.id]}
                         onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))}
                         />
@@ -3469,6 +3513,7 @@ export default function App() {
                         themeKey={themeKey}
                         strategyName={selectedStrategy}
                         strategyTotal={strategyTotal}
+                        brainTags={brainTagsForTicker(pick.ticker, "Nova", "pick")}
                         expanded={expandedCards[pick.ticker + "_nn"]}
                         cardKeyOverride={pick.ticker + "_nn"}
                         onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))} />
