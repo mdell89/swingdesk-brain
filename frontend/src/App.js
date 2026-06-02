@@ -3863,37 +3863,65 @@ export default function App() {
             </div>
           )}
 
-          {/* ── Method Intelligence ── */}
+          {/* Variant Intelligence: live universe ledger, aligned with Brain tab. */}
           {(() => {
-            const METHOD_INFO = METHOD_DEFINITIONS;
-            const allMethods = Object.keys(METHOD_INFO);
+            const variantRows = variantLeaderboard
+              .filter(row =>
+                row.brain === activeVariantBrain &&
+                (allStrategySelected || row.strategy === selectedStrategy) &&
+                !["top 1", "top1", "top 3", "top3"].includes(String(row.selection_mode || "").toLowerCase())
+              )
+              .sort((a, b) =>
+                Number(b.closed_count || 0) - Number(a.closed_count || 0) ||
+                Number(b.open_count || 0) - Number(a.open_count || 0) ||
+                Number(b.return_pct || 0) - Number(a.return_pct || 0)
+              );
 
             return (
               <div style={{ marginTop: 16 }}>
-                <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8, marginBottom: 10 }}>Method Intelligence</div>
+                <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .8, marginBottom: 10 }}>Variant Intelligence</div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                  {allMethods.map(method => {
-                    const stats = methodStats?.[method];
-                    const isExpanded = expandedMethods[method];
-                    const flaggedPositions = openPositions.filter(p => p.confluence_methods?.includes(method));
-                    const flaggedPicks = picks.longs.filter(p => p.confluence_methods?.includes(method));
-                    const totalFlagged = flaggedPositions.length + flaggedPicks.length;
+                  {variantRows.length === 0 ? (
+                    <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 20, fontSize: 12, color: T3, textAlign: "center" }}>
+                      No active variants match this analytics filter.
+                    </div>
+                  ) : variantRows.map(row => {
+                    const isExpanded = expandedMethods[`variant_${row.id}`];
+                    const closedCount = Number(row.closed_count || 0);
+                    const openCount = Number(row.open_count || 0);
+                    const winRate = row.win_rate == null ? null : Number(row.win_rate);
+                    const returnPct = Number(row.return_pct || 0);
+                    const winColor = winRate == null ? T3 : winRate >= 60 ? GREEN : winRate >= 45 ? AMBER : RED;
+                    const brainColor = row.brain === "Nova" ? "#a78bfa" : BLUE;
+                    const method = row.id;
+                    const METHOD_INFO = {
+                      [row.id]: `Live variant ledger for ${row.strategy} / ${row.brain} / ${row.execution_time || "Reg"} / ${row.selection_mode || "All"}. This is the same universe ledger used by the Brain tab.`,
+                    };
+                    const stats = {
+                      total_signals: closedCount + openCount,
+                      win_rate: winRate,
+                      avg_move: returnPct,
+                      best_trade: Number(row.equity || 0),
+                      hits: Number(row.win_count || 0),
+                      misses: Number(row.loss_count || 0),
+                    };
+                    const flaggedPositions = [];
+                    const flaggedPicks = [];
+                    const totalFlagged = 0;
 
                     return (
-                      <div key={method} style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, overflow: "hidden" }}>
-                        <div onClick={() => setExpandedMethods(p => ({ ...p, [method]: !p[method] }))}
+                      <div key={row.id} style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, overflow: "hidden" }}>
+                        <div onClick={() => setExpandedMethods(prev => ({ ...prev, [`variant_${row.id}`]: !prev[`variant_${row.id}`] }))}
                           style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 14px", cursor: "pointer" }}>
                           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                            <span style={{ fontSize: 12, fontWeight: 600, color: T1 }}>{method}</span>
-                            {totalFlagged > 0 && (
-                              <span style={{ fontSize: 9, color: BLUE, background: "#0a1020", padding: "1px 6px", borderRadius: 10, border: `1px solid #1a2a40` }}>{totalFlagged} flagged</span>
-                            )}
+                            <span style={{ fontSize: 12, fontWeight: 600, color: T1 }}>{row.label || row.id}</span>
+                            <span style={{ fontSize: 8, color: brainColor, background: brainColor + "16", padding: "1px 6px", borderRadius: 10, border: `1px solid ${brainColor}44`, fontWeight: 800 }}>{row.brain}</span>
                           </div>
                           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                            {stats?.win_rate != null ? (
-                              <span style={{ fontSize: 11, fontWeight: 600, color: stats.win_rate >= 60 ? GREEN : stats.win_rate >= 45 ? AMBER : RED }}>{stats.win_rate}%</span>
+                            {winRate != null ? (
+                              <span style={{ fontSize: 11, fontWeight: 600, color: winColor }}>{winRate.toFixed(1)}%</span>
                             ) : (
-                              <span style={{ fontSize: 9, color: T3 }}>No data yet</span>
+                              <span style={{ fontSize: 9, color: T3 }}>No closes</span>
                             )}
                             <span style={{ color: T3, fontSize: 10 }}>{isExpanded ? "▲" : "▼"}</span>
                           </div>
@@ -3907,8 +3935,8 @@ export default function App() {
                               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginBottom: 12 }}>
                                 {[
                                   ["Win rate", stats.win_rate != null ? `${stats.win_rate}%` : "—", stats.win_rate >= 60 ? GREEN : stats.win_rate >= 45 ? AMBER : RED],
-                                  ["Avg move", stats.avg_move != null ? `+${stats.avg_move.toFixed(1)}%` : "—", GREEN],
-                                  ["Best trade", stats.best_trade != null ? `+${stats.best_trade.toFixed(1)}%` : "—", GREEN],
+                                  ["Return", stats.avg_move != null ? `${stats.avg_move >= 0 ? "+" : ""}${stats.avg_move.toFixed(2)}%` : "—", stats.avg_move >= 0 ? GREEN : RED],
+                                  ["Equity", stats.best_trade != null ? `$${stats.best_trade.toFixed(2)}` : "—", T1],
                                   ["Hits", stats.hits, GREEN],
                                   ["Misses", stats.misses, RED],
                                 ].map(([label, value, color]) => (
