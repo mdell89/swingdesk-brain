@@ -2461,6 +2461,7 @@ def variant_weighted_signal_score(pick, weights):
     return round(base_conf * 0.65 + weighted * 100 * 0.35, 4)
 
 def learn_variant_from_closed_trade(database, trade_row, outcome, actual_move):
+    """Learn from one resolved variant trade and always leave an audit trail."""
     variant_id = trade_row.get("variant_id")
     before = get_variant_signal_weights(database, variant_id)
     try:
@@ -2471,30 +2472,38 @@ def learn_variant_from_closed_trade(database, trade_row, outcome, actual_move):
     if not isinstance(scores, dict):
         scores = scores_blob if isinstance(scores_blob, dict) else {}
     scores = canonicalize_signal_map(scores)
-    if not scores:
-        return
-    direction = 1 if outcome == "hit" else -1
-    strength = min(abs(float(actual_move or 0)) / 10.0, 1.0)
     after = dict(before)
     reasoning = []
-    for key in canonical_signal_weights():
-        signal_score = float(scores.get(key, 0.5) or 0.5)
-        delta = direction * strength * (signal_score - 0.5) * 0.02
-        if abs(delta) >= 0.0001:
-            after[key] = after.get(key, before[key]) + delta
-            reasoning.append(f"{key} {'rewarded' if delta > 0 else 'penalized'} from {outcome} trade")
-    after = normalize_signal_weights(after)
+    status = "updated"
+    if scores:
+        direction = 1 if outcome == "hit" else -1
+        strength = min(abs(float(actual_move or 0)) / 10.0, 1.0)
+        for key in canonical_signal_weights():
+            signal_score = float(scores.get(key, 0.5) or 0.5)
+            delta = direction * strength * (signal_score - 0.5) * 0.02
+            if abs(delta) >= 0.0001:
+                after[key] = after.get(key, before[key]) + delta
+                reasoning.append(f"{key} {'rewarded' if delta > 0 else 'penalized'} from {outcome} trade")
+        after = normalize_signal_weights(after)
+        if not reasoning:
+            status = "unchanged"
+            reasoning.append("signal scores were neutral; weights unchanged")
+    else:
+        status = "missing_signal_scores"
+        reasoning.append("closed trade had no signal score payload; weights unchanged")
     ts = current_time_cst().isoformat()
-    database.execute("""
-        UPDATE variant_signal_weights
-        SET weights_json=?, learning_revision=COALESCE(learning_revision, 0)+1, updated_at=?
-        WHERE variant_id=?
-    """, [json.dumps(after), ts, variant_id])
+    if status == "updated":
+        database.execute("""
+            UPDATE variant_signal_weights
+            SET weights_json=?, learning_revision=COALESCE(learning_revision, 0)+1, updated_at=?
+            WHERE variant_id=?
+        """, [json.dumps(after), ts, variant_id])
     database.execute("""
         INSERT OR REPLACE INTO variant_learning_events
         (id, variant_id, trade_id, timestamp, outcome, actual_move, weights_before, weights_after, reasoning)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [f"{trade_row.get('id')}_{int(time.time())}", variant_id, trade_row.get("id"), ts, outcome, actual_move, json.dumps(before), json.dumps(after), json.dumps(reasoning[:6])])
+    return status
 
 def run_daily_variant_learning():
     """Apply variant ML once per day from closed trades that have not been learned yet."""
@@ -2510,15 +2519,31 @@ def run_daily_variant_learning():
             ORDER BY t.sell_date ASC, COALESCE(t.sell_time, '') ASC, t.id ASC
         """).fetchall()]
         learned = 0
+        updated = 0
+        unchanged = 0
+        missing_signal_scores = 0
         for row in rows:
             outcome = row.get("outcome")
             actual_move = row.get("actual_move")
             if not row.get("variant_id") or outcome == "open":
                 continue
-            learn_variant_from_closed_trade(database, row, outcome, actual_move)
+            status = learn_variant_from_closed_trade(database, row, outcome, actual_move)
             learned += 1
+            if status == "updated":
+                updated += 1
+            elif status == "missing_signal_scores":
+                missing_signal_scores += 1
+            else:
+                unchanged += 1
         database.commit()
-        return {"success": True, "learned": learned, "eligible_closed_trades": len(rows)}
+        return {
+            "success": True,
+            "learned": learned,
+            "updated": updated,
+            "unchanged": unchanged,
+            "missing_signal_scores": missing_signal_scores,
+            "eligible_closed_trades": len(rows),
+        }
     except Exception as exc:
         database.rollback()
         log.error(f"Daily variant learning failed: {exc}")

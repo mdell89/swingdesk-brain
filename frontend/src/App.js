@@ -2805,6 +2805,14 @@ export default function App() {
     variantCounterPage * VARIANT_COUNTER_PAGE_SIZE,
     (variantCounterPage + 1) * VARIANT_COUNTER_PAGE_SIZE
   );
+  const proofOpenLearningCount = Number(variantProof?.learned_open_trade_count || 0);
+  const proofPendingLearningCount = Number(variantProof?.unlearned_closed_variant_count || 0);
+  const proofLearningColor = proofOpenLearningCount ? RED : proofPendingLearningCount ? AMBER : GREEN;
+  const proofLearningLabel = proofOpenLearningCount
+    ? `${proofOpenLearningCount} open`
+    : proofPendingLearningCount
+      ? `${proofPendingLearningCount} pending`
+      : "current";
   const variantLabel = v => {
     if (!v) return "All";
     const time = v.execution_time === "reg" ? "Reg" : (v.execution_time || "").replace(/^0/, "");
@@ -4065,10 +4073,10 @@ export default function App() {
                       {variantProof.ledger_mismatch_count || 0} mismatch
                     </div>
                   </div>
-                  <div style={{ background: "#000", border: `1px solid ${variantProof.learned_open_trade_count ? RED + "66" : BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
+                  <div style={{ background: "#000", border: `1px solid ${proofOpenLearningCount ? RED + "66" : proofPendingLearningCount ? AMBER + "66" : BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
                     <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>Learning</div>
-                    <div style={{ fontSize: 12, color: variantProof.learned_open_trade_count ? RED : GREEN, fontFamily: "'DM Mono',monospace" }}>
-                      {variantProof.learned_open_trade_count ? `${variantProof.learned_open_trade_count} open` : "closed only"}
+                    <div style={{ fontSize: 12, color: proofLearningColor, fontFamily: "'DM Mono',monospace" }}>
+                      {proofLearningLabel}
                     </div>
                   </div>
                   <div style={{ background: "#000", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 8px" }}>

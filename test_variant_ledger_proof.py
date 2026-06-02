@@ -84,6 +84,7 @@ class VariantLedgerProofTest(unittest.TestCase):
         self.assertEqual(proof["ledger"]["computed_equity"], 1001.5)
         self.assertTrue(proof["learning"]["closed_trades_only"])
         self.assertEqual(proof["learning"]["unlearned_closed_trade_count"], 0)
+        self.assertEqual(proof["learning"]["state"], "current")
 
     def test_flags_ledger_mismatch_and_learning_on_open_trade(self):
         db = make_database()
@@ -110,6 +111,26 @@ class VariantLedgerProofTest(unittest.TestCase):
         self.assertIn("ledger_mismatch", proof["issues"])
         self.assertIn("learning_event_points_to_open_trade", proof["issues"])
         self.assertFalse(proof["learning"]["closed_trades_only"])
+        self.assertEqual(proof["learning"]["state"], "open_trade_violation")
+
+    def test_tracks_pending_closed_trades_without_calling_it_corruption(self):
+        db = make_database()
+        db.execute("""
+            INSERT INTO variant_portfolios
+            (variant_id, cash, equity, realized_pnl, open_value, open_count, closed_count)
+            VALUES ('v1', 1000, 1000, 4, 0, 0, 1)
+        """)
+        db.execute("""
+            INSERT INTO variant_virtual_trades
+            (id, variant_id, outcome, sell_date, gross_pnl, net_pnl)
+            VALUES ('closed1', 'v1', 'hit', '2026-06-01', 4.0, 4.0)
+        """)
+
+        proof = build_variant_ledger_proof(db, {"id": "v1", "brain": "Vector", "strategy": "SwingDesk"})
+
+        self.assertEqual(proof["health"], "ok")
+        self.assertEqual(proof["learning"]["state"], "pending_closed_trade_events")
+        self.assertEqual(proof["learning"]["unlearned_closed_trade_ids"], ["closed1"])
 
 
 if __name__ == "__main__":

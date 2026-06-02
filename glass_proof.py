@@ -81,6 +81,12 @@ def build_variant_ledger_proof(database, variant, snapshot=None, get_weights=Non
         trade_id for trade_id in learned_trade_ids
         if any(r.get("id") == trade_id for r in open_rows)
     ])
+    if learned_open_trade_ids:
+        learning_state = "open_trade_violation"
+    elif closed_unlearned:
+        learning_state = "pending_closed_trade_events"
+    else:
+        learning_state = "current"
 
     proof_issues = []
     if not portfolio:
@@ -130,6 +136,7 @@ def build_variant_ledger_proof(database, variant, snapshot=None, get_weights=Non
             "unlearned_closed_trade_ids": closed_unlearned[:25],
             "learned_open_trade_ids": learned_open_trade_ids[:25],
             "closed_trades_only": not learned_open_trade_ids,
+            "state": learning_state,
         },
         "issues": proof_issues,
         "health": "ok" if not proof_issues else "attention",
@@ -141,6 +148,6 @@ def proof_contract():
     return {
         "variant_alive": "Active variant has a portfolio and can evaluate the latest shared Vector/Nova snapshot.",
         "ledger": "equity must equal cash plus open_value; open_value and realized_pnl must tie to variant_virtual_trades.",
-        "learning": "daily learning may only consume closed trades with sell_date, and must never point to open trades.",
+        "learning": "daily learning may only consume closed trades with sell_date; every eligible closed trade must produce either a weight-change event or an explicit no-op event.",
         "audit": "audit is read-only recap; weights_before and weights_after in audit_log are expected to match.",
     }
