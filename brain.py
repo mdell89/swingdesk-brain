@@ -8604,6 +8604,8 @@ def api_variant_status():
             "last_monitor": last_monitor,
         }
         if snapshot:
+            vector_pick_count = len(snapshot["vector_payload"].get("longs") or snapshot["vector_payload"].get("recommended_longs") or [])
+            nova_pick_count = len(snapshot["nova_payload"].get("recommended_longs") or snapshot["nova_payload"].get("longs") or [])
             payload.update({
                 "shared_snapshot": True,
                 "vector_cache_time": snapshot["vector_cache_time"],
@@ -8611,12 +8613,27 @@ def api_variant_status():
                 "vector_cache_age_minutes": snapshot["vector_cache_age_minutes"],
                 "nova_cache_age_minutes": snapshot["nova_cache_age_minutes"],
                 "cache_gap_minutes": snapshot["cache_gap_minutes"],
-                "vector_pick_count": len(snapshot["vector_payload"].get("longs") or snapshot["vector_payload"].get("recommended_longs") or []),
-                "nova_pick_count": len(snapshot["nova_payload"].get("recommended_longs") or snapshot["nova_payload"].get("longs") or []),
+                "vector_pick_count": vector_pick_count,
+                "nova_pick_count": nova_pick_count,
             })
         else:
             payload["shared_snapshot"] = False
             payload["cache_issue"] = refusal
+        now = current_time_cst()
+        last_run_date = str((last_run or {}).get("ran_at") or "")[:10]
+        today = now.strftime("%Y-%m-%d")
+        has_openable_snapshot = bool((payload.get("vector_pick_count") or 0) + (payload.get("nova_pick_count") or 0))
+        after_primary_execution = now.hour > 8 or (now.hour == 8 and now.minute >= 50)
+        payload["missed_variant_open_alert"] = bool(
+            after_primary_execution and
+            has_openable_snapshot and
+            int(payload.get("open_positions") or 0) == 0 and
+            last_run_date != today
+        )
+        payload["missed_variant_open_reason"] = (
+            "Cached Vector/Nova picks exist after 8:50 AM Central, but no variant universe has open positions and last_variant_run is not from today."
+            if payload["missed_variant_open_alert"] else None
+        )
         return jsonify(payload)
     except Exception as e:
         log.error(f"variant-status error: {e}")
@@ -8905,7 +8922,26 @@ def api_run_daily_variant_learning():
 @app.route("/api/variant-run-now", methods=["POST"])
 def api_variant_run_now():
     """Manually run active universes from the latest cached shared scan."""
-    return jsonify(run_variant_universes_from_cache(trigger="manual"))
+    body = request.get_json(silent=True) or {}
+    buy_time = body.get("buy_time")
+    trigger = body.get("trigger") or ("manual_recovery" if buy_time else "manual")
+    return jsonify(run_variant_universes_from_cache(trigger=trigger, buy_time=buy_time))
+
+@app.route("/api/recover-missed-variant-open", methods=["POST"])
+def api_recover_missed_variant_open():
+    """Replay the 8:45 universe run from the latest cached shared scan.
+
+    Idempotent: run_variant_universes_from_cache skips any variant/ticker/date
+    trade id that already exists before opening a new simulated position.
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        buy_time = body.get("buy_time") or "08:45:00"
+        result = run_variant_universes_from_cache(trigger="manual_recovery_0845", buy_time=buy_time)
+        return jsonify(result), 200 if result.get("success", True) else 500
+    except Exception as e:
+        log.error(f"Manual missed variant-open recovery failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/api/variant-monitor-now", methods=["POST"])
 def api_variant_monitor_now():
