@@ -8956,7 +8956,6 @@ def api_recover_missed_variant_open_from_executions():
     universe runner missed its 8:45 job. It only reconstructs the primary
     SwingDesk 8:45 universes, using the real open rows as the source of truth.
     """
-    database = get_database()
     today = current_time_cst().strftime("%Y-%m-%d")
     status = {
         "success": True,
@@ -8969,7 +8968,9 @@ def api_recover_missed_variant_open_from_executions():
         "skipped": [],
         "errors": [],
     }
+    database = None
     try:
+        database = get_database()
         source_tables = {
             "Vector": "virtual_trades",
             "Nova": "nn_virtual_trades",
@@ -9070,15 +9071,17 @@ def api_recover_missed_variant_open_from_executions():
             update_variant_portfolio(database, variant["id"], note="recovery_from_executions")
         database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_variant_run', ?)", [json.dumps(status)])
         database.commit()
-        return jsonify(status)
+        return jsonify(json.loads(json.dumps(status, default=str)))
     except Exception as error:
-        database.rollback()
+        if database:
+            database.rollback()
         status["success"] = False
         status["errors"].append(str(error))
         log.error(f"recover missed variant open from executions failed: {error}")
-        return jsonify(status), 500
+        return jsonify(json.loads(json.dumps(status, default=str))), 500
     finally:
-        database.close()
+        if database:
+            database.close()
 
 @app.route("/api/variant-monitor-now", methods=["POST"])
 def api_variant_monitor_now():
