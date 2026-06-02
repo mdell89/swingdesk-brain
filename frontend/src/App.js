@@ -2435,7 +2435,7 @@ export default function App() {
   }
 
   function round2(n) { return Math.round(n * 100) / 100; }
-  const AUDIT_PAGE_SIZE = 3;
+  const AUDIT_PAGE_SIZE = 2;
   const LEARNING_PAGE_SIZE = 10;
   const VARIANT_COUNTER_PAGE_SIZE = 8;
 
