@@ -2890,6 +2890,11 @@ export default function App() {
     : proofPendingLearningCount
       ? `${proofPendingLearningCount} pending`
       : "current";
+  const variantProofAttentionRows = Array.isArray(variantProof?.rows)
+    ? variantProof.rows
+      .filter(row => row.health === "attention" || row.evaluation_state === "evaluated_no_pick" || !row.ledger_ok)
+      .slice(0, 5)
+    : [];
   const variantLabel = v => {
     if (!v) return "All";
     const time = v.execution_time === "reg" ? "Reg" : (v.execution_time || "").replace(/^0/, "");
@@ -4175,26 +4180,48 @@ export default function App() {
                 </div>
               </div>
               {variantProof && (
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
-                  <div style={{ background: "#000", border: `1px solid ${variantProof.ledger_mismatch_count ? RED + "66" : BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
-                    <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>Ledger</div>
-                    <div style={{ fontSize: 12, color: variantProof.ledger_mismatch_count ? RED : GREEN, fontFamily: "'DM Mono',monospace" }}>
-                      {variantProof.ledger_mismatch_count || 0} mismatch
+                <>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
+                    <div style={{ background: "#000", border: `1px solid ${variantProof.ledger_mismatch_count ? RED + "66" : BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
+                      <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>Ledger</div>
+                      <div style={{ fontSize: 12, color: variantProof.ledger_mismatch_count ? RED : GREEN, fontFamily: "'DM Mono',monospace" }}>
+                        {variantProof.ledger_mismatch_count || 0} mismatch
+                      </div>
+                    </div>
+                    <div style={{ background: "#000", border: `1px solid ${proofOpenLearningCount ? RED + "66" : proofPendingLearningCount ? AMBER + "66" : BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
+                      <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>Learning</div>
+                      <div style={{ fontSize: 12, color: proofLearningColor, fontFamily: "'DM Mono',monospace" }}>
+                        {proofLearningLabel}
+                      </div>
+                    </div>
+                    <div style={{ background: "#000", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
+                      <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>No Pick</div>
+                      <div style={{ fontSize: 12, color: T2, fontFamily: "'DM Mono',monospace" }}>
+                        {variantProof.evaluated_no_pick_count || 0} variants
+                      </div>
                     </div>
                   </div>
-                  <div style={{ background: "#000", border: `1px solid ${proofOpenLearningCount ? RED + "66" : proofPendingLearningCount ? AMBER + "66" : BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
-                    <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>Learning</div>
-                    <div style={{ fontSize: 12, color: proofLearningColor, fontFamily: "'DM Mono',monospace" }}>
-                      {proofLearningLabel}
+                  {variantProofAttentionRows.length > 0 && (
+                    <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 5 }}>
+                      {variantProofAttentionRows.map(row => {
+                        const topReason = row.evaluation?.no_pick_reasons?.[0]?.reason || row.issues?.[0] || "No issue text recorded.";
+                        const sourceCount = row.evaluation?.source_count ?? row.source_count ?? 0;
+                        const qualifiedCount = row.evaluation?.strategy_qualified ?? row.strategy_qualified ?? 0;
+                        const selectedCount = row.evaluation?.selected_count ?? row.selected_count ?? 0;
+                        const color = row.brain === "Nova" ? "#a78bfa" : BLUE;
+                        return (
+                          <div key={row.variant_id} style={{ background: "#070708", border: `1px solid ${BORDER}`, borderRadius: 7, padding: "7px 8px" }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline" }}>
+                              <div style={{ minWidth: 0, fontSize: 8, color: T1, fontWeight: 800, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{row.label || row.variant_id}</div>
+                              <div style={{ flexShrink: 0, fontSize: 8, color, fontFamily: "'DM Mono',monospace" }}>{sourceCount}/{qualifiedCount}/{selectedCount}</div>
+                            </div>
+                            <div style={{ marginTop: 3, fontSize: 8, color: T3, lineHeight: 1.35 }}>{topReason}</div>
+                          </div>
+                        );
+                      })}
                     </div>
-                  </div>
-                  <div style={{ background: "#000", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
-                    <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>No Pick</div>
-                    <div style={{ fontSize: 12, color: T2, fontFamily: "'DM Mono',monospace" }}>
-                      {variantProof.evaluated_no_pick_count || 0} variants
-                    </div>
-                  </div>
-                </div>
+                  )}
+                </>
               )}
             </div>
           )}

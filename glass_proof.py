@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 
 
 def _extract_signal_scores(payload):
@@ -13,7 +14,20 @@ def _extract_signal_scores(payload):
     return payload if isinstance(payload, dict) else {}
 
 
-def build_variant_ledger_proof(database, variant, snapshot=None, get_weights=None, filter_picks=None, select_picks=None):
+def _summarize_pick(pick):
+    """Small pick snapshot for glass-house diagnostics."""
+    if not pick:
+        return {}
+    return {
+        "ticker": pick.get("ticker"),
+        "confidence": pick.get("long_conf") or pick.get("confidence") or pick.get("nn_score"),
+        "expected_move": pick.get("long_move") or pick.get("expected_move"),
+        "day_change_pct": pick.get("day_change_pct") or pick.get("pct_change_prev_close"),
+        "volume_ratio": pick.get("vol_ratio") or pick.get("volume_ratio"),
+    }
+
+
+def build_variant_ledger_proof(database, variant, snapshot=None, get_weights=None, filter_picks=None, select_picks=None, explain_strategy=None):
     """Return one variant's aliveness and ledger reconciliation proof."""
     variant = dict(variant)
     variant_id = variant["id"]
@@ -65,6 +79,9 @@ def build_variant_ledger_proof(database, variant, snapshot=None, get_weights=Non
 
     source_count = strategy_qualified = selected_count = 0
     selected_tickers = []
+    source_sample = []
+    qualified_sample = []
+    no_pick_reasons = []
     evaluation_state = "no_snapshot"
     evaluation_issues = []
     if snapshot and get_weights and filter_picks and select_picks:
@@ -80,11 +97,25 @@ def build_variant_ledger_proof(database, variant, snapshot=None, get_weights=Non
         strategy_qualified = len(qualified)
         selected_count = len(selected)
         selected_tickers = [p.get("ticker") for p in selected[:20]]
+        source_sample = [_summarize_pick(p) for p in source[:5]]
+        qualified_sample = [_summarize_pick(p) for p in qualified[:5]]
         evaluation_state = "selected" if selected else "evaluated_no_pick"
         if not source:
             evaluation_issues.append(f"{variant.get('brain')} source pick list is empty")
         if source and not qualified:
             evaluation_issues.append("No source picks matched this variant strategy filter")
+            if explain_strategy:
+                reason_counter = Counter()
+                for pick in source:
+                    explanation = explain_strategy(variant.get("strategy"), pick)
+                    if explanation.get("matched"):
+                        continue
+                    reasons = explanation.get("reasons") or ["No strategy rule matched"]
+                    reason_counter.update(reasons[:2])
+                no_pick_reasons = [
+                    {"reason": reason, "count": count}
+                    for reason, count in reason_counter.most_common(6)
+                ]
         if qualified and not selected:
             evaluation_issues.append("Strategy-qualified picks existed, but selection mode returned none")
 
@@ -130,6 +161,16 @@ def build_variant_ledger_proof(database, variant, snapshot=None, get_weights=Non
         "strategy_qualified": strategy_qualified,
         "selected_count": selected_count,
         "selected_tickers": selected_tickers,
+        "evaluation": {
+            "state": evaluation_state,
+            "source_count": source_count,
+            "strategy_qualified": strategy_qualified,
+            "selected_count": selected_count,
+            "selected_tickers": selected_tickers,
+            "source_sample": source_sample,
+            "qualified_sample": qualified_sample,
+            "no_pick_reasons": no_pick_reasons,
+        },
         "ledger_ok": ledger_ok,
         "ledger": {
             "cash": cash,
@@ -168,6 +209,7 @@ def proof_contract():
     """Human-readable contract surfaced by the glass-house endpoint."""
     return {
         "variant_alive": "Active variant has a portfolio and can evaluate the latest shared Vector/Nova snapshot.",
+        "evaluation": "selected_count explains live picks; evaluated_no_pick rows include source/qualified counts and filter reasons when the source list was non-empty.",
         "ledger": "equity must equal cash plus open_value; open_value and realized_pnl must tie to variant_virtual_trades.",
         "learning": "daily learning may only consume closed trades with sell_date; every eligible closed trade must produce either a weight-change event or an explicit no-op event.",
         "audit": "audit is read-only recap; weights_before and weights_after in audit_log are expected to match.",

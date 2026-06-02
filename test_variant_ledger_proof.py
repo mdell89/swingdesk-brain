@@ -134,6 +134,54 @@ class VariantLedgerProofTest(unittest.TestCase):
         self.assertEqual(proof["learning"]["state"], "pending_closed_trade_events")
         self.assertEqual(proof["learning"]["unlearned_closed_trade_ids"], ["closed1"])
 
+    def test_explains_alive_variant_with_no_selected_picks(self):
+        db = make_database()
+        db.execute("""
+            INSERT INTO variant_portfolios
+            (variant_id, cash, equity, realized_pnl, open_value, open_count, closed_count)
+            VALUES ('v1', 1000, 1000, 0, 0, 0, 0)
+        """)
+        snapshot = {
+            "vector_payload": {
+                "longs": [
+                    {"ticker": "ABC", "confidence": 60, "expected_move": 4},
+                    {"ticker": "XYZ", "confidence": 62, "expected_move": 2},
+                ]
+            },
+            "nova_payload": {"recommended_longs": []},
+        }
+
+        def get_weights(_database, _variant_id):
+            return {}
+
+        def filter_picks(source, _variant, _weights):
+            return []
+
+        def select_picks(source, _selection_mode):
+            return source
+
+        def explain_strategy(_strategy, pick):
+            return {
+                "matched": False,
+                "reasons": [f"{pick['ticker']} failed confidence floor"],
+            }
+
+        proof = build_variant_ledger_proof(
+            db,
+            {"id": "v1", "brain": "Vector", "strategy": "SwingDesk", "selection_mode": "All"},
+            snapshot=snapshot,
+            get_weights=get_weights,
+            filter_picks=filter_picks,
+            select_picks=select_picks,
+            explain_strategy=explain_strategy,
+        )
+
+        self.assertEqual(proof["evaluation_state"], "evaluated_no_pick")
+        self.assertEqual(proof["evaluation"]["source_count"], 2)
+        self.assertEqual(proof["evaluation"]["strategy_qualified"], 0)
+        self.assertEqual(proof["evaluation"]["no_pick_reasons"][0]["count"], 1)
+        self.assertIn("No source picks matched", proof["issues"][0])
+
 
 if __name__ == "__main__":
     unittest.main()

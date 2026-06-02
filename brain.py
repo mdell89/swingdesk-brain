@@ -2748,8 +2748,8 @@ def variant_cache_snapshot(database, require_fresh=True, max_age_minutes=180):
         "scan_status": scan_status,
     }, None
 
-def variant_strategy_matches(strategy, pick):
-    """Lightweight bullish filters so universes do not all consume the same pick stream."""
+def explain_variant_strategy_match(strategy, pick):
+    """Explain one strategy filter decision for variant aliveness diagnostics."""
     strategy = (strategy or "SwingDesk").lower()
     day_change = float(pick.get("day_change_pct") or pick.get("pct_change_prev_close") or 0)
     regular_open_change = float(pick.get("pct_change_regular_open") or 0)
@@ -2763,35 +2763,148 @@ def variant_strategy_matches(strategy, pick):
         methods = []
     method_text = " ".join(str(m).lower() for m in methods)
 
+    def result(matched, reasons=None, passes=None):
+        return {
+            "matched": bool(matched),
+            "reasons": reasons or [],
+            "passes": passes or [],
+            "metrics": {
+                "confidence": confidence,
+                "expected_move": expected_move,
+                "day_change_pct": day_change,
+                "regular_open_change_pct": regular_open_change,
+                "gap_pct": gap,
+                "volume_ratio": volume,
+                "rsi": rsi,
+                "confluence_count": confluence,
+            },
+        }
+
     if strategy == "swingdesk":
-        return confidence >= 65 and expected_move >= 3
+        reasons = []
+        if confidence < 65:
+            reasons.append(f"confidence {confidence}% below 65%")
+        if expected_move < 3:
+            reasons.append(f"expected move {expected_move:.1f}% below 3.0%")
+        return result(not reasons, reasons)
     if strategy == "darvas":
-        return (confluence >= 1 or "52" in method_text or "breakout" in method_text) and day_change > 1.5 and volume >= 1.0
+        reasons = []
+        if not (confluence >= 1 or "52" in method_text or "breakout" in method_text):
+            reasons.append("no breakout/confluence evidence")
+        if day_change <= 1.5:
+            reasons.append(f"day change {day_change:.1f}% not above 1.5%")
+        if volume < 1.0:
+            reasons.append(f"volume {volume:.2f}x below 1.0x")
+        return result(not reasons, reasons)
     if strategy == "gap & go":
-        return gap >= 2.5 and day_change > 2 and volume >= 1.1
+        reasons = []
+        if gap < 2.5:
+            reasons.append(f"gap {gap:.1f}% below 2.5%")
+        if day_change <= 2:
+            reasons.append(f"day change {day_change:.1f}% not above 2.0%")
+        if volume < 1.1:
+            reasons.append(f"volume {volume:.2f}x below 1.1x")
+        return result(not reasons, reasons)
     if strategy == "vwap reclaim":
         scores = pick.get("signal_scores_for_observation") or pick.get("signal_scores") or {}
         scores = extract_signal_score_map(scores)
-        return float(scores.get("vwap_reclaim") or 0) >= 0.65 or "vwap" in method_text
+        vwap_score = float(scores.get("vwap_reclaim") or 0)
+        matched = vwap_score >= 0.65 or "vwap" in method_text
+        return result(matched, [] if matched else [f"VWAP score {vwap_score:.2f} below 0.65 and no VWAP method tag"])
     if strategy == "inside day":
-        return abs(gap) <= 4 and day_change > 0.5 and volume >= 0.8 and 45 <= rsi <= 65
+        reasons = []
+        if abs(gap) > 4:
+            reasons.append(f"gap {gap:.1f}% outside inside-day range")
+        if day_change <= 0.5:
+            reasons.append(f"day change {day_change:.1f}% not above 0.5%")
+        if volume < 0.8:
+            reasons.append(f"volume {volume:.2f}x below 0.8x")
+        if not 45 <= rsi <= 65:
+            reasons.append(f"RSI {rsi:.0f} outside 45-65")
+        return result(not reasons, reasons)
     if strategy == "nr7":
-        return volume <= 1.4 and abs(gap) <= 5 and day_change > 0
+        reasons = []
+        if volume > 1.4:
+            reasons.append(f"volume {volume:.2f}x above NR7 quiet-range cap")
+        if abs(gap) > 5:
+            reasons.append(f"gap {gap:.1f}% outside NR7 range")
+        if day_change <= 0:
+            reasons.append(f"day change {day_change:.1f}% not positive")
+        return result(not reasons, reasons)
     if strategy == "bull flag":
-        return day_change > 1 and regular_open_change > -2 and 45 <= rsi <= 70 and confidence >= 62
+        reasons = []
+        if day_change <= 1:
+            reasons.append(f"day change {day_change:.1f}% not above 1.0%")
+        if regular_open_change <= -2:
+            reasons.append(f"regular-open change {regular_open_change:.1f}% too weak")
+        if not 45 <= rsi <= 70:
+            reasons.append(f"RSI {rsi:.0f} outside 45-70")
+        if confidence < 62:
+            reasons.append(f"confidence {confidence}% below 62%")
+        return result(not reasons, reasons)
     if strategy == "pocket pivot":
-        return volume >= 1.4 and day_change > 0.5 and confidence >= 60
+        reasons = []
+        if volume < 1.4:
+            reasons.append(f"volume {volume:.2f}x below 1.4x")
+        if day_change <= 0.5:
+            reasons.append(f"day change {day_change:.1f}% not above 0.5%")
+        if confidence < 60:
+            reasons.append(f"confidence {confidence}% below 60%")
+        return result(not reasons, reasons)
     if strategy == "vol squeeze breakout":
         scores = pick.get("signal_scores_for_observation") or pick.get("signal_scores") or {}
         scores = extract_signal_score_map(scores)
-        return float(scores.get("volatility_squeeze") or 0) >= 0.5 and day_change > 1
+        squeeze_score = float(scores.get("volatility_squeeze") or 0)
+        reasons = []
+        if squeeze_score < 0.5:
+            reasons.append(f"volatility squeeze score {squeeze_score:.2f} below 0.50")
+        if day_change <= 1:
+            reasons.append(f"day change {day_change:.1f}% not above 1.0%")
+        return result(not reasons, reasons)
     if strategy == "relative strength pullback":
-        return confidence >= 62 and day_change > 0 and regular_open_change <= 1.5 and 42 <= rsi <= 62 and volume >= 1.0
+        reasons = []
+        if confidence < 62:
+            reasons.append(f"confidence {confidence}% below 62%")
+        if day_change <= 0:
+            reasons.append(f"day change {day_change:.1f}% not positive")
+        if regular_open_change > 1.5:
+            reasons.append(f"regular-open change {regular_open_change:.1f}% too extended")
+        if not 42 <= rsi <= 62:
+            reasons.append(f"RSI {rsi:.0f} outside 42-62")
+        if volume < 1.0:
+            reasons.append(f"volume {volume:.2f}x below 1.0x")
+        return result(not reasons, reasons)
     if strategy == "ema trend pullback":
-        return confidence >= 62 and -2.5 <= regular_open_change <= 1.0 and day_change >= -1.0 and 45 <= rsi <= 60 and volume >= 0.9
+        reasons = []
+        if confidence < 62:
+            reasons.append(f"confidence {confidence}% below 62%")
+        if not -2.5 <= regular_open_change <= 1.0:
+            reasons.append(f"regular-open change {regular_open_change:.1f}% outside pullback range")
+        if day_change < -1.0:
+            reasons.append(f"day change {day_change:.1f}% too weak")
+        if not 45 <= rsi <= 60:
+            reasons.append(f"RSI {rsi:.0f} outside 45-60")
+        if volume < 0.9:
+            reasons.append(f"volume {volume:.2f}x below 0.9x")
+        return result(not reasons, reasons)
     if strategy == "opening range hold":
-        return confidence >= 62 and gap >= 1.0 and regular_open_change >= -0.5 and day_change > 0 and 45 <= rsi <= 68
-    return confidence >= 65
+        reasons = []
+        if confidence < 62:
+            reasons.append(f"confidence {confidence}% below 62%")
+        if gap < 1.0:
+            reasons.append(f"gap {gap:.1f}% below 1.0%")
+        if regular_open_change < -0.5:
+            reasons.append(f"regular-open change {regular_open_change:.1f}% too weak")
+        if day_change <= 0:
+            reasons.append(f"day change {day_change:.1f}% not positive")
+        if not 45 <= rsi <= 68:
+            reasons.append(f"RSI {rsi:.0f} outside 45-68")
+        return result(not reasons, reasons)
+    return result(confidence >= 65, [] if confidence >= 65 else [f"confidence {confidence}% below 65%"])
+
+def variant_strategy_matches(strategy, pick):
+    """Lightweight bullish filters so universes do not all consume the same pick stream."""
+    return explain_variant_strategy_match(strategy, pick).get("matched", False)
 
 def filter_variant_strategy_picks(picks, variant, weights=None):
     filtered = [p for p in picks if variant_strategy_matches(variant.get("strategy"), p)]
@@ -8586,6 +8699,7 @@ def api_variant_ledger_proof():
                 get_weights=get_variant_signal_weights,
                 filter_picks=filter_variant_strategy_picks,
                 select_picks=select_variant_picks,
+                explain_strategy=explain_variant_strategy_match,
             )
             for variant in variants
         ]
