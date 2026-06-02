@@ -1343,7 +1343,12 @@ def initialize_database():
         except:
             pass  # Column already exists
 
-    for column_definition in FEE_MODEL_COLUMN_DEFINITIONS:
+    # Keep the variant trade ledger schema aligned with the fields written by
+    # universe openings, execution recovery, card tags, and confidence context.
+    for column_definition in [
+        "confluence_count INTEGER DEFAULT 0",
+        "confluence_methods TEXT DEFAULT '[]'",
+    ] + FEE_MODEL_COLUMN_DEFINITIONS:
         try:
             database.execute(f"ALTER TABLE variant_virtual_trades ADD COLUMN {column_definition}")
         except:
@@ -8947,6 +8952,68 @@ def api_recover_missed_variant_open():
     except Exception as e:
         log.error(f"Manual missed variant-open recovery failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/recover-missed-variant-open-from-executions-preview", methods=["GET"])
+def api_recover_missed_variant_open_from_executions_preview():
+    """Preview execution-backed recovery without mutating variant ledgers."""
+    database = None
+    today = current_time_cst().strftime("%Y-%m-%d")
+    try:
+        database = get_database()
+        variants = [dict(row) for row in database.execute("""
+            SELECT sv.id, sv.strategy, sv.brain, sv.execution_time, sv.selection_mode,
+                   sv.exit_mode, vp.cash, vp.open_count, vp.lifecycle_status
+            FROM strategy_variants sv
+            JOIN variant_portfolios vp ON vp.variant_id = sv.id
+            WHERE sv.status='active'
+              AND vp.lifecycle_status!='archived'
+              AND sv.strategy='SwingDesk'
+              AND sv.execution_time='08:45'
+            ORDER BY sv.brain, sv.id
+        """).fetchall()]
+        source_tables = {
+            "Vector": "virtual_trades",
+            "Nova": "nn_virtual_trades",
+        }
+        source_counts = {}
+        source_tickers = {}
+        for brain_name, table_name in source_tables.items():
+            rows = [dict(row) for row in database.execute(f"""
+                SELECT ticker, buy_time, buy_price, invested_amount, outcome
+                FROM {table_name}
+                WHERE outcome='open'
+                  AND buy_date=?
+                  AND COALESCE(direction, 'long')='long'
+                ORDER BY buy_time ASC, ticker ASC
+            """, [today]).fetchall()]
+            source_counts[brain_name] = len(rows)
+            source_tickers[brain_name] = rows
+        existing_variant_opens = [dict(row) for row in database.execute("""
+            SELECT variant_id, ticker, buy_date, buy_time
+            FROM variant_virtual_trades
+            WHERE outcome='open'
+              AND buy_date=?
+            ORDER BY variant_id, ticker
+        """, [today]).fetchall()]
+        return jsonify({
+            "success": True,
+            "today": today,
+            "target_strategy": "SwingDesk",
+            "target_execution_time": "08:45",
+            "variant_count": len(variants),
+            "variants": variants,
+            "source_counts": source_counts,
+            "source_tickers": source_tickers,
+            "existing_variant_open_count": len(existing_variant_opens),
+            "existing_variant_opens": existing_variant_opens,
+            "would_recover": any(source_counts.get(variant.get("brain"), 0) for variant in variants),
+        })
+    except Exception as error:
+        log.error(f"recover missed variant open preview failed: {error}")
+        return jsonify({"success": False, "today": today, "error": str(error)}), 500
+    finally:
+        if database:
+            database.close()
 
 @app.route("/api/recover-missed-variant-open-from-executions", methods=["POST"])
 def api_recover_missed_variant_open_from_executions():
