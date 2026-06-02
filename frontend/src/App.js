@@ -621,6 +621,29 @@ function avg(values = []) {
   return nums.length ? nums.reduce((sum, value) => sum + value, 0) / nums.length : 0;
 }
 
+function roundMoney(value = 0) {
+  return Math.round(Number(value || 0) * 100) / 100;
+}
+
+function calculateSimulationLedger(portfolio = {}, trades = [], feeAdjusted = true) {
+  const startingCash = Number(portfolio?.starting_cash || 1000);
+  const activeTrades = Array.isArray(trades)
+    ? trades.filter(trade => trade && trade.outcome !== "archived_excess_open")
+    : [];
+  const openPnl = activeTrades
+    .filter(trade => trade.outcome === "open")
+    .reduce((sum, trade) => sum + getTradeOpenPnlDollars(trade, feeAdjusted), 0);
+  const realizedPnl = activeTrades
+    .filter(trade => trade.outcome !== "open")
+    .reduce((sum, trade) => sum + getClosedTradePnlDollars(trade, feeAdjusted), 0);
+  return {
+    starting_cash: roundMoney(startingCash),
+    realized_pnl: roundMoney(realizedPnl),
+    open_pnl: roundMoney(openPnl),
+    equity: roundMoney(startingCash + realizedPnl + openPnl),
+  };
+}
+
 function evidenceLevelForSample(sampleSize = 0) {
   if (sampleSize >= 75) return "Strong";
   if (sampleSize >= 30) return "Building";
@@ -2616,10 +2639,14 @@ export default function App() {
   const aggregateVariantDetails = allStrategySelected
     ? activeVariantUniverseIds.map(id => variantDetailsById[id]).filter(Boolean)
     : [];
-  const aggregatePortfolios = aggregateVariantDetails.map(detail => detail?.portfolio).filter(Boolean);
-  const aggregatePortfolio = aggregatePortfolios.length ? {
-    equity: avg(aggregatePortfolios.map(p => Number(p.equity || 0))),
-    starting_cash: avg(aggregatePortfolios.map(p => Number(p.starting_cash || 1000))),
+  const aggregateLedgers = aggregateVariantDetails
+    .filter(detail => detail?.portfolio)
+    .map(detail => calculateSimulationLedger(detail.portfolio, detail.trades || [], feeAdjusted));
+  const aggregatePortfolio = aggregateLedgers.length ? {
+    equity: roundMoney(avg(aggregateLedgers.map(ledger => ledger.equity))),
+    realized_pnl: roundMoney(avg(aggregateLedgers.map(ledger => ledger.realized_pnl))),
+    open_pnl: roundMoney(avg(aggregateLedgers.map(ledger => ledger.open_pnl))),
+    starting_cash: roundMoney(avg(aggregateLedgers.map(ledger => ledger.starting_cash))),
   } : null;
   const novaUniversePortfolio = allStrategySelected ? aggregatePortfolio : (novaUniverse?.portfolio || null);
   const selectedUniverseTrades = Array.isArray(novaUniverse?.trades)
@@ -2643,6 +2670,11 @@ export default function App() {
       : `SwingDesk / ${activeVariantBrain} / 8:45 / All`;
   const analyticsVariantTrades = selectedVariantMatchesTab ? rawSelectedVariantTrades : virtualTrades;
   const analyticsVariantLabel = selectedVariantMatchesTab ? activeVariantLabel : "Legacy SwingDesk";
+  const selectedVariantLedger = selectedVariantMatchesTab
+    ? allStrategySelected
+      ? novaUniversePortfolio
+      : calculateSimulationLedger(novaUniversePortfolio, rawSelectedVariantTrades, feeAdjusted)
+    : null;
 
   const openLongPositions = selectedVariantMatchesTab && activeVariantBrain === "Vector"
     ? novaUniverseOpen.filter(t => (t.direction || "long") === "long")
@@ -2745,12 +2777,12 @@ export default function App() {
     return allSettled.length ? allSettled[allSettled.length - 1].virtual : 1000;
   })();
   const perfLast = round2(settledBalance + livePnl);
-  const activePortfolioBalance = selectedVariantMatchesTab && activeVariantBrain === "Vector" && novaUniversePortfolio?.equity != null
-    ? Number(novaUniversePortfolio.equity)
+  const activePortfolioBalance = selectedVariantMatchesTab && activeVariantBrain === "Vector" && selectedVariantLedger?.equity != null
+    ? Number(selectedVariantLedger.equity)
     : perfLast;
-  const activeStartingCash = Number(novaUniversePortfolio?.starting_cash || 1000);
-  const activeRealizedPnl = novaUniversePortfolio?.realized_pnl != null
-    ? Number(novaUniversePortfolio.realized_pnl)
+  const activeStartingCash = Number(selectedVariantLedger?.starting_cash ?? novaUniversePortfolio?.starting_cash ?? 1000);
+  const activeRealizedPnl = selectedVariantLedger?.realized_pnl != null
+    ? Number(selectedVariantLedger.realized_pnl)
     : round2(activePortfolioBalance - activeStartingCash - activeOpenPnl);
 
   // perfFirst: baseline for percent gain calculation
@@ -2808,11 +2840,15 @@ export default function App() {
     }
     return [];
   };
-  const novaUniverseBalance = novaUniversePortfolio?.equity != null ? Number(novaUniversePortfolio.equity) : null;
   const novaOpenPnl = novaOpenPositions.reduce((sum, trade) => sum + getTradeOpenPnlDollars(trade, feeAdjusted), 0);
-  const novaStartingCash = Number(novaUniversePortfolio?.starting_cash || 1000);
-  const novaRealizedPnl = novaUniversePortfolio?.realized_pnl != null && activeVariantBrain === "Nova"
-    ? Number(novaUniversePortfolio.realized_pnl)
+  const novaUniverseBalance = selectedVariantMatchesTab && activeVariantBrain === "Nova" && selectedVariantLedger?.equity != null
+    ? Number(selectedVariantLedger.equity)
+    : novaUniversePortfolio?.equity != null
+      ? Number(novaUniversePortfolio.equity)
+      : null;
+  const novaStartingCash = Number(selectedVariantLedger?.starting_cash ?? novaUniversePortfolio?.starting_cash ?? 1000);
+  const novaRealizedPnl = selectedVariantMatchesTab && activeVariantBrain === "Nova" && selectedVariantLedger?.realized_pnl != null
+    ? Number(selectedVariantLedger.realized_pnl)
     : round2((novaUniverseBalance ?? Number(nnStats?.portfolio_value || 1000)) - novaStartingCash - novaOpenPnl);
   const novaSessionPnl = (() => {
     const points = Array.isArray(novaUniverse?.equity_points) ? [...novaUniverse.equity_points] : [];
