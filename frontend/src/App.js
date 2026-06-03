@@ -142,56 +142,8 @@ function confidenceColor(score, theme) {
   return theme === "navy" ? "#3a5570" : "#8a8f98";
 }
 
-function evidenceColor(level) {
-  if (level === "Strong") return GREEN;
-  if (level === "Building") return BLUE;
-  if (level === "Thin") return AMBER;
-  return T3;
-}
-
-function EvidenceBadgeCompact({ evidence, glowing = false }) {
-  if (!evidence) return null;
-  const level = evidence.level || "New";
-  if (level === "New") return null;
-  const color = evidenceColor(level);
-  const title = evidence.description || `Evidence: ${level}`;
-  return (
-    <span className={glowing ? "tag-glow" : ""} title={title} style={{
-      fontSize: 7, fontWeight: 800, color, letterSpacing: .25,
-      padding: "1px 4px", background: color + "16", borderRadius: 3,
-      border: `1px solid ${color}55`, whiteSpace: "nowrap", flexShrink: 0,
-      display: "inline-flex", alignItems: "center",
-    }}>
-      {level}
-    </span>
-  );
-}
-
 function hasVisiblePicksPayload(payload = {}) {
   return Boolean((payload.longs || []).length || (payload.shorts || []).length || (payload.recommended_longs || []).length || (payload.recommended_shorts || []).length);
-}
-
-function EvidenceValue({ evidence }) {
-  const level = evidence?.level || "New";
-  const color = evidenceColor(level);
-  const title = evidence?.description || `Evidence: ${level}`;
-  const glowClass = level === "New" ? "" : "tag-glow";
-  return (
-    <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontFamily: "'DM Mono',monospace" }}>
-      <button type="button" className={glowClass} title={title} aria-label={title} onClick={(e) => e.stopPropagation()} style={{
-        width: 28, height: 28, borderRadius: "50%", border: "none", background: "transparent",
-        color, display: "inline-flex", alignItems: "center", justifyContent: "center",
-        padding: 0, margin: "-7px -3px", cursor: "pointer", WebkitTapHighlightColor: "transparent",
-      }}>
-        <span style={{
-        width: 13, height: 13, borderRadius: "50%", border: `1px solid ${color}77`,
-        color, display: "inline-flex", alignItems: "center", justifyContent: "center",
-        fontSize: 8, fontWeight: 900, lineHeight: 1, background: color + "12",
-      }}>i</span>
-      </button>
-      <span style={{ color }}>{level}</span>
-    </span>
-  );
 }
 
 function mapPickFields(pick) {
@@ -673,18 +625,6 @@ function calculateAggregatePortfolio(ledgers = []) {
   };
 }
 
-function evidenceLevelForSample(sampleSize = 0) {
-  if (sampleSize >= 75) return "Strong";
-  if (sampleSize >= 30) return "Building";
-  if (sampleSize >= 10) return "Thin";
-  return "New";
-}
-
-function credibilityLabelForClosedTrades(sampleSize = 0) {
-  const level = evidenceLevelForSample(sampleSize);
-  return level === "New" ? "New sample" : `${level} sample`;
-}
-
 const SIGNAL_WEIGHT_LABELS = {
   rsi_momentum: "RSI Momentum",
   volume_surge: "Volume Surge",
@@ -735,7 +675,7 @@ function calculateSimulationProjection(trades = []) {
   const closed = trades.filter(t => t && t.outcome !== "open" && Number.isFinite(Number(t.actual_move)));
   const wins = closed.filter(t => Number(t.actual_move) > 0);
   const losses = closed.filter(t => Number(t.actual_move) <= 0);
-  if (!closed.length) return { annualReturnPct: null, expectancyPct: null, avgR: null, sampleSize: 0, evidence: evidenceLevelForSample(0) };
+  if (!closed.length) return { annualReturnPct: null, expectancyPct: null, avgR: null, sampleSize: 0 };
   const avgWin = wins.length ? avg(wins.map(t => Number(t.actual_move))) : 0;
   const avgLoss = losses.length ? avg(losses.map(t => Number(t.actual_move))) : 0;
   const winRate = wins.length / closed.length;
@@ -753,7 +693,6 @@ function calculateSimulationProjection(trades = []) {
     expectancyPct,
     avgR,
     sampleSize: closed.length,
-    evidence: evidenceLevelForSample(closed.length),
   };
 }
 
@@ -1073,14 +1012,13 @@ function MiniChart({ data, timeframe, feeAdjusted = false }) {
   );
 }
 
-function ProjectionLine({ projection, T3, BLUE }) {
+function ProjectionLine({ projection, T3 }) {
   if (!projection || projection.annualReturnPct == null) return null;
   return (
     <div style={{ marginTop: 4, fontSize: 9, color: T3, fontFamily: "'DM Mono',monospace", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
       <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
         Annualized est. {projection.annualReturnPct >= 0 ? "+" : ""}{projection.annualReturnPct.toFixed(1)}% · exp {projection.expectancyPct >= 0 ? "+" : ""}{projection.expectancyPct.toFixed(2)}%{projection.avgR != null ? ` · ${projection.avgR.toFixed(2)}R` : ""}
       </span>
-      <span style={{ color: BLUE, border: `1px solid ${BLUE}55`, borderRadius: 4, padding: "1px 4px", flexShrink: 0 }}>{projection.evidence}</span>
     </div>
   );
 }
@@ -1170,7 +1108,6 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
         borderColor={BORDER}
         actions={<>
           <BrainAgreementTags brains={brainTags} glowing={glowing} />
-          <EvidenceBadgeCompact evidence={pick.evidence} glowing={glowing} />
           <StrategyBadge strategy={pick.strategy || strategyName} selectedStrategy={strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
           {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 && (
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
@@ -1199,8 +1136,6 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
                 ["Volume ratio", `${pick.vol_ratio}x`],
                 ["Gap", `${pick.overnight_gap_pct >= 0 ? "+" : ""}${pick.overnight_gap_pct?.toFixed(1)}%`],
                 ["Day change", `${pick.day_change_pct >= 0 ? "+" : ""}${pick.day_change_pct?.toFixed(1)}%`],
-                ["Evidence", <EvidenceValue evidence={pick.evidence} />],
-                ["Sample", pick.evidence ? `${pick.evidence.sample_size || 0} past` : "0 past"],
               ].map(([label, value]) => (
                 <div key={label} style={{ display: "flex", justifyContent: "space-between", borderBottom: `1px solid ${CARD_BORDER_LONG}`, paddingBottom: 3 }}>
                   <span style={{ fontSize: 9, color: T3 }}>{label}</span>
@@ -1485,7 +1420,6 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
         borderColor={rulingColor}
         actions={<>
           <BrainAgreementTags brains={brainTags} glowing={glowing} />
-          <EvidenceBadgeCompact evidence={trade.evidence} glowing={glowing} />
           <StrategyBadge strategy={trade.strategy || strategyName} selectedStrategy={strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
           {trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7 && (
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
@@ -1520,8 +1454,6 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
               ["Current estimate", `+${dynamicEstimate.toFixed(1)}%`],
               ["Entry confidence", `${frozenConfidence}%`],
               ["Current confidence", `${dynamicConfidence}%`],
-              ["Evidence", <EvidenceValue evidence={trade.evidence} />],
-              ["Sample", trade.evidence ? `${trade.evidence.sample_size || 0} past` : "0 past"],
             ].filter(Boolean).map(([label, value]) => (
               <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: `1px solid ${rulingColor}` }}>
                 <span style={{ fontSize: 9, color: T3, paddingBottom: 3 }}>{label}</span>
@@ -3150,7 +3082,7 @@ export default function App() {
               <span style={{ fontSize: 10, color: T3 }}>(realized + open)</span>
             </div>
             <MiniChart data={perfHistory} timeframe={perfTimeframe} feeAdjusted={feeAdjusted} />
-            <ProjectionLine projection={activeSimulationProjection} T3={T3} BLUE={BLUE} />
+            <ProjectionLine projection={activeSimulationProjection} T3={T3} />
             <div style={{ display: "flex", alignItems: "center", marginTop: 8, position: "relative" }}>
               <div style={{ flex: 1, display: "flex", justifyContent: "center", gap: 4 }}>
                 {["D", "W", "M", "3M", "Y", "ALL"].map(tf => (
@@ -3514,7 +3446,7 @@ export default function App() {
                       <span style={{ fontSize: 10, color: T3 }}>(realized + open)</span>
                     </div>
                     <MiniChart data={nnPerfHistory} timeframe={nnPerfTimeframe} feeAdjusted={feeAdjusted} />
-                    <ProjectionLine projection={novaSimulationProjection} T3={T3} BLUE={"#a78bfa"} />
+                    <ProjectionLine projection={novaSimulationProjection} T3={T3} />
                     <div style={{ display: "flex", alignItems: "center", marginTop: 8, position: "relative" }}>
                       <div style={{ flex: 1, display: "flex", justifyContent: "center", gap: 4 }}>
                       {["D", "W", "M", "3M", "Y", "ALL"].map(tf => (
@@ -4030,8 +3962,6 @@ export default function App() {
                     const closedCount = Number(row.closed_count || 0);
                     const openCount = Number(row.open_count || 0);
                     const winRate = row.win_rate == null ? null : Number(row.win_rate);
-                    const credibilityLabel = credibilityLabelForClosedTrades(closedCount);
-                    const credibilityColor = evidenceColor(credibilityLabel.split(" ")[0]);
                     const returnPct = Number(row.return_pct || 0);
                     const winColor = winRate == null ? T3 : winRate >= 60 ? GREEN : winRate >= 45 ? AMBER : RED;
                     const brainColor = row.brain === "Nova" ? "#a78bfa" : BLUE;
@@ -4062,9 +3992,6 @@ export default function App() {
                             ) : (
                               <span style={{ fontSize: 9, color: T3 }}>No closes</span>
                             )}
-                            {closedCount > 0 && (
-                              <span style={{ fontSize: 8, color: credibilityColor, border: `1px solid ${credibilityColor}55`, borderRadius: 8, padding: "1px 5px", whiteSpace: "nowrap" }}>{credibilityLabel}</span>
-                            )}
                             <span style={{ color: T3, fontSize: 10 }}>{isExpanded ? "▲" : "▼"}</span>
                           </div>
                         </div>
@@ -4072,7 +3999,7 @@ export default function App() {
                         {isExpanded && (
                           <div style={{ padding: "0 14px 14px", borderTop: `1px solid ${BORDER}` }}>
                             <div style={{ fontSize: 10, color: T3, lineHeight: 1.6, paddingTop: 10, marginBottom: 12 }}>
-                              {universeInfo} Win rates under 30 closes are early evidence, not mature proof.
+                              {universeInfo} Win rates under 30 closes are small-sample stats, not mature proof.
                             </div>
 
                             {stats && stats.total_signals > 0 ? (
@@ -4350,8 +4277,6 @@ export default function App() {
                   {variantCounterRows.map(row => {
                     const closedCount = Number(row.closed_count || 0);
                     const winRate = row.win_rate == null ? null : Number(row.win_rate);
-                    const credibilityLabel = credibilityLabelForClosedTrades(closedCount);
-                    const credibilityColor = evidenceColor(credibilityLabel.split(" ")[0]);
                     const color = row.brain === "Nova" ? "#a78bfa" : BLUE;
                     return (
                       <div key={row.id} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8, alignItems: "center", padding: "7px 8px", background: "#070708", border: `1px solid ${BORDER}`, borderRadius: 7 }}>
@@ -4366,9 +4291,6 @@ export default function App() {
                           <div style={{ fontSize: 8, color: winRate == null ? T3 : winRate >= 60 ? GREEN : winRate >= 45 ? AMBER : RED, fontFamily: "'DM Mono',monospace" }}>
                             {winRate == null ? "- win" : `${winRate.toFixed(1)}% win`}
                           </div>
-                          {closedCount > 0 && (
-                            <div style={{ fontSize: 7, color: credibilityColor, fontFamily: "'DM Mono',monospace", marginTop: 1 }}>{credibilityLabel}</div>
-                          )}
                         </div>
                       </div>
                     );
