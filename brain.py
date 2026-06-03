@@ -533,6 +533,18 @@ def is_market_open():
     minute_of_day = now.hour * 60 + now.minute
     return now.weekday() < 5 and (8 * 60 + 30) <= minute_of_day < (15 * 60)
 
+def market_session_state(now=None):
+    """Return a display-safe market state for session-scoped P&L labels."""
+    now = now or current_time_cst()
+    minute_of_day = now.hour * 60 + now.minute
+    if now.weekday() >= 5:
+        return "weekend"
+    if minute_of_day < (8 * 60 + 30):
+        return "premarket"
+    if minute_of_day < (15 * 60):
+        return "open"
+    return "afterhours"
+
 def minutes_until_forced_close():
     """Returns minutes remaining until the 2:45 PM CST forced close."""
     now = current_time_cst()
@@ -8232,12 +8244,13 @@ def api_performance_history():
 
 @app.route("/api/day-pnl")
 def api_day_pnl():
-    """Current main account value vs previous settled session close baseline."""
+    """Display-safe Day's P&L with live-open and frozen-closed session semantics."""
     try:
         fees_on = request.args.get("fees", "on").lower() != "off"
         pnl_expr = "COALESCE(net_pnl, gross_pnl, 0)" if fees_on else "COALESCE(gross_pnl, net_pnl, 0)"
         now = current_time_cst()
         today = now.strftime("%Y-%m-%d")
+        market_state = market_session_state(now)
         db = get_database()
         settled_rows = [dict(r) for r in db.execute(f"""
             SELECT sell_date AS date,
@@ -8256,29 +8269,41 @@ def api_day_pnl():
 
         running = 1000.0
         previous_close = 1000.0
-        today_settled = 0.0
         previous_close_date = None
-        activity_dates = [r["date"] for r in settled_rows if r.get("date")]
-        activity_dates += [r["buy_date"] for r in open_rows if r.get("buy_date")]
-        session_date = today
-        if activity_dates and today not in activity_dates:
-            session_date = max(d for d in activity_dates if d <= today)
+        settled_by_date = {}
         for row in settled_rows:
+            if not row.get("date"):
+                continue
+            settled_by_date[row["date"]] = float(row.get("daily_pnl") or 0)
+
+        completed_session_dates = sorted(d for d in settled_by_date if d <= today)
+        latest_completed_session = completed_session_dates[-1] if completed_session_dates else None
+
+        if market_state == "open":
+            session_date = today
+        else:
+            session_date = latest_completed_session or today
+
+        today_settled = settled_by_date.get(session_date, 0.0)
+        for row in settled_rows:
+            date = row.get("date")
+            if not date or date >= session_date:
+                continue
             daily = float(row.get("daily_pnl") or 0)
-            if row.get("date") and row["date"] < session_date:
-                running += daily
-                previous_close = running
-                previous_close_date = row["date"]
-            elif row.get("date") == session_date:
-                today_settled += daily
+            running += daily
+            previous_close = running
+            previous_close_date = date
 
         open_pnl = sum(
             float((r.get("current_value") if fees_on else r.get("gross_current_value")) or r.get("current_value") or r.get("invested_amount") or 10) -
             float(r.get("invested_amount") or 10)
             for r in open_rows
         )
-        current_value = previous_close + today_settled + open_pnl
-        day_pnl = current_value - previous_close
+        live_day_pnl = today_settled + open_pnl
+        frozen_day_pnl = today_settled
+        display_day_pnl = live_day_pnl if market_state == "open" else frozen_day_pnl
+        display_mode = "live_session" if market_state == "open" else "frozen_last_completed_session"
+        current_value = previous_close + display_day_pnl
         return jsonify({
             "success": True,
             "label": "Day's P&L",
@@ -8288,11 +8313,16 @@ def api_day_pnl():
             "previous_close_date": previous_close_date,
             "today_settled_pnl": round(today_settled, 4),
             "open_pnl": round(open_pnl, 4),
-            "day_pnl": round(day_pnl, 4),
-            "day_pnl_percent": round((day_pnl / previous_close * 100), 2) if previous_close else 0,
+            "live_day_pnl": round(live_day_pnl, 4),
+            "frozen_day_pnl": round(frozen_day_pnl, 4),
+            "display_day_pnl": round(display_day_pnl, 4),
+            "display_mode": display_mode,
+            "market_state": market_state,
+            "day_pnl": round(display_day_pnl, 4),
+            "day_pnl_percent": round((display_day_pnl / previous_close * 100), 2) if previous_close else 0,
             "open_count": len(open_rows),
             "as_of": now.isoformat(),
-            "basis": "previous settled session close plus today's settled and open P&L",
+            "basis": "live during market hours; frozen to the latest completed market session when closed or premarket",
             "fees_on": fees_on,
             "fee_model_version": STOCK_FEE_MODEL_VERSION if fees_on else "gross",
         })
@@ -8680,12 +8710,21 @@ def api_variant_health():
             qualified = filter_variant_strategy_picks(source, variant) if snapshot else []
             selected = select_variant_picks(qualified, variant.get("selection_mode")) if snapshot else []
             issues = []
+            evaluation_state = "not_evaluated"
             if not snapshot:
                 issues.append(refusal.get("reason", "missing_shared_snapshot") if isinstance(refusal, dict) else "missing_shared_snapshot")
             if variant.get("lifecycle_status") == "archived":
                 issues.append("portfolio_archived")
-            if not source and snapshot:
-                issues.append(f"{variant.get('brain')} source pick list is empty")
+            if snapshot:
+                if not source:
+                    evaluation_state = "evaluated_no_source_candidates"
+                elif selected:
+                    evaluation_state = "selected_candidates"
+                elif qualified:
+                    evaluation_state = "qualified_but_not_selected"
+                else:
+                    evaluation_state = "evaluated_no_pick"
+            health = "attention" if issues else "ok"
             rows.append({
                 **variant,
                 "source_count": len(source),
@@ -8693,11 +8732,15 @@ def api_variant_health():
                 "selected_count": len(selected),
                 "selected_tickers": [p.get("ticker") for p in selected[:20]],
                 "last_shared_observation_at": latest_observation,
-                "health": "ok" if not issues else "attention",
+                "evaluation_state": evaluation_state,
+                "health": health,
                 "issues": issues,
             })
 
         ok_count = sum(1 for row in rows if row["health"] == "ok")
+        selected_count = sum(1 for row in rows if row["evaluation_state"] == "selected_candidates")
+        no_pick_count = sum(1 for row in rows if row["evaluation_state"] == "evaluated_no_pick")
+        no_source_count = sum(1 for row in rows if row["evaluation_state"] == "evaluated_no_source_candidates")
         return jsonify({
             "success": True,
             "shared_snapshot": bool(snapshot),
@@ -8706,8 +8749,11 @@ def api_variant_health():
             "variant_count": len(rows),
             "ok_count": ok_count,
             "attention_count": len(rows) - ok_count,
+            "selected_count": selected_count,
+            "no_pick_count": no_pick_count,
+            "no_source_count": no_source_count,
             "rows": rows,
-            "note": "A variant is alive when it is active, has a non-archived portfolio, and can evaluate the latest shared pick snapshot. Empty source pick lists mean the brain produced no executable candidates, not that the variant loop crashed.",
+            "note": "OK means the variant registry, portfolio, and shared snapshot plumbing are usable. Evaluation state tells whether it selected candidates, found no qualifying pick, or had no source candidates from its brain.",
         })
     except Exception as e:
         log.error(f"variant-health error: {e}")

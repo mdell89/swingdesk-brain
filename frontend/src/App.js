@@ -680,6 +680,11 @@ function evidenceLevelForSample(sampleSize = 0) {
   return "New";
 }
 
+function credibilityLabelForClosedTrades(sampleSize = 0) {
+  const level = evidenceLevelForSample(sampleSize);
+  return level === "New" ? "New sample" : `${level} sample`;
+}
+
 function calculateSimulationProjection(trades = []) {
   const closed = trades.filter(t => t && t.outcome !== "open" && Number.isFinite(Number(t.actual_move)));
   const wins = closed.filter(t => Number(t.actual_move) > 0);
@@ -2825,7 +2830,14 @@ export default function App() {
   const perfChange = activePortfolioBalance - perfFirst;
   const perfPercent = perfFirst > 0 ? (perfChange / perfFirst * 100) : 0;
   const perfUp = perfChange >= 0;
-  const backendDayPnl = dayPnlStatus?.success ? Number(dayPnlStatus.day_pnl || 0) : null;
+  const backendDayPnl = dayPnlStatus?.success ? Number(dayPnlStatus.display_day_pnl ?? dayPnlStatus.day_pnl ?? 0) : null;
+  const marketState = dayPnlStatus?.market_state || null;
+  const isLiveMarketSession = marketState === "open";
+  const dayPnlModeLabel = dayPnlStatus?.display_mode === "frozen_last_completed_session"
+    ? "last close"
+    : isLiveMarketSession
+      ? "live"
+      : null;
   const backendDayUp = backendDayPnl == null ? perfUp : backendDayPnl >= 0;
   const novaOpenPositions = selectedVariantMatchesTab && activeVariantBrain === "Nova"
     ? novaUniverseOpen
@@ -2882,9 +2894,10 @@ export default function App() {
       return d && d <= today && d > max ? d : max;
     }, "");
     if (!latestDate) return null;
-    const current = novaUniversePortfolio?.equity != null
+    const latestPoint = points.filter(p => (p.timestamp || "").slice(0, 10) === latestDate).slice(-1)[0];
+    const current = isLiveMarketSession && novaUniversePortfolio?.equity != null
       ? Number(novaUniversePortfolio.equity)
-      : Number(points.filter(p => (p.timestamp || "").slice(0, 10) === latestDate).slice(-1)[0]?.equity || 1000);
+      : Number(latestPoint?.equity || 1000);
     const prior = [...points].reverse().find(p => (p.timestamp || "").slice(0, 10) < latestDate);
     const baseline = prior ? Number(prior.equity || 1000) : Number(novaUniversePortfolio?.starting_cash || 1000);
     return round2(current - baseline);
@@ -2915,7 +2928,7 @@ export default function App() {
       : "current";
   const variantProofAttentionRows = Array.isArray(variantProof?.rows)
     ? variantProof.rows
-      .filter(row => row.health === "attention" || row.evaluation_state === "evaluated_no_pick" || !row.ledger_ok)
+      .filter(row => row.health === "attention" || !row.ledger_ok || row.evaluation_state === "evaluated_no_source_candidates")
       .slice(0, 5)
     : [];
   const variantLabel = v => {
@@ -3071,7 +3084,7 @@ export default function App() {
                 const dayUp2 = dayPnl >= 0;
                 return (
                   <div style={{ textAlign: "right", lineHeight: 1, paddingTop: 6 }}>
-                    <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L</div>
+                    <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L{dayPnlModeLabel ? ` · ${dayPnlModeLabel}` : ""}</div>
                     <div style={{ fontSize: 16, fontWeight: 600, color: dayUp2 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(dayPnl)}</div>
 
                   </div>
@@ -3439,7 +3452,7 @@ export default function App() {
                         </div>
                       </div>
                       <div style={{ textAlign: "right", lineHeight: 1, paddingTop: 6 }}>
-                        <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L</div>
+                        <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L{dayPnlModeLabel ? ` · ${dayPnlModeLabel}` : ""}</div>
                         <div style={{ fontSize: 16, fontWeight: 600, color: nnUp ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(nnChange)}</div>
                       </div>
                     </div>
@@ -3965,6 +3978,8 @@ export default function App() {
                     const closedCount = Number(row.closed_count || 0);
                     const openCount = Number(row.open_count || 0);
                     const winRate = row.win_rate == null ? null : Number(row.win_rate);
+                    const credibilityLabel = credibilityLabelForClosedTrades(closedCount);
+                    const credibilityColor = evidenceColor(credibilityLabel.split(" ")[0]);
                     const returnPct = Number(row.return_pct || 0);
                     const winColor = winRate == null ? T3 : winRate >= 60 ? GREEN : winRate >= 45 ? AMBER : RED;
                     const brainColor = row.brain === "Nova" ? "#a78bfa" : BLUE;
@@ -3995,13 +4010,18 @@ export default function App() {
                             ) : (
                               <span style={{ fontSize: 9, color: T3 }}>No closes</span>
                             )}
+                            {closedCount > 0 && (
+                              <span style={{ fontSize: 8, color: credibilityColor, border: `1px solid ${credibilityColor}55`, borderRadius: 8, padding: "1px 5px", whiteSpace: "nowrap" }}>{credibilityLabel}</span>
+                            )}
                             <span style={{ color: T3, fontSize: 10 }}>{isExpanded ? "▲" : "▼"}</span>
                           </div>
                         </div>
 
                         {isExpanded && (
                           <div style={{ padding: "0 14px 14px", borderTop: `1px solid ${BORDER}` }}>
-                            <div style={{ fontSize: 10, color: T3, lineHeight: 1.6, paddingTop: 10, marginBottom: 12 }}>{universeInfo}</div>
+                            <div style={{ fontSize: 10, color: T3, lineHeight: 1.6, paddingTop: 10, marginBottom: 12 }}>
+                              {universeInfo} Win rates under 30 closes are early evidence, not mature proof.
+                            </div>
 
                             {stats && stats.total_signals > 0 ? (
                               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginBottom: 12 }}>
@@ -4192,22 +4212,22 @@ export default function App() {
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
                 <div style={{ fontSize: 12, fontWeight: 800, color: T1 }}>Variant health</div>
                 <div style={{ fontSize: 10, color: (variantHealth.attention_count || variantProof?.attention_count) ? AMBER : GREEN, fontFamily: "'DM Mono',monospace" }}>
-                  {variantHealth.ok_count || 0}/{variantHealth.variant_count || 0} ok
+                  {variantHealth.ok_count || 0}/{variantHealth.variant_count || 0} plumbing ok
                 </div>
               </div>
               <div style={{ fontSize: 9, color: T3, lineHeight: 1.45, marginBottom: 8 }}>{variantHealth.note}</div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginBottom: variantProof ? 8 : 0 }}>
                 <div style={{ background: "#000", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
-                  <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>Vector Source</div>
-                  <div style={{ fontSize: 12, color: BLUE, fontFamily: "'DM Mono',monospace" }}>{variantHealth.rows?.find(r => r.brain === "Vector")?.source_count ?? 0}</div>
+                  <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>Selected</div>
+                  <div style={{ fontSize: 12, color: GREEN, fontFamily: "'DM Mono',monospace" }}>{variantHealth.selected_count ?? 0}</div>
                 </div>
                 <div style={{ background: "#000", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
-                  <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>Nova Source</div>
-                  <div style={{ fontSize: 12, color: "#a78bfa", fontFamily: "'DM Mono',monospace" }}>{variantHealth.rows?.find(r => r.brain === "Nova")?.source_count ?? 0}</div>
+                  <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>No Pick</div>
+                  <div style={{ fontSize: 12, color: T2, fontFamily: "'DM Mono',monospace" }}>{variantHealth.no_pick_count ?? 0}</div>
                 </div>
                 <div style={{ background: "#000", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
-                  <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>Needs Attention</div>
-                  <div style={{ fontSize: 12, color: variantHealth.attention_count ? AMBER : GREEN, fontFamily: "'DM Mono',monospace" }}>{variantHealth.attention_count || 0}</div>
+                  <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>No Source</div>
+                  <div style={{ fontSize: 12, color: (variantHealth.no_source_count || 0) ? AMBER : GREEN, fontFamily: "'DM Mono',monospace" }}>{variantHealth.no_source_count ?? 0}</div>
                 </div>
               </div>
               {variantProof && (
@@ -4273,6 +4293,8 @@ export default function App() {
                   {variantCounterRows.map(row => {
                     const closedCount = Number(row.closed_count || 0);
                     const winRate = row.win_rate == null ? null : Number(row.win_rate);
+                    const credibilityLabel = credibilityLabelForClosedTrades(closedCount);
+                    const credibilityColor = evidenceColor(credibilityLabel.split(" ")[0]);
                     const color = row.brain === "Nova" ? "#a78bfa" : BLUE;
                     return (
                       <div key={row.id} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8, alignItems: "center", padding: "7px 8px", background: "#070708", border: `1px solid ${BORDER}`, borderRadius: 7 }}>
@@ -4287,6 +4309,9 @@ export default function App() {
                           <div style={{ fontSize: 8, color: winRate == null ? T3 : winRate >= 60 ? GREEN : winRate >= 45 ? AMBER : RED, fontFamily: "'DM Mono',monospace" }}>
                             {winRate == null ? "- win" : `${winRate.toFixed(1)}% win`}
                           </div>
+                          {closedCount > 0 && (
+                            <div style={{ fontSize: 7, color: credibilityColor, fontFamily: "'DM Mono',monospace", marginTop: 1 }}>{credibilityLabel}</div>
+                          )}
                         </div>
                       </div>
                     );
