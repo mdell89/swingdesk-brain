@@ -790,12 +790,14 @@ function sortOpenTradesByMode(trades = [], sortMode = "smart", feeAdjusted = tru
 }
 
 function averagePicksByTicker(rows = [], brain = "") {
+  const ACTIONABLE_PICK_FLOOR = 65;
   const groups = new Map();
   rows
     .filter(row => row?.brain === brain && String(row.selection_mode || "").toLowerCase() === "all")
     .forEach(row => {
       (row.qualified_preview || []).forEach(pick => {
         if (!pick?.ticker) return;
+        if (Number(pick.confidence || 0) < ACTIONABLE_PICK_FLOOR) return;
         if (!groups.has(pick.ticker)) groups.set(pick.ticker, []);
         groups.get(pick.ticker).push({ ...pick, strategy: row.strategy });
       });
@@ -818,6 +820,8 @@ function averagePicksByTicker(rows = [], brain = "") {
       day_change_pct: dayChange,
       overnight_gap_pct: avg(group.map(p => Number(p.gap_pct ?? p.overnight_gap_pct ?? 0))),
       source_variant_count: group.length,
+      aggregate_confidence: group.length > 1,
+      aggregate_confidence_basis: group.map(p => `${p.strategy}: ${Number(p.confidence || 0)}%`),
     });
   }).sort((a, b) => (b.lc || 0) - (a.lc || 0));
 }
@@ -1089,6 +1093,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
   const signalCount = signalData.fired.length;
   const hasSignalScores = Object.keys(signalData.scores || {}).length > 0;
   const cardKey = cardKeyOverride || (pick.ticker + "_" + (isLong ? "l" : "s"));
+  const isAggregateConfidence = Boolean(pick.aggregate_confidence || Number(pick.source_variant_count || 0) > 1);
 
   return (
     <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, overflow: "hidden", cursor: "pointer", borderLeft: `3px solid ${borderColor}` }}
@@ -1107,7 +1112,10 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
         </SpineCell>
         <div></div>
         <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center", alignSelf: "center" }}>
-          <div style={{ fontSize: 13, fontWeight: 700, color: borderColor, lineHeight: 1, fontFamily: "'DM Mono',monospace" }}>{confidence}%</div>
+          <div style={{ display: "inline-flex", alignItems: "baseline", justifyContent: "flex-end", gap: 3, lineHeight: 1, fontFamily: "'DM Mono',monospace" }}>
+            {isAggregateConfidence && <span style={{ fontSize: 7, fontWeight: 800, color: T3, letterSpacing: .2 }}>avg</span>}
+            <span style={{ fontSize: 13, fontWeight: 700, color: borderColor }}>{confidence}%</span>
+          </div>
         </div>
       </CardMetricGrid>
 
@@ -1159,6 +1167,11 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
                   CONTEXT
                 </button>
               </div>
+              {isAggregateConfidence && (
+                <div style={{ marginTop: 5, fontSize: 8, color: T3, fontFamily: "'DM Mono',monospace", lineHeight: 1.4 }}>
+                  Aggregate confidence averages actionable contributors only{Array.isArray(pick.aggregate_confidence_basis) && pick.aggregate_confidence_basis.length ? `: ${pick.aggregate_confidence_basis.join(" · ")}` : "."}
+                </div>
+              )}
             </div>
             {showScoreContext && (
               <div style={{ padding: "7px 8px", background: "#111113", border: `1px solid ${BORDER}`, borderRadius: 7 }}>
@@ -1339,6 +1352,8 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
   const visibleMethods = visibleConfluenceMethodTags(confluenceMethods, strategyName);
   const signalData = getSignalData(trade);
   const signalCount = signalData.fired.length;
+  const isAggregateConfidence = Boolean(Number(trade.source_variant_count || 0) > 1);
+  const displayDayChange = getDisplayDayChangePercent(trade);
 
   const sentiment = getSentimentLabel(pnlPercent, frozenTarget, trade.sentiment_icon, pdtRemaining);
 
@@ -1399,8 +1414,8 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
           <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 14, fontWeight: 600, color: T1, lineHeight: 1.2 }}>{trade.ticker}</span>
           {trade.name && trade.name !== trade.ticker && <span style={{ fontSize: 9, color: T3, lineHeight: 1.2, marginTop: 1 }}>{trade.name}</span>}
         </div>
-        <div style={{ fontSize: 11, fontWeight: 600, color: (() => { const d = Number(trade.day_change_percent ?? trade.day_change_pct ?? trade.pct_change_prev_close ?? trade.pct_change_regular_open ?? pnlPercent) || 0; return d > 0 ? GREEN : d < 0 ? RED : T3; })(), fontFamily: "'DM Mono',monospace", textAlign: "center" }}>
-          {(() => { const d = Number(trade.day_change_percent ?? trade.day_change_pct ?? trade.pct_change_prev_close ?? trade.pct_change_regular_open ?? pnlPercent) || 0; return `${d >= 0 ? "+" : ""}${d.toFixed(1)}%`; })()}
+        <div style={{ fontSize: 11, fontWeight: 600, color: displayDayChange > 0 ? GREEN : displayDayChange < 0 ? RED : T3, fontFamily: "'DM Mono',monospace", textAlign: "center" }}>
+          {`${displayDayChange >= 0 ? "+" : ""}${displayDayChange.toFixed(1)}%`}
         </div>
         <SpineCell>
           <SpinePercent value={pnlPercent} color={pnlColor} fontSize={12} />
@@ -1408,9 +1423,13 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
         <div style={{ fontSize: 13, fontWeight: 700, color: pnlColor, fontFamily: "'DM Mono',monospace", textAlign: "right", paddingRight: 6, whiteSpace: "nowrap" }}>{pnlDollars >= 0 ? "+" : "-"}${Math.abs(pnlDollars).toFixed(2)}</div>
         <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center", alignSelf: "center" }}>
           {confDelta === 0 ? (
-            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 13, fontWeight: 700, color: confidenceColor(lockInConfidence, themeKey), lineHeight: 1 }}>{lockInConfidence}%</div>
+            <div style={{ display: "inline-flex", alignItems: "baseline", justifyContent: "flex-end", gap: 3, fontFamily: "'DM Mono',monospace", lineHeight: 1 }}>
+              {isAggregateConfidence && <span style={{ fontSize: 7, fontWeight: 800, color: T3, letterSpacing: .2 }}>avg</span>}
+              <span style={{ fontSize: 13, fontWeight: 700, color: confidenceColor(lockInConfidence, themeKey) }}>{lockInConfidence}%</span>
+            </div>
           ) : (
             <div style={{ display: "flex", alignItems: "center", gap: 2, fontFamily: "'DM Mono',monospace", lineHeight: 1 }}>
+              {isAggregateConfidence && <span style={{ fontSize: 7, fontWeight: 800, color: T3, letterSpacing: .2 }}>avg</span>}
               <span style={{ fontSize: 13, fontWeight: 700, color: confidenceColor(lockInConfidence, themeKey) }}>{lockInConfidence}%</span>
               <span style={{ fontSize: 9, color: confDeltaColor, margin: "0 1px" }}>→</span>
               <span style={{ fontSize: 13, fontWeight: 700, color: confidenceColor(dynamicConfidence, themeKey) }}>{dynamicConfidence}%</span>
@@ -1469,6 +1488,11 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
               </div>
             ))}
           </div>
+          {isAggregateConfidence && (
+            <div style={{ marginTop: 6, fontSize: 8, color: T3, fontFamily: "'DM Mono',monospace", lineHeight: 1.4 }}>
+              Aggregate card: values and confidence are averages across {trade.source_variant_count || 2} open simulations for this ticker.
+            </div>
+          )}
           {(visibleMethods.length > 0 || (trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7)) && (
             <div style={{ padding: "6px 10px 6px 4px", background: "#000", borderRadius: 7, marginTop: 4, border: "1px solid rgba(255,255,255,0.12)" }}>
               <span style={{ fontSize: 8, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, display: "block", marginBottom: 6, textAlign: "center" }}>Method confluence</span>
@@ -2185,6 +2209,7 @@ function WhyNotPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED })
 }
 
 export {
+  averagePicksByTicker,
   averageTradesByTicker,
   calculateAggregatePortfolio,
   calculateSimulationLedger,
@@ -3154,7 +3179,7 @@ export default function App() {
           {/* CONFIDENCE LEGEND */}
           <div style={{ margin: `0 16px ${HOME_ROW_GAP}px`, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 14px" }}>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
-              {[[AMBER, "85%+ elite"], [GREEN, "75-84 strong"], [BLUE, "65-74 decent"], [T3, "<65 skip"]].map(([color, label]) => (
+              {[[AMBER, "85%+ elite"], [GREEN, "75-84 strong"], [BLUE, "65-74 valid"], [T3, "<65 skip"]].map(([color, label]) => (
                 <div key={label} style={{ display: "flex", alignItems: "center", gap: 5 }}>
                   <div style={{ width: 10, height: 10, borderRadius: 3, background: color, flexShrink: 0 }} />
                   <span style={{ fontSize: 9, color: color, fontWeight: 600 }}>{label}</span>
@@ -3497,7 +3522,7 @@ export default function App() {
               )}
               <div style={{ margin: `0 0 ${HOME_ROW_GAP}px`, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 14px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  {[[AMBER, "85%+ elite"], [GREEN, "75-84 strong"], [BLUE, "65-74 decent"], [T3, "<65 skip"]].map(([color, label]) => (
+                  {[[AMBER, "85%+ elite"], [GREEN, "75-84 strong"], [BLUE, "65-74 valid"], [T3, "<65 skip"]].map(([color, label]) => (
                     <div key={label} style={{ display: "flex", alignItems: "center", gap: 5 }}>
                       <div style={{ width: 10, height: 10, borderRadius: 3, background: color, flexShrink: 0 }} />
                       <span style={{ fontSize: 9, color: color, fontWeight: 600 }}>{label}</span>

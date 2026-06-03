@@ -1,5 +1,6 @@
 import { render, screen } from '@testing-library/react';
 import App, {
+  averagePicksByTicker,
   averageTradesByTicker,
   calculateAggregatePortfolio,
   changedWeightDeltaRows,
@@ -55,6 +56,37 @@ test('dedupes open trades by ticker and averages variant-specific values', () =>
   expect(averaged[0].current_value).toBe(16.7);
   expect(averaged[0].current_pnl_dollars).toBeCloseTo(1.7);
   expect(averaged[0].confidence).toBe(80);
+});
+
+test('All pick aggregation averages actionable contributors only', () => {
+  const averaged = averagePicksByTicker([
+    {
+      brain: 'Vector',
+      selection_mode: 'All',
+      strategy: 'Darvas',
+      qualified_preview: [{ ticker: 'MU', confidence: 70, move: 8, day_change_pct: 4 }],
+    },
+    {
+      brain: 'Vector',
+      selection_mode: 'All',
+      strategy: 'Bull Flag',
+      qualified_preview: [{ ticker: 'MU', confidence: 64, move: 12, day_change_pct: 6 }],
+    },
+    {
+      brain: 'Vector',
+      selection_mode: 'All',
+      strategy: 'VWAP Reclaim',
+      qualified_preview: [{ ticker: 'MU', confidence: 80, move: 10, day_change_pct: 8 }],
+    },
+  ], 'Vector');
+
+  expect(averaged).toHaveLength(1);
+  expect(averaged[0].lc).toBe(75);
+  expect(averaged[0].lm).toBeCloseTo(9);
+  expect(averaged[0].dayChg).toBeCloseTo(6);
+  expect(averaged[0].source_variant_count).toBe(2);
+  expect(averaged[0].aggregate_confidence).toBe(true);
+  expect(averaged[0].confluence_methods).toEqual(['Darvas', 'VWAP Reclaim']);
 });
 
 test('formats changed signal weight deltas in percent points', () => {
