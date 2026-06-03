@@ -1002,6 +1002,7 @@ def initialize_database():
             buy_time TEXT,
             buy_price REAL,
             current_price REAL,
+            day_change_percent REAL,
             invested_amount REAL,
             current_value REAL,
             confidence INTEGER,
@@ -1359,6 +1360,7 @@ def initialize_database():
     # universe openings, execution recovery, card tags, and confidence context.
     for column_definition in [
         "current_price REAL",
+        "day_change_percent REAL",
         "confluence_count INTEGER DEFAULT 0",
         "confluence_methods TEXT DEFAULT '[]'",
     ] + FEE_MODEL_COLUMN_DEFINITIONS:
@@ -5737,6 +5739,12 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None, require_fr
 
                 entry_quote = normalize_monitor_quote(entry_quotes.get(ticker), pick.get("price")) if entry_quotes.get(ticker) else None
                 buy_price = (entry_quote or {}).get("price") or pick.get("open_price") or pick.get("price") or pick.get("buy_price") or 0
+                day_change_percent = float(
+                    (entry_quote or {}).get("day_change_percent")
+                    if (entry_quote or {}).get("day_change_percent") is not None
+                    else pick.get("pct_change_prev_close", pick.get("day_change_pct", pick.get("day_change_percent", 0)))
+                    or 0
+                )
                 if not buy_price:
                     status["skipped_count"] += 1
                     variant_skipped += 1
@@ -5756,14 +5764,14 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None, require_fr
                 database.execute(f"""
                     INSERT INTO variant_virtual_trades
                     (id, variant_id, strategy, brain, ticker, direction, buy_date, buy_time,
-                     buy_price, current_price, invested_amount, current_value, confidence, expected_move,
+                     buy_price, current_price, day_change_percent, invested_amount, current_value, confidence, expected_move,
                      {FEE_MODEL_INSERT_COLUMNS},
                      outcome, sector, reasoning, signal_scores, confluence_count, confluence_methods, source_scan_time, source_rank,
                      created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 'long', ?, ?, ?, ?, ?, ?, ?, ?, {FEE_MODEL_INSERT_PLACEHOLDERS}, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, 'long', ?, ?, ?, ?, ?, ?, ?, ?, ?, {FEE_MODEL_INSERT_PLACEHOLDERS}, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [
                     trade_id, variant["id"], variant["strategy"], brain, ticker, today, buy_time,
-                    float(buy_price), float(buy_price), round(invested, 4), fee_quote["net_current_value"], confidence, expected_move,
+                    float(buy_price), float(buy_price), round(day_change_percent, 4), round(invested, 4), fee_quote["net_current_value"], confidence, expected_move,
                     *fee_model_values(fee_quote),
                     pick.get("sector") or get_sector(ticker), reasoning, signal_scores, confluence_count, confluence_methods, scan_time, rank,
                     status["ran_at"], status["ran_at"],
@@ -5842,6 +5850,7 @@ def monitor_variant_universes(trigger="manual"):
                 continue
             price_data = normalize_monitor_quote(raw, row.get("buy_price"))
             price = float(price_data["price"])
+            day_change_percent = float(price_data.get("day_change_percent") or price_data.get("day_change_pct") or 0)
             buy_price = float(row.get("buy_price") or price)
             invested = float(row.get("invested_amount") or 0)
             pnl_pct = (price - buy_price) / max(buy_price, 0.01) * 100
@@ -5864,12 +5873,12 @@ def monitor_variant_universes(trigger="manual"):
                 outcome = "hit" if pnl_pct > 0 else "miss"
                 database.execute(f"""
                     UPDATE variant_virtual_trades
-                    SET current_value=?, current_price=?, sell_date=?, sell_time=?, sell_price=?,
+                    SET current_value=?, current_price=?, day_change_percent=?, sell_date=?, sell_time=?, sell_price=?,
                         actual_move=?, gross_pnl=?, net_pnl=?, {FEE_MODEL_UPDATE_SET},
                         outcome=?, sell_reason=?, updated_at=?
                     WHERE id=?
                 """, [
-                    round(current_value, 4), price, today, now.strftime("%H:%M:%S"), price,
+                    round(current_value, 4), price, round(day_change_percent, 4), today, now.strftime("%H:%M:%S"), price,
                     round(pnl_pct, 2), fee_quote["gross_pnl"], fee_quote["net_pnl"],
                     *fee_model_values(fee_quote),
                     outcome, sell_reason, status["ran_at"], row["id"],
@@ -5883,10 +5892,10 @@ def monitor_variant_universes(trigger="manual"):
             else:
                 database.execute(f"""
                     UPDATE variant_virtual_trades
-                    SET current_value=?, current_price=?, actual_move=?, {FEE_MODEL_UPDATE_SET}, updated_at=?
+                    SET current_value=?, current_price=?, day_change_percent=?, actual_move=?, {FEE_MODEL_UPDATE_SET}, updated_at=?
                     WHERE id=?
                 """, [
-                    round(current_value, 4), price, round(pnl_pct, 2), *fee_model_values(fee_quote),
+                    round(current_value, 4), price, round(day_change_percent, 4), round(pnl_pct, 2), *fee_model_values(fee_quote),
                     status["ran_at"], row["id"],
                 ])
 
@@ -5925,6 +5934,7 @@ def refresh_variant_open_quotes(database, variant_id):
             continue
         quote = normalize_monitor_quote(raw, row.get("buy_price"))
         price = float(quote["price"])
+        day_change_percent = float(quote.get("day_change_percent") or quote.get("day_change_pct") or 0)
         buy_price = float(row.get("buy_price") or price)
         invested = float(row.get("invested_amount") or 0)
         pnl_pct = (price - buy_price) / max(buy_price, 0.01) * 100
@@ -5933,12 +5943,13 @@ def refresh_variant_open_quotes(database, variant_id):
         fee_quote = calculate_stock_fee_model(invested, buy_price, price, row.get("direction") or "long")
         database.execute(f"""
             UPDATE variant_virtual_trades
-            SET current_value=?, current_price=?, actual_move=?, gross_pnl=?, net_pnl=?,
+            SET current_value=?, current_price=?, day_change_percent=?, actual_move=?, gross_pnl=?, net_pnl=?,
                 {FEE_MODEL_UPDATE_SET}, updated_at=?
             WHERE id=?
         """, [
             round(fee_quote["net_current_value"], 4),
             price,
+            round(day_change_percent, 4),
             round(pnl_pct, 2),
             fee_quote["gross_pnl"],
             fee_quote["net_pnl"],
@@ -7667,7 +7678,8 @@ def run_scheduler():
     
     All times are specified in UTC. Current Central daylight schedule uses UTC + 5 hours.
     
-    Comprehensive scans run every 30 minutes during pre-market and post-market.
+    Comprehensive scans run every 30 minutes during pre-market, regular market,
+    and post-market.
     8:30 AM CST market open scan fires after queue lock-in for fresh open-market scores.
     5-minute monitoring runs continuously during active hours (4 AM - 7 PM CST).
     """
@@ -7692,6 +7704,17 @@ def run_scheduler():
 
     # 8:30 AM CST = 13:30 UTC — Market open scan: fresh scores at open for recs + ML data
     schedule.every().day.at("13:30").do(lambda: run_comprehensive_scan(scan_type="market_open"))
+
+    # Regular-session comprehensive scans keep picks/current candidates fresh after open.
+    # The single-flight scan lock prevents overlap if a provider run is still active.
+    for hour_utc, label in [(14,"9:00am"),(14.5,"9:30am"),(15,"10:00am"),(15.5,"10:30am"),
+                             (16,"11:00am"),(16.5,"11:30am"),(17,"12:00pm"),(17.5,"12:30pm"),
+                             (18,"1:00pm"),(18.5,"1:30pm"),(19,"2:00pm"),(19.5,"2:30pm")]:
+        hour = int(hour_utc)
+        minute = int((hour_utc % 1) * 60)
+        time_str = f"{hour:02d}:{minute:02d}"
+        scan_label = f"regular_{label}"
+        schedule.every().day.at(time_str).do(lambda st=scan_label: run_comprehensive_scan(scan_type=st))
 
     # Execution-time variant families. Each call only opens matching execution_time universes.
     schedule.every().day.at("10:00").do(lambda: run_variant_universes_from_cache(trigger="scheduled_0500", buy_time="05:00:00"))
@@ -9273,6 +9296,7 @@ def api_recover_missed_variant_open_from_executions():
                     status["skipped_count"] += 1
                     status["skipped"].append({"variant_id": variant["id"], "ticker": ticker, "reason": "missing cash or buy price"})
                     continue
+                day_change_percent = float(source.get("day_change_percent") or source.get("day_change_pct") or 0)
                 confidence = int(source.get("lock_in_confidence") or source.get("nn_confidence") or source.get("confidence") or 0)
                 expected_move = float(source.get("expected_move") or 0)
                 signal_scores = source.get("signal_scores") or json.dumps({"scores": {}, "fired": [], "values": {}})
@@ -9284,14 +9308,14 @@ def api_recover_missed_variant_open_from_executions():
                 database.execute(f"""
                     INSERT INTO variant_virtual_trades
                     (id, variant_id, strategy, brain, ticker, direction, buy_date, buy_time,
-                     buy_price, invested_amount, current_value, confidence, expected_move,
+                     buy_price, current_price, day_change_percent, invested_amount, current_value, confidence, expected_move,
                      {FEE_MODEL_INSERT_COLUMNS},
                      outcome, sector, reasoning, signal_scores, confluence_count, confluence_methods, source_scan_time, source_rank,
                      created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 'long', ?, ?, ?, ?, ?, ?, ?, {FEE_MODEL_INSERT_PLACEHOLDERS}, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, 'long', ?, ?, ?, ?, ?, ?, ?, ?, ?, {FEE_MODEL_INSERT_PLACEHOLDERS}, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [
                     trade_id, variant["id"], variant["strategy"], variant["brain"], ticker, today, source.get("buy_time") or "08:45:00",
-                    buy_price, round(invested, 4), fee_quote["net_current_value"], confidence, expected_move,
+                    buy_price, buy_price, round(day_change_percent, 4), round(invested, 4), fee_quote["net_current_value"], confidence, expected_move,
                     *fee_model_values(fee_quote),
                     source.get("sector") or get_sector(ticker),
                     source.get("reasoning") or f"{variant['brain']} execution recovery",
@@ -9581,6 +9605,20 @@ def api_intraday_pnl():
 def api_scan_history():
     mark_stalled_scan_events(max_age_minutes=10)
     database = get_database()
+    try:
+        requested_limit = int(request.args.get("limit", 75))
+    except Exception:
+        requested_limit = 75
+    try:
+        requested_offset = int(request.args.get("offset", 0))
+    except Exception:
+        requested_offset = 0
+    limit = max(1, min(requested_limit, 250))
+    offset = max(0, requested_offset)
+    paged = str(request.args.get("paged", "")).lower() in {"1", "true", "yes"}
+
+    total_row = database.execute("SELECT COUNT(*) AS total FROM scan_events").fetchone()
+    total = int(total_row["total"] or 0) if total_row else 0
     rows = [dict(r) for r in database.execute("""
         SELECT id,
                COALESCE(finished_at, started_at) AS scan_time,
@@ -9594,9 +9632,11 @@ def api_scan_history():
                error
         FROM scan_events
         ORDER BY started_at DESC
-        LIMIT 75
-    """).fetchall()]
+        LIMIT ? OFFSET ?
+    """, [limit, offset]).fetchall()]
     if not rows:
+        legacy_total_row = database.execute("SELECT COUNT(*) AS total FROM scan_cache").fetchone()
+        legacy_total = int(legacy_total_row["total"] or 0) if legacy_total_row else 0
         rows = [dict(r) for r in database.execute("""
             SELECT id,
                    scan_time,
@@ -9610,9 +9650,19 @@ def api_scan_history():
                    NULL AS error
             FROM scan_cache
             ORDER BY scan_time DESC
-            LIMIT 50
-        """).fetchall()]
+            LIMIT ? OFFSET ?
+        """, [limit, offset]).fetchall()]
+        if not total:
+            total = legacy_total
     database.close()
+    if paged:
+        return jsonify({
+            "rows": rows,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "page": offset // limit if limit else 0,
+        })
     return jsonify(rows)
 
 @app.route("/api/freshness-status")

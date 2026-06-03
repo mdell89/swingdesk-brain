@@ -754,6 +754,9 @@ function averageTradesByTicker(trades = [], brain = "", feeAdjusted = true) {
       net_pnl: current - invested,
       current_pnl_percent: invested > 0 ? ((current - invested) / invested) * 100 : avg(group.map(t => getTradeOpenPnlPercent(t, feeAdjusted))),
       actual_move: avg(group.map(t => getTradeOpenPnlPercent(t, feeAdjusted))),
+      day_change_percent: avg(group.map(getDisplayDayChangePercent)),
+      day_change_pct: avg(group.map(getDisplayDayChangePercent)),
+      pct_change_prev_close: avg(group.map(getDisplayDayChangePercent)),
       confidence: Math.round(avg(group.map(t => Number(t.confidence || 0)))),
       dynamic_confidence: Math.round(avg(group.map(t => Number(t.dynamic_confidence || t.confidence || 0)))),
       dynamic_estimate: avg(group.map(t => Number(t.dynamic_estimate || t.expected_move || 0))),
@@ -2284,6 +2287,8 @@ export default function App() {
   const [closedTab, setClosedTab] = useState("all");
   const [analyticsPage, setAnalyticsPage] = useState("performance"); // performance | closed
   const [scanHistory, setScanHistory] = useState([]);
+  const [scanHistoryTotal, setScanHistoryTotal] = useState(0);
+  const [scanHistoryPage, setScanHistoryPage] = useState(0);
   const [portfolioTab, setPortfolioTab] = useState("brain"); // brain | neural | personal
   const [selectedStrategy, setSelectedStrategy] = useState("SwingDesk");
   const [nnPositions, setNnPositions] = useState([]);
@@ -2544,6 +2549,7 @@ export default function App() {
   const AUDIT_PAGE_SIZE = 2;
   const LEARNING_PAGE_SIZE = 10;
   const VARIANT_COUNTER_PAGE_SIZE = 8;
+  const SCAN_HISTORY_PAGE_SIZE = 12;
 
   async function loadAuditPage(page = auditPage) {
     const offset = page * AUDIT_PAGE_SIZE;
@@ -2557,6 +2563,13 @@ export default function App() {
     const data = await apiFetch(`/variant-learning-events?paged=1&limit=${LEARNING_PAGE_SIZE}&offset=${offset}`);
     setLearningEvents(data.rows || []);
     setLearningTotal(Number(data.total || 0));
+  }
+
+  async function loadScanHistoryPage(page = scanHistoryPage) {
+    const offset = page * SCAN_HISTORY_PAGE_SIZE;
+    const data = await apiFetch(`/scan-history?paged=1&limit=${SCAN_HISTORY_PAGE_SIZE}&offset=${offset}`);
+    setScanHistory(data.rows || []);
+    setScanHistoryTotal(Number(data.total || 0));
   }
 
   useEffect(() => {
@@ -2600,10 +2613,10 @@ export default function App() {
       setTabLoading(true);
       apiFetch("/predictions").then(data => { setPredictions(data); setTabLoading(false); }).catch(() => setTabLoading(false));
     }
-    if (tab === "virtual" && analyticsPage === "scan" && scanHistory.length === 0) {
-      apiFetch("/scan-history").then(data => setScanHistory(data || [])).catch(() => {});
+    if (tab === "virtual" && analyticsPage === "scan") {
+      loadScanHistoryPage(scanHistoryPage).catch(() => {});
     }
-  }, [tab, loaded, analyticsPage, auditPage, learningPage]);
+  }, [tab, loaded, analyticsPage, auditPage, learningPage, scanHistoryPage]);
 
   // ── 5-minute refresh ──
   useEffect(() => {
@@ -3923,6 +3936,21 @@ export default function App() {
                 <div style={{ fontSize: 9, color: T3, textAlign: "right" }}>
                   {totalScanned ? `${totalScanned} tickers` : ""}
                   {lastScan ? ` · ${new Date(lastScan).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : ""}
+                </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                <span style={{ fontSize: 8, color: T3 }}>
+                  Page {scanHistoryPage + 1} of {Math.max(1, Math.ceil((scanHistoryTotal || scanHistory.length) / SCAN_HISTORY_PAGE_SIZE))} · {scanHistoryTotal || scanHistory.length} scans
+                </span>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button onClick={() => setScanHistoryPage(p => Math.max(0, p - 1))} disabled={scanHistoryPage <= 0}
+                    style={{ fontSize: 8, color: scanHistoryPage <= 0 ? T3 : BLUE, background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 5, padding: "3px 7px" }}>
+                    Prev
+                  </button>
+                  <button onClick={() => setScanHistoryPage(p => p + 1)} disabled={(scanHistoryPage + 1) * SCAN_HISTORY_PAGE_SIZE >= (scanHistoryTotal || scanHistory.length)}
+                    style={{ fontSize: 8, color: (scanHistoryPage + 1) * SCAN_HISTORY_PAGE_SIZE >= (scanHistoryTotal || scanHistory.length) ? T3 : BLUE, background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 5, padding: "3px 7px" }}>
+                    Next
+                  </button>
                 </div>
               </div>
               {scanHistory.length === 0 ? (
