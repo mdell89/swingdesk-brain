@@ -3,6 +3,7 @@ import App, {
   averageTradesByTicker,
   calculateAggregatePortfolio,
   changedWeightDeltaRows,
+  getDisplayDayChangePercent,
   sortOpenTradesByMode,
 } from './App';
 
@@ -67,4 +68,17 @@ test('formats changed signal weight deltas in percent points', () => {
   expect(rows[0].afterPct).toBeCloseTo(20.95);
   expect(rows[0].deltaPct).toBeCloseTo(-0.79);
   expect(rows[1].deltaPct).toBeCloseTo(0.52);
+});
+
+test('card percent change never falls back to overnight gap', () => {
+  expect(getDisplayDayChangePercent({
+    pct_change_prev_close: 5.1,
+    day_change_pct: 5.0,
+    overnight_gap_pct: 12.4,
+  })).toBeCloseTo(5.1);
+
+  expect(getDisplayDayChangePercent({
+    overnight_gap_pct: 12.4,
+    gap_pct: 12.4,
+  })).toBe(0);
 });

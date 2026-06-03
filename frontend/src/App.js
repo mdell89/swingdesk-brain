@@ -154,7 +154,7 @@ function mapPickFields(pick) {
     lm: pick.long_move, sm: pick.short_move,
     lr: pick.long_reasoning, sr: pick.short_reasoning,
     st: pick.sell_time,
-    dayChg: pick.day_change_pct || pick.overnight_gap_pct || 0,
+    dayChg: getDisplayDayChangePercent(pick),
   };
 }
 
@@ -504,6 +504,13 @@ function getClosedTradePnlDollars(trade = {}, feeAdjusted = true) {
   return invested * (getClosedTradePnlPercent(trade) / 100);
 }
 
+function getDisplayDayChangePercent(item = {}) {
+  for (const key of ["pct_change_prev_close", "day_change_pct", "day_change_percent"]) {
+    if (item[key] != null && Number.isFinite(Number(item[key]))) return Number(item[key]);
+  }
+  return 0;
+}
+
 const SIGNAL_KEY_ALIASES = {
   overnight_gap: "overnight_gap_probability",
   sector_rs: "sector_relative_strength",
@@ -797,7 +804,7 @@ function averagePicksByTicker(rows = [], brain = "") {
     const methods = uniqueList(group.map(p => p.strategy));
     const confidence = Math.round(avg(group.map(p => Number(p.confidence || 0))));
     const move = avg(group.map(p => Number(p.move || 0)));
-    const dayChange = avg(group.map(p => Number(p.day_change_pct ?? p.gap_pct ?? 0)));
+    const dayChange = avg(group.map(getDisplayDayChangePercent));
     return mapPickFields({
       ticker,
       strategy: "All",
@@ -807,8 +814,9 @@ function averagePicksByTicker(rows = [], brain = "") {
       long_conf: confidence,
       long_move: move,
       long_reasoning: `${methods.length} ${brain} strategies currently agree on ${ticker}.`,
+      pct_change_prev_close: dayChange,
       day_change_pct: dayChange,
-      overnight_gap_pct: avg(group.map(p => Number(p.gap_pct ?? p.day_change_pct ?? 0))),
+      overnight_gap_pct: avg(group.map(p => Number(p.gap_pct ?? p.overnight_gap_pct ?? 0))),
       source_variant_count: group.length,
     });
   }).sort((a, b) => (b.lc || 0) - (a.lc || 0));
@@ -2181,6 +2189,7 @@ export {
   calculateAggregatePortfolio,
   calculateSimulationLedger,
   changedWeightDeltaRows,
+  getDisplayDayChangePercent,
   getTradeOpenPnlDollars,
   getTradeOpenPnlPercent,
   sortOpenTradesByMode,

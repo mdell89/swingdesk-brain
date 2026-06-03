@@ -8890,8 +8890,16 @@ def api_variant_strategy_preview():
                         "ticker": p.get("ticker"),
                         "confidence": p.get("long_conf") or p.get("confidence") or p.get("nn_score"),
                         "move": p.get("long_move") or p.get("expected_move"),
-                        "day_change_pct": p.get("day_change_pct") or p.get("pct_change_prev_close"),
-                        "gap_pct": p.get("overnight_gap_pct") or p.get("gap_percent"),
+                        "day_change_pct": (
+                            p.get("pct_change_prev_close")
+                            if p.get("pct_change_prev_close") is not None
+                            else p.get("day_change_pct")
+                        ),
+                        "gap_pct": (
+                            p.get("overnight_gap_pct")
+                            if p.get("overnight_gap_pct") is not None
+                            else p.get("gap_percent")
+                        ),
                     }
                     for p in qualified[:10]
                 ],
