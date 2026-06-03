@@ -505,6 +505,24 @@ function getTradeOpenPnlDollars(trade = {}, feeAdjusted = true) {
   return invested * (pct / 100);
 }
 
+function getTradeOpenPnlPercent(trade = {}, feeAdjusted = true) {
+  if (trade.current_pnl_percent != null && Number.isFinite(Number(trade.current_pnl_percent))) {
+    return Number(trade.current_pnl_percent);
+  }
+  if (trade.actual_move != null && Number.isFinite(Number(trade.actual_move))) {
+    return Number(trade.actual_move);
+  }
+  const invested = Number(trade.invested_amount || 0);
+  if (invested > 0) return (getTradeOpenPnlDollars(trade, feeAdjusted) / invested) * 100;
+  const buy = Number(trade.buy_price || trade.entry_price || 0);
+  const current = Number(trade.current_price || trade.last_price || trade.price || 0);
+  if (buy > 0 && current > 0) {
+    const pct = (current - buy) / buy * 100;
+    return (trade.direction || "long") === "short" ? -pct : pct;
+  }
+  return 0;
+}
+
 function getClosedTradePnlPercent(trade = {}) {
   if (trade.actual_move != null && Number.isFinite(Number(trade.actual_move))) {
     const actual = Number(trade.actual_move);
@@ -644,6 +662,17 @@ function calculateSimulationLedger(portfolio = {}, trades = [], feeAdjusted = tr
   };
 }
 
+function calculateAggregatePortfolio(ledgers = []) {
+  if (!ledgers.length) return null;
+  return {
+    equity: roundMoney(avg(ledgers.map(ledger => ledger.equity))),
+    realized_pnl: roundMoney(avg(ledgers.map(ledger => ledger.realized_pnl))),
+    open_pnl: roundMoney(avg(ledgers.map(ledger => ledger.open_pnl))),
+    starting_cash: roundMoney(avg(ledgers.map(ledger => ledger.starting_cash))),
+    universe_count: ledgers.length,
+  };
+}
+
 function evidenceLevelForSample(sampleSize = 0) {
   if (sampleSize >= 75) return "Strong";
   if (sampleSize >= 30) return "Building";
@@ -716,8 +745,8 @@ function averageTradesByTicker(trades = [], brain = "", feeAdjusted = true) {
       gross_current_value: avg(group.map(t => Number(t.gross_current_value ?? t.current_value ?? t.invested_amount ?? 0))),
       current_pnl_dollars: current - invested,
       net_pnl: current - invested,
-      current_pnl_percent: invested > 0 ? ((current - invested) / invested) * 100 : avg(group.map(t => Number(t.current_pnl_percent || t.actual_move || 0))),
-      actual_move: avg(group.map(t => Number(t.actual_move || t.current_pnl_percent || 0))),
+      current_pnl_percent: invested > 0 ? ((current - invested) / invested) * 100 : avg(group.map(t => getTradeOpenPnlPercent(t, feeAdjusted))),
+      actual_move: avg(group.map(t => getTradeOpenPnlPercent(t, feeAdjusted))),
       confidence: Math.round(avg(group.map(t => Number(t.confidence || 0)))),
       dynamic_confidence: Math.round(avg(group.map(t => Number(t.dynamic_confidence || t.confidence || 0)))),
       dynamic_estimate: avg(group.map(t => Number(t.dynamic_estimate || t.expected_move || 0))),
@@ -725,6 +754,42 @@ function averageTradesByTicker(trades = [], brain = "", feeAdjusted = true) {
       source_variant_count: group.length,
     };
   });
+}
+
+function sortOpenTradesByMode(trades = [], sortMode = "smart", feeAdjusted = true) {
+  const entryConfidence = trade => Number(trade.lock_in_confidence ?? trade.confidence ?? 0);
+  const currentConfidence = trade => Number(trade.dynamic_confidence ?? trade.confidence ?? 0);
+  const confidenceDrift = trade => Math.abs(entryConfidence(trade) - currentConfidence(trade));
+  const sentimentPriority = trade => {
+    const pnl = getTradeOpenPnlPercent(trade, feeAdjusted);
+    const icon = trade.sentiment_icon;
+    if (trade.is_post_close) return -1;
+    if (icon === "x") return 0;
+    if (pnl < 0) return 2;
+    return 1;
+  };
+  const arr = [...trades];
+  switch (sortMode) {
+    case "gain":      return arr.sort((a, b) => getTradeOpenPnlPercent(b, feeAdjusted) - getTradeOpenPnlPercent(a, feeAdjusted));
+    case "loss":      return arr.sort((a, b) => getTradeOpenPnlPercent(a, feeAdjusted) - getTradeOpenPnlPercent(b, feeAdjusted));
+    case "conf_hi":   return arr.sort((a, b) => entryConfidence(b) - entryConfidence(a));
+    case "conf_lo":   return arr.sort((a, b) => entryConfidence(a) - entryConfidence(b));
+    case "curr_conf_hi": return arr.sort((a, b) => currentConfidence(b) - currentConfidence(a));
+    case "curr_conf_lo": return arr.sort((a, b) => currentConfidence(a) - currentConfidence(b));
+    case "conf_drift_lo": return arr.sort((a, b) => confidenceDrift(a) - confidenceDrift(b));
+    case "conf_drift_hi": return arr.sort((a, b) => confidenceDrift(b) - confidenceDrift(a));
+    case "method_hi": return arr.sort((a, b) => (b.confluence_count || 0) - (a.confluence_count || 0));
+    case "method_lo": return arr.sort((a, b) => (a.confluence_count || 0) - (b.confluence_count || 0));
+    case "oldest":    return arr.sort((a, b) => (a.buy_date || "").localeCompare(b.buy_date || ""));
+    case "newest":    return arr.sort((a, b) => (b.buy_date || "").localeCompare(a.buy_date || ""));
+    default:          return arr.sort((a, b) => {
+      const ap = sentimentPriority(a), bp = sentimentPriority(b);
+      if (ap !== bp) return ap - bp;
+      const confDiff = currentConfidence(b) - currentConfidence(a);
+      if (confDiff !== 0) return confDiff;
+      return getTradeOpenPnlPercent(b, feeAdjusted) - getTradeOpenPnlPercent(a, feeAdjusted);
+    });
+  }
 }
 
 function averagePicksByTicker(rows = [], brain = "") {
@@ -786,24 +851,6 @@ function StrategyBadge({ strategy, selectedStrategy, color = BLUE }) {
       flexShrink: 0,
     }}>{strategy}</span>
   );
-}
-
-function CompactMethodTags({ methods = [], glowing = false, selectedStrategy = "" }) {
-  const list = visibleConfluenceMethodTags(methods, selectedStrategy);
-  return list.slice(0, 3).map(method => (
-    <span key={method} className={glowing ? "tag-glow" : ""} style={{
-      fontSize: 7,
-      fontWeight: 800,
-      color: "#ddd",
-      letterSpacing: .25,
-      padding: "1px 4px",
-      background: "#000",
-      borderRadius: 3,
-      border: "1px solid rgba(255,255,255,0.2)",
-      whiteSpace: "nowrap",
-      flexShrink: 0,
-    }}>{method}</span>
-  ));
 }
 
 function BrainAgreementTags({ brains = [], glowing = false }) {
@@ -1074,7 +1121,6 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
           <BrainAgreementTags brains={brainTags} glowing={glowing} />
           <EvidenceBadgeCompact evidence={pick.evidence} glowing={glowing} />
           <StrategyBadge strategy={pick.strategy || strategyName} selectedStrategy={strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
-          <CompactMethodTags methods={confluenceMethods} glowing={glowing} selectedStrategy={strategyName} />
           {pick.broke_52w_high_days_ago != null && pick.broke_52w_high_days_ago <= 7 && (
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
           )}
@@ -1276,10 +1322,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
   const currentPrice = Number(trade.current_price || trade.last_price || trade.price || 0);
   const fallbackCurrentValue = currentPrice && buyPrice > 0 ? investedAmount * (currentPrice / buyPrice) : investedAmount;
   const currentValue = Number(getValuationFields({ ...trade, current_value: trade.current_value ?? fallbackCurrentValue }, feeAdjusted).current);
-  const rawPnlPercent = trade.current_pnl_percent != null ? Number(trade.current_pnl_percent) :
-    trade.actual_move != null ? Number(trade.actual_move) :
-    (buyPrice > 0 && currentPrice > 0 ? (currentPrice - buyPrice) / buyPrice * 100 :
-      (currentValue - investedAmount) / investedAmount * 100);
+  const rawPnlPercent = getTradeOpenPnlPercent({ ...trade, current_value: trade.current_value ?? fallbackCurrentValue }, feeAdjusted);
   // Clamp -0 to 0 to avoid negative zero display
   const pnlPercent = rawPnlPercent === 0 ? 0 : (Math.abs(rawPnlPercent) < 0.005 ? 0 : rawPnlPercent);
   const rawPnlDollars = getTradeOpenPnlDollars(trade, feeAdjusted);
@@ -1393,7 +1436,6 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
           <BrainAgreementTags brains={brainTags} glowing={glowing} />
           <EvidenceBadgeCompact evidence={trade.evidence} glowing={glowing} />
           <StrategyBadge strategy={trade.strategy || strategyName} selectedStrategy={strategyName} color={themeKey === "purple" ? "#a78bfa" : BLUE} />
-          <CompactMethodTags methods={confluenceMethods} glowing={glowing} selectedStrategy={strategyName} />
           {trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7 && (
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
           )}
@@ -2151,6 +2193,15 @@ function WhyNotPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED })
   );
 }
 
+export {
+  averageTradesByTicker,
+  calculateAggregatePortfolio,
+  calculateSimulationLedger,
+  getTradeOpenPnlDollars,
+  getTradeOpenPnlPercent,
+  sortOpenTradesByMode,
+};
+
 export default function App() {
   const [loadProgress, setLoadProgress] = useState(0);
   const [loadStatus, setLoadStatus] = useState("Connecting to brain...");
@@ -2645,12 +2696,7 @@ export default function App() {
   const aggregateLedgers = aggregateVariantDetails
     .filter(detail => detail?.portfolio)
     .map(detail => calculateSimulationLedger(detail.portfolio, detail.trades || [], feeAdjusted));
-  const aggregatePortfolio = aggregateLedgers.length ? {
-    equity: roundMoney(avg(aggregateLedgers.map(ledger => ledger.equity))),
-    realized_pnl: roundMoney(avg(aggregateLedgers.map(ledger => ledger.realized_pnl))),
-    open_pnl: roundMoney(avg(aggregateLedgers.map(ledger => ledger.open_pnl))),
-    starting_cash: roundMoney(avg(aggregateLedgers.map(ledger => ledger.starting_cash))),
-  } : null;
+  const aggregatePortfolio = calculateAggregatePortfolio(aggregateLedgers);
   const novaUniversePortfolio = allStrategySelected ? aggregatePortfolio : (novaUniverse?.portfolio || null);
   const selectedUniverseTrades = Array.isArray(novaUniverse?.trades)
     ? novaUniverse.trades.filter(t => t.outcome !== "archived_excess_open")
@@ -2682,7 +2728,13 @@ export default function App() {
   const openLongPositions = selectedVariantMatchesTab && activeVariantBrain === "Vector"
     ? novaUniverseOpen.filter(t => (t.direction || "long") === "long")
     : openPositions.filter(t => t.direction === "long" && t.outcome === "open");
-  const activeOpenPnl = openLongPositions.reduce((sum, trade) => sum + getTradeOpenPnlDollars(trade, feeAdjusted), 0);
+  const visibleOpenCardPnl = openLongPositions.reduce((sum, trade) => sum + getTradeOpenPnlDollars(trade, feeAdjusted), 0);
+  const activeOpenPnl = selectedVariantMatchesTab && activeVariantBrain === "Vector" && selectedVariantLedger?.open_pnl != null
+    ? Number(selectedVariantLedger.open_pnl)
+    : visibleOpenCardPnl;
+  const allViewScopeNote = allStrategySelected && aggregatePortfolio
+    ? `All view: account boxes average ${aggregatePortfolio.universe_count} ${activeVariantBrain} universes. Open cards are deduped by ticker and average matching open instances.`
+    : "";
 
   const isWeekendNow = (() => { const d = new Date().getDay(); return d === 0 || d === 6; })();
   // Sell Today = previous session positions (buy_date < today), active on trading days
@@ -2698,43 +2750,8 @@ export default function App() {
     (t.sell_date == null || t.sell_date >= thirtyDaysAgo)
   );
 
-  // Sort positions: CUT first (worst P&L), then rest by P&L descending
-  function getSentimentPriority(trade) {
-    const pnl = trade.current_pnl_percent || 0;
-    const icon = trade.sentiment_icon;
-    if (trade.is_post_close) return -1;
-    if (icon === "x") return 0;
-    if (pnl < 0) return 2;
-    return 1;
-  }
-
-  const entryConfidence = trade => Number(trade.lock_in_confidence ?? trade.confidence ?? 0);
-  const currentConfidence = trade => Number(trade.dynamic_confidence ?? trade.confidence ?? 0);
-  const confidenceDrift = trade => Math.abs(entryConfidence(trade) - currentConfidence(trade));
-
   function sortPositions(positions) {
-    const arr = [...positions];
-    switch (sortMode) {
-      case "gain":      return arr.sort((a, b) => (b.current_pnl_percent || 0) - (a.current_pnl_percent || 0));
-      case "loss":      return arr.sort((a, b) => (a.current_pnl_percent || 0) - (b.current_pnl_percent || 0));
-      case "conf_hi":   return arr.sort((a, b) => entryConfidence(b) - entryConfidence(a));
-      case "conf_lo":   return arr.sort((a, b) => entryConfidence(a) - entryConfidence(b));
-      case "curr_conf_hi": return arr.sort((a, b) => currentConfidence(b) - currentConfidence(a));
-      case "curr_conf_lo": return arr.sort((a, b) => currentConfidence(a) - currentConfidence(b));
-      case "conf_drift_lo": return arr.sort((a, b) => confidenceDrift(a) - confidenceDrift(b));
-      case "conf_drift_hi": return arr.sort((a, b) => confidenceDrift(b) - confidenceDrift(a));
-      case "method_hi": return arr.sort((a, b) => (b.confluence_count || 0) - (a.confluence_count || 0));
-      case "method_lo": return arr.sort((a, b) => (a.confluence_count || 0) - (b.confluence_count || 0));
-      case "oldest":    return arr.sort((a, b) => (a.buy_date || "").localeCompare(b.buy_date || ""));
-      case "newest":    return arr.sort((a, b) => (b.buy_date || "").localeCompare(a.buy_date || ""));
-      default:          return arr.sort((a, b) => {
-        const ap = getSentimentPriority(a), bp = getSentimentPriority(b);
-        if (ap !== bp) return ap - bp;
-        const confDiff = currentConfidence(b) - currentConfidence(a);
-        if (confDiff !== 0) return confDiff;
-        return (b.current_pnl_percent || 0) - (a.current_pnl_percent || 0);
-      });
-    }
+    return sortOpenTradesByMode(positions, sortMode, feeAdjusted);
   }
 
   const openFilteredPositions = openDayFilter === "day2"
@@ -2843,7 +2860,10 @@ export default function App() {
     }
     return [];
   };
-  const novaOpenPnl = novaOpenPositions.reduce((sum, trade) => sum + getTradeOpenPnlDollars(trade, feeAdjusted), 0);
+  const novaVisibleOpenCardPnl = novaOpenPositions.reduce((sum, trade) => sum + getTradeOpenPnlDollars(trade, feeAdjusted), 0);
+  const novaOpenPnl = selectedVariantMatchesTab && activeVariantBrain === "Nova" && selectedVariantLedger?.open_pnl != null
+    ? Number(selectedVariantLedger.open_pnl)
+    : novaVisibleOpenCardPnl;
   const novaUniverseBalance = selectedVariantMatchesTab && activeVariantBrain === "Nova" && selectedVariantLedger?.equity != null
     ? Number(selectedVariantLedger.equity)
     : novaUniversePortfolio?.equity != null
@@ -3097,6 +3117,12 @@ export default function App() {
               <div style={{ fontSize: 16, fontWeight: 600, color: openLongPositions.length > 0 ? GREEN : T2 }}>{openLongPositions.length}</div>
             </div>
           </div>
+
+          {portfolioTab === "classic" && allViewScopeNote && (
+            <div style={{ margin: `0 16px ${HOME_ROW_GAP}px`, fontSize: 8.5, lineHeight: 1.35, color: T3, fontFamily: "'DM Mono',monospace" }}>
+              {allViewScopeNote} Card open sum {visibleOpenCardPnl >= 0 ? "+" : "-"}${Math.abs(visibleOpenCardPnl).toFixed(2)}.
+            </div>
+          )}
 
           {openExecution?.missed_open_alert && (
             <div style={{ margin: "0 16px 10px", background: "#1a0f05", border: `1px solid ${AMBER}66`, borderRadius: 8, padding: "9px 10px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
@@ -3458,6 +3484,11 @@ export default function App() {
                   </div>
                 </div>
               </div>
+              {portfolioTab === "neural" && allViewScopeNote && (
+                <div style={{ margin: `0 0 ${HOME_ROW_GAP}px`, fontSize: 8.5, lineHeight: 1.35, color: T3, fontFamily: "'DM Mono',monospace" }}>
+                  {allViewScopeNote} Card open sum {novaVisibleOpenCardPnl >= 0 ? "+" : "-"}${Math.abs(novaVisibleOpenCardPnl).toFixed(2)}.
+                </div>
+              )}
               <div style={{ margin: `0 0 ${HOME_ROW_GAP}px`, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 14px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
                   {[[AMBER, "85%+ elite"], [GREEN, "75-84 strong"], [BLUE, "65-74 decent"], [T3, "<65 skip"]].map(([color, label]) => (
