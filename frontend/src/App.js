@@ -642,6 +642,52 @@ function calculateAggregatePortfolio(ledgers = []) {
   };
 }
 
+function equityPointDate(point = {}) {
+  return String(point.date || point.timestamp || "").slice(0, 10);
+}
+
+function calculateLedgerSessionPnl({ equityPoints = [], currentEquity = 1000, startingCash = 1000, today }) {
+  const current = Number(currentEquity ?? startingCash ?? 1000);
+  const points = [...(equityPoints || [])]
+    .filter(point => equityPointDate(point))
+    .sort((a, b) => new Date(a.timestamp || a.date || 0) - new Date(b.timestamp || b.date || 0));
+  const latestDate = points.reduce((max, point) => {
+    const date = equityPointDate(point);
+    return date && (!today || date <= today) && date > max ? date : max;
+  }, "");
+  const priorPoint = latestDate
+    ? [...points].reverse().find(point => equityPointDate(point) < latestDate)
+    : null;
+  const previousClose = priorPoint ? Number(priorPoint.equity || startingCash || 1000) : Number(startingCash || 1000);
+  return {
+    currentEquity: roundMoney(current),
+    previousClose: roundMoney(previousClose),
+    previousCloseDate: priorPoint ? equityPointDate(priorPoint) : null,
+    dayPnl: roundMoney(current - previousClose),
+  };
+}
+
+function calculateAggregateSessionPnl(rows = [], today) {
+  const sessions = rows
+    .map(row => calculateLedgerSessionPnl({
+      equityPoints: row.detail?.equity_points || [],
+      currentEquity: row.ledger?.equity,
+      startingCash: row.ledger?.starting_cash ?? row.detail?.portfolio?.starting_cash ?? 1000,
+      today,
+    }))
+    .filter(session => Number.isFinite(Number(session.currentEquity)) && Number.isFinite(Number(session.previousClose)));
+  if (!sessions.length) return null;
+  const currentEquity = avg(sessions.map(session => session.currentEquity));
+  const previousClose = avg(sessions.map(session => session.previousClose));
+  return {
+    currentEquity: roundMoney(currentEquity),
+    previousClose: roundMoney(previousClose),
+    previousCloseDate: null,
+    dayPnl: roundMoney(currentEquity - previousClose),
+    universeCount: sessions.length,
+  };
+}
+
 const SIGNAL_WEIGHT_LABELS = {
   rsi_momentum: "RSI Momentum",
   volume_surge: "Volume Surge",
@@ -2735,9 +2781,13 @@ export default function App() {
   const aggregateVariantDetails = allStrategySelected
     ? activeVariantUniverseIds.map(id => variantDetailsById[id]).filter(Boolean)
     : [];
-  const aggregateLedgers = aggregateVariantDetails
+  const aggregateLedgerRows = aggregateVariantDetails
     .filter(detail => detail?.portfolio)
-    .map(detail => calculateSimulationLedger(detail.portfolio, detail.trades || [], feeAdjusted));
+    .map(detail => ({
+      detail,
+      ledger: calculateSimulationLedger(detail.portfolio, detail.trades || [], feeAdjusted),
+    }));
+  const aggregateLedgers = aggregateLedgerRows.map(row => row.ledger);
   const aggregatePortfolio = calculateAggregatePortfolio(aggregateLedgers);
   const novaUniversePortfolio = allStrategySelected ? aggregatePortfolio : (novaUniverse?.portfolio || null);
   const selectedUniverseTrades = Array.isArray(novaUniverse?.trades)
@@ -2766,6 +2816,16 @@ export default function App() {
       ? novaUniversePortfolio
       : calculateSimulationLedger(novaUniversePortfolio, rawSelectedVariantTrades, feeAdjusted)
     : null;
+  const selectedVariantSession = selectedVariantMatchesTab && selectedVariantLedger
+    ? allStrategySelected
+      ? calculateAggregateSessionPnl(aggregateLedgerRows, today)
+      : calculateLedgerSessionPnl({
+          equityPoints: novaUniverse?.equity_points || [],
+          currentEquity: selectedVariantLedger.equity,
+          startingCash: selectedVariantLedger.starting_cash ?? novaUniversePortfolio?.starting_cash ?? 1000,
+          today,
+        })
+    : null;
 
   const openLongPositions = selectedVariantMatchesTab && activeVariantBrain === "Vector"
     ? novaUniverseOpen.filter(t => (t.direction || "long") === "long")
@@ -2775,7 +2835,7 @@ export default function App() {
     ? Number(selectedVariantLedger.open_pnl)
     : visibleOpenCardPnl;
   const allViewScopeNote = allStrategySelected && aggregatePortfolio
-    ? `All view: account boxes average ${aggregatePortfolio.universe_count} ${activeVariantBrain} universes. Open cards are deduped by ticker and average matching open instances.`
+    ? `All view: ledger boxes average ${aggregatePortfolio.universe_count} ${activeVariantBrain} universes. Cards dedupe tickers and average matching open instances.`
     : "";
 
   const isWeekendNow = (() => { const d = new Date().getDay(); return d === 0 || d === 6; })();
@@ -2879,7 +2939,15 @@ export default function App() {
     : isLiveMarketSession
       ? "live"
       : null;
-  const backendDayUp = backendDayPnl == null ? perfUp : backendDayPnl >= 0;
+  const activeDayPnl = selectedVariantMatchesTab && activeVariantBrain === "Vector" && selectedVariantSession
+    ? selectedVariantSession.dayPnl
+    : backendDayPnl == null
+      ? perfChange
+      : backendDayPnl;
+  const activeDayUp = activeDayPnl >= 0;
+  const selectedDayPnlModeLabel = selectedVariantMatchesTab && selectedVariantSession
+    ? "last close"
+    : dayPnlModeLabel;
   const novaOpenPositions = selectedVariantMatchesTab && activeVariantBrain === "Nova"
     ? novaUniverseOpen
     : nnPositions.filter(t => t.outcome === "open");
@@ -2928,23 +2996,9 @@ export default function App() {
   const novaRealizedPnl = selectedVariantMatchesTab && activeVariantBrain === "Nova" && selectedVariantLedger?.realized_pnl != null
     ? Number(selectedVariantLedger.realized_pnl)
     : round2((novaUniverseBalance ?? Number(nnStats?.portfolio_value || 1000)) - novaStartingCash - novaOpenPnl);
-  const novaSessionPnl = (() => {
-    const points = Array.isArray(novaUniverse?.equity_points) ? [...novaUniverse.equity_points] : [];
-    if (!points.length) return null;
-    points.sort((a, b) => new Date(a.timestamp || 0) - new Date(b.timestamp || 0));
-    const latestDate = points.reduce((max, p) => {
-      const d = (p.timestamp || "").slice(0, 10);
-      return d && d <= today && d > max ? d : max;
-    }, "");
-    if (!latestDate) return null;
-    const latestPoint = points.filter(p => (p.timestamp || "").slice(0, 10) === latestDate).slice(-1)[0];
-    const current = isLiveMarketSession && novaUniversePortfolio?.equity != null
-      ? Number(novaUniversePortfolio.equity)
-      : Number(latestPoint?.equity || 1000);
-    const prior = [...points].reverse().find(p => (p.timestamp || "").slice(0, 10) < latestDate);
-    const baseline = prior ? Number(prior.equity || 1000) : Number(novaUniversePortfolio?.starting_cash || 1000);
-    return round2(current - baseline);
-  })();
+  const novaSessionPnl = selectedVariantMatchesTab && activeVariantBrain === "Nova" && selectedVariantSession
+    ? selectedVariantSession.dayPnl
+    : null;
   const variantOptions = allStrategySelected ? [] : variantLeaderboard.filter(v =>
     v.brain === activeVariantBrain &&
     v.strategy === selectedStrategy &&
@@ -3121,17 +3175,11 @@ export default function App() {
                 ${activePortfolioBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
               </div>
               {(() => {
-                // Day's P&L: today's portfolio value vs yesterday's closing balance
-                const todayStr = new Date().toISOString().split("T")[0];
-                const yesterdaySettled = perfHistory.filter(p => !p.intraday && !p.seed && p.date < todayStr);
-                const baseline = yesterdaySettled.length
-                  ? yesterdaySettled[yesterdaySettled.length - 1].virtual
-                  : (perfHistory.find(p => p.seed)?.virtual || 1000);
-                const dayPnl = backendDayPnl == null ? (activePortfolioBalance - baseline) : backendDayPnl;
+                const dayPnl = activeDayPnl;
                 const dayUp2 = dayPnl >= 0;
                 return (
                   <div style={{ textAlign: "right", lineHeight: 1, paddingTop: 6 }}>
-                    <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L{dayPnlModeLabel ? ` · ${dayPnlModeLabel}` : ""}</div>
+                    <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L{selectedDayPnlModeLabel ? ` · ${selectedDayPnlModeLabel}` : ""}</div>
                     <div style={{ fontSize: 16, fontWeight: 600, color: dayUp2 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(dayPnl)}</div>
 
                   </div>
@@ -3140,7 +3188,7 @@ export default function App() {
             </div>
 
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
-              <span style={{ fontSize: 13, fontWeight: 500, color: backendDayUp ? GREEN : RED }}>{perfUp ? "↑" : "↓"} {Math.abs(perfPercent).toFixed(2)}%</span>
+              <span style={{ fontSize: 13, fontWeight: 500, color: activeDayUp ? GREEN : RED }}>{perfUp ? "↑" : "↓"} {Math.abs(perfPercent).toFixed(2)}%</span>
               <span style={{ fontSize: 12, color: T3 }}>{formatSignedCurrency(perfChange)}</span>
               <span style={{ fontSize: 10, color: T3 }}>(realized + open)</span>
             </div>
@@ -3180,7 +3228,7 @@ export default function App() {
 
           {portfolioTab === "classic" && allViewScopeNote && (
             <div style={{ margin: `0 16px ${HOME_ROW_GAP}px`, fontSize: 8.5, lineHeight: 1.35, color: T3, fontFamily: "'DM Mono',monospace" }}>
-              {allViewScopeNote} Card open sum {visibleOpenCardPnl >= 0 ? "+" : "-"}${Math.abs(visibleOpenCardPnl).toFixed(2)}.
+              {allViewScopeNote} Deduped card sum {visibleOpenCardPnl >= 0 ? "+" : "-"}${Math.abs(visibleOpenCardPnl).toFixed(2)}.
             </div>
           )}
 
@@ -3485,7 +3533,7 @@ export default function App() {
                   ? Number(nnStats.portfolio_value)
                   : (nnFiltered[nnFiltered.length - 1]?.virtual || 1000);
                 const nnFirst = nnPerfTimeframe === "D"
-                  ? (nnFiltered[0]?.virtual || nnLast)
+                  ? (selectedVariantSession?.previousClose ?? nnFiltered[0]?.virtual ?? nnLast)
                   : (nnFiltered[0]?.virtual || 1000);
                 const nnChange = novaSessionPnl == null ? round2(nnLast - nnFirst) : novaSessionPnl;
                 const nnPercent = nnFirst > 0 ? (nnChange / nnFirst * 100) : 0;
@@ -3499,7 +3547,7 @@ export default function App() {
                         </div>
                       </div>
                       <div style={{ textAlign: "right", lineHeight: 1, paddingTop: 6 }}>
-                        <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L{dayPnlModeLabel ? ` · ${dayPnlModeLabel}` : ""}</div>
+                        <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L{selectedDayPnlModeLabel ? ` · ${selectedDayPnlModeLabel}` : ""}</div>
                         <div style={{ fontSize: 16, fontWeight: 600, color: nnUp ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(nnChange)}</div>
                       </div>
                     </div>
@@ -3546,7 +3594,7 @@ export default function App() {
               </div>
               {portfolioTab === "neural" && allViewScopeNote && (
                 <div style={{ margin: `0 0 ${HOME_ROW_GAP}px`, fontSize: 8.5, lineHeight: 1.35, color: T3, fontFamily: "'DM Mono',monospace" }}>
-                  {allViewScopeNote} Card open sum {novaVisibleOpenCardPnl >= 0 ? "+" : "-"}${Math.abs(novaVisibleOpenCardPnl).toFixed(2)}.
+                  {allViewScopeNote} Deduped card sum {novaVisibleOpenCardPnl >= 0 ? "+" : "-"}${Math.abs(novaVisibleOpenCardPnl).toFixed(2)}.
                 </div>
               )}
               <div style={{ margin: `0 0 ${HOME_ROW_GAP}px`, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 14px" }}>
