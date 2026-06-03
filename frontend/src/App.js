@@ -458,6 +458,16 @@ function getTradeOpenPnlDollars(trade = {}, feeAdjusted = true) {
 }
 
 function getTradeOpenPnlPercent(trade = {}, feeAdjusted = true) {
+  if (trade.outcome === "open") {
+    const buy = Number(trade.buy_price || trade.entry_price || 0);
+    const currentPrice = Number(trade.current_price || trade.last_price || trade.price || 0);
+    if (buy > 0 && currentPrice > 0) {
+      const pct = (currentPrice - buy) / buy * 100;
+      return (trade.direction || "long") === "short" ? -pct : pct;
+    }
+    const invested = Number(trade.invested_amount || 0);
+    if (invested > 0) return (getTradeOpenPnlDollars(trade, feeAdjusted) / invested) * 100;
+  }
   if (trade.current_pnl_percent != null && Number.isFinite(Number(trade.current_pnl_percent))) {
     return Number(trade.current_pnl_percent);
   }
@@ -2789,7 +2799,11 @@ export default function App() {
   const aggregateBuyPicks = allStrategySelected
     ? averagePicksByTicker(strategyPreviewRows, activeVariantBrain).filter(pick => !activeOpenTickers.has(pick.ticker))
     : null;
-  const activeBuyPicks = (aggregateBuyPicks || allBuyPicks).filter(pick => !activeOpenTickers.has(pick.ticker));
+  const activeBuyPicks = (
+    allStrategySelected && aggregateBuyPicks?.length
+      ? aggregateBuyPicks
+      : allBuyPicks
+  ).filter(pick => !activeOpenTickers.has(pick.ticker));
   const buyVisible = buyListExpanded ? activeBuyPicks : activeBuyPicks.slice(0, 20);
   const sellVisible = sellListExpanded ? sortedOpenFilteredPositions : sortedOpenFilteredPositions.slice(0, 20);
   // Open P&L from currently held positions
@@ -2868,7 +2882,9 @@ export default function App() {
   const aggregateNovaBuyPicks = allStrategySelected
     ? averagePicksByTicker(strategyPreviewRows, "Nova").filter(pick => !new Set(novaOpenPositions.map(t => t.ticker)).has(pick.ticker))
     : null;
-  const activeNovaBuyPicks = aggregateNovaBuyPicks || (nnPicks.recommended_longs || []);
+  const activeNovaBuyPicks = allStrategySelected && aggregateNovaBuyPicks?.length
+    ? aggregateNovaBuyPicks
+    : (nnPicks.recommended_longs || []);
   const vectorPickTickers = new Set(activeBuyPicks.map(row => String(row?.ticker || "").toUpperCase()).filter(Boolean));
   const novaPickTickers = new Set(activeNovaBuyPicks.map(row => String(row?.ticker || "").toUpperCase()).filter(Boolean));
   const vectorOpenTickers = new Set(openLongPositions.map(row => String(row?.ticker || "").toUpperCase()).filter(Boolean));

@@ -1001,6 +1001,7 @@ def initialize_database():
             buy_date TEXT NOT NULL,
             buy_time TEXT,
             buy_price REAL,
+            current_price REAL,
             invested_amount REAL,
             current_value REAL,
             confidence INTEGER,
@@ -1357,6 +1358,7 @@ def initialize_database():
     # Keep the variant trade ledger schema aligned with the fields written by
     # universe openings, execution recovery, card tags, and confidence context.
     for column_definition in [
+        "current_price REAL",
         "confluence_count INTEGER DEFAULT 0",
         "confluence_methods TEXT DEFAULT '[]'",
     ] + FEE_MODEL_COLUMN_DEFINITIONS:
@@ -2396,12 +2398,35 @@ def pct_from_baseline(price, baseline):
     except Exception:
         return None
 
+def previous_completed_close_from_history(history):
+    """Return the most recent completed daily close before today's market date."""
+    if not history:
+        return None
+    today = current_time_cst().strftime("%Y-%m-%d")
+    dated_rows = [
+        row for row in history
+        if row.get("date") and row.get("date") < today and row.get("close") not in (None, 0)
+    ]
+    if dated_rows:
+        return float(dated_rows[-1]["close"])
+    if len(history) >= 2:
+        return float(history[-2].get("close") or 0) or None
+    return float(history[-1].get("close") or 0) or None
+
 def repair_quote_baselines_from_history(quote, history):
-    """Use recent candles to repair stale previous-close/open baselines."""
+    """Use completed candles to repair stale previous-close/open baselines."""
     if not quote or not history:
         return quote
     try:
         price = float(quote.get("price") or 0)
+        completed_prev = previous_completed_close_from_history(history)
+        if completed_prev:
+            quote["previous_close"] = completed_prev
+            quote["day_change_percent"] = pct_from_baseline(price, completed_prev) or 0
+            quote["day_change_pct"] = quote["day_change_percent"]
+            quote["gap_percent"] = pct_from_baseline(quote.get("open", price), completed_prev) or 0
+            quote["baseline_repaired_from_history"] = True
+            return quote
         current_prev = float(quote.get("previous_close") or 0)
         current_change = abs(pct_from_baseline(price, current_prev) or 0)
         close_candidates = [
@@ -3337,14 +3362,18 @@ def fetch_finnhub_candles(ticker, days=60):
         highs = d.get("h", [])
         lows = d.get("l", [])
         volumes = d.get("v", [])
+        timestamps = d.get("t", [])
         history = []
         for i in range(len(closes)):
+            ts = int(timestamps[i]) if i < len(timestamps) else None
             history.append({
                 "close": float(closes[i]),
                 "open": float(opens[i]) if i < len(opens) else float(closes[i]),
                 "high": float(highs[i]) if i < len(highs) else float(closes[i]),
                 "low": float(lows[i]) if i < len(lows) else float(closes[i]),
                 "volume": float(volumes[i]) if i < len(volumes) else 0,
+                "timestamp": ts,
+                "date": datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else None,
             })
         return history
     except Exception as e:
@@ -3534,7 +3563,7 @@ def fetch_twelve_data_live(tickers):
     return results
 
 
-def fetch_price_data(tickers):
+def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
     """
     Fetch daily OHLCV price data for scanning and scoring.
     
@@ -3584,17 +3613,30 @@ def fetch_price_data(tickers):
 
     # Fetch fresh quotes for missing or stale tickers — max 60 per cycle
     missing = [t for t in tickers if t not in results]
-    refresh_limit = int(os.getenv("SCAN_PRICE_REFRESH_LIMIT", str(SCAN_BATCH_SIZE)))
+    refresh_limit = int(os.getenv("SCAN_PRICE_REFRESH_LIMIT", str(len(missing))))
     to_refresh = missing[:refresh_limit]
 
     if to_refresh:
         log.info(f"Refreshing {len(to_refresh)} tickers from Finnhub...")
-        RATE_DELAY = 1.1
+        RATE_DELAY = 2.2
         cycle = ProviderCycle("comprehensive_quote")
-        for ticker in to_refresh:
+        refreshed_tickers = []
+        for idx, ticker in enumerate(to_refresh, start=1):
+            if scan_event_id and (idx == 1 or idx % 5 == 0 or idx == len(to_refresh)):
+                record_nn_scan_status(
+                    status="running",
+                    scan_type=scan_type,
+                    phase="fetching_prices",
+                    scan_event_id=scan_event_id,
+                    total_scanned=len(results),
+                    total_expected=len(tickers),
+                    current_ticker=ticker,
+                    scanned_tickers=refreshed_tickers[-12:],
+                )
             quote = fetch_quote_with_fallback(ticker, cycle=cycle, use_cache=False)
             if quote:
                 results[ticker] = quote
+                refreshed_tickers.append(ticker)
                 # Fetch candle history for fresh tickers
                 history = fetch_finnhub_candles(ticker, days=60)
                 if history:
@@ -3618,7 +3660,18 @@ def fetch_price_data(tickers):
                     database.close()
                 except:
                     pass
-                time.sleep(RATE_DELAY)
+            if scan_event_id and (idx == 1 or idx % 5 == 0 or idx == len(to_refresh)):
+                record_nn_scan_status(
+                    status="running",
+                    scan_type=scan_type,
+                    phase="fetching_prices",
+                    scan_event_id=scan_event_id,
+                    total_scanned=len(results),
+                    total_expected=len(tickers),
+                    current_ticker=ticker,
+                    scanned_tickers=refreshed_tickers[-12:],
+                )
+            time.sleep(RATE_DELAY)
         set_app_state("last_price_provider_summary", json.dumps(cycle.summary()))
 
     log.info(f"fetch_price_data complete: {len(results)}/{len(tickers)} tickers")
@@ -4082,6 +4135,7 @@ def enrich_price_data_with_history(tickers, price_data):
     for ticker in missing:
         if ticker in supplemental and "daily_history" in supplemental[ticker]:
             price_data[ticker]["daily_history"] = supplemental[ticker]["daily_history"]
+            repair_quote_baselines_from_history(price_data[ticker], price_data[ticker]["daily_history"])
 
 def run_darvas_silent_collection(price_data, scored_stocks):
     """
@@ -5229,6 +5283,8 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         source="shared_comprehensive_scan",
         started=True,
         already_running=False,
+        started_at=current_time_cst().isoformat(),
+        finished_at=None,
         total_scanned=0,
         qualified=0,
         picks=0,
@@ -5239,13 +5295,15 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
 
     # Ensure SPY is always fetched — needed for relative strength calculations
     universe_with_spy = list(dict.fromkeys(universe + ["SPY"]))
-    price_data = fetch_price_data(universe_with_spy)
+    price_data = fetch_price_data(universe_with_spy, scan_event_id=scan_event_id, scan_type=scan_type)
     record_nn_scan_status(
         status="running",
         scan_type=scan_type,
         source="shared_comprehensive_scan",
         started=True,
         already_running=False,
+        started_at=current_time_cst().isoformat(),
+        finished_at=None,
         total_scanned=0,
         total_expected=len(universe),
         scanned_tickers=[],
@@ -5432,6 +5490,10 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         "all_longs": len(recommended_longs),
         "all_shorts": len(recommended_shorts),
         "total_scanned": len(scored_stocks),
+        "ticker_universe_count": len(universe),
+        "price_rows_loaded": len(price_data),
+        "price_rows_expected": len(universe_with_spy),
+        "partial_price_universe": len(price_data) < max(1, int(len(universe_with_spy) * 0.95)),
         "generated_at": current_time_cst().isoformat(),
         "scan_type": scan_type,
         "queue_locked": bool(queue_is_locked),
@@ -5498,7 +5560,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
     database.close()
     finish_scan_event(
         scan_event_id,
-        status="success",
+        status="degraded" if scan_result["partial_price_universe"] else "success",
         tickers_updated=len(price_data),
         picks_count=len(scan_result["longs"]) + len(scan_result["shorts"]),
         provider_summary=get_app_state_json("last_price_provider_summary", {}) or {},
@@ -5626,6 +5688,10 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None, require_fr
                 status["skipped_count"] += 1
                 update_variant_portfolio(database, variant["id"], note="no_picks")
                 continue
+            entry_quotes = fetch_current_prices(
+                sorted({pick.get("ticker") for pick in selected if pick.get("ticker")}),
+                pin_to_845=(target_execution_time == "08:45"),
+            )
             variant_opened = 0
             variant_skipped = 0
             open_cap = variant_open_position_cap(variant)
@@ -5669,7 +5735,8 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None, require_fr
                     status["skipped"].append({"variant_id": variant["id"], "ticker": ticker, "reason": "no cash"})
                     continue
 
-                buy_price = pick.get("open_price") or pick.get("price") or pick.get("buy_price") or 0
+                entry_quote = normalize_monitor_quote(entry_quotes.get(ticker), pick.get("price")) if entry_quotes.get(ticker) else None
+                buy_price = (entry_quote or {}).get("price") or pick.get("open_price") or pick.get("price") or pick.get("buy_price") or 0
                 if not buy_price:
                     status["skipped_count"] += 1
                     variant_skipped += 1
@@ -5689,14 +5756,14 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None, require_fr
                 database.execute(f"""
                     INSERT INTO variant_virtual_trades
                     (id, variant_id, strategy, brain, ticker, direction, buy_date, buy_time,
-                     buy_price, invested_amount, current_value, confidence, expected_move,
+                     buy_price, current_price, invested_amount, current_value, confidence, expected_move,
                      {FEE_MODEL_INSERT_COLUMNS},
                      outcome, sector, reasoning, signal_scores, confluence_count, confluence_methods, source_scan_time, source_rank,
                      created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 'long', ?, ?, ?, ?, ?, ?, ?, {FEE_MODEL_INSERT_PLACEHOLDERS}, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, 'long', ?, ?, ?, ?, ?, ?, ?, ?, {FEE_MODEL_INSERT_PLACEHOLDERS}, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [
                     trade_id, variant["id"], variant["strategy"], brain, ticker, today, buy_time,
-                    float(buy_price), round(invested, 4), fee_quote["net_current_value"], confidence, expected_move,
+                    float(buy_price), float(buy_price), round(invested, 4), fee_quote["net_current_value"], confidence, expected_move,
                     *fee_model_values(fee_quote),
                     pick.get("sector") or get_sector(ticker), reasoning, signal_scores, confluence_count, confluence_methods, scan_time, rank,
                     status["ran_at"], status["ran_at"],
@@ -5797,12 +5864,12 @@ def monitor_variant_universes(trigger="manual"):
                 outcome = "hit" if pnl_pct > 0 else "miss"
                 database.execute(f"""
                     UPDATE variant_virtual_trades
-                    SET current_value=?, sell_date=?, sell_time=?, sell_price=?,
+                    SET current_value=?, current_price=?, sell_date=?, sell_time=?, sell_price=?,
                         actual_move=?, gross_pnl=?, net_pnl=?, {FEE_MODEL_UPDATE_SET},
                         outcome=?, sell_reason=?, updated_at=?
                     WHERE id=?
                 """, [
-                    round(current_value, 4), today, now.strftime("%H:%M:%S"), price,
+                    round(current_value, 4), price, today, now.strftime("%H:%M:%S"), price,
                     round(pnl_pct, 2), fee_quote["gross_pnl"], fee_quote["net_pnl"],
                     *fee_model_values(fee_quote),
                     outcome, sell_reason, status["ran_at"], row["id"],
@@ -5816,10 +5883,10 @@ def monitor_variant_universes(trigger="manual"):
             else:
                 database.execute(f"""
                     UPDATE variant_virtual_trades
-                    SET current_value=?, actual_move=?, {FEE_MODEL_UPDATE_SET}, updated_at=?
+                    SET current_value=?, current_price=?, actual_move=?, {FEE_MODEL_UPDATE_SET}, updated_at=?
                     WHERE id=?
                 """, [
-                    round(current_value, 4), round(pnl_pct, 2), *fee_model_values(fee_quote),
+                    round(current_value, 4), price, round(pnl_pct, 2), *fee_model_values(fee_quote),
                     status["ran_at"], row["id"],
                 ])
 
@@ -5866,11 +5933,12 @@ def refresh_variant_open_quotes(database, variant_id):
         fee_quote = calculate_stock_fee_model(invested, buy_price, price, row.get("direction") or "long")
         database.execute(f"""
             UPDATE variant_virtual_trades
-            SET current_value=?, actual_move=?, gross_pnl=?, net_pnl=?,
+            SET current_value=?, current_price=?, actual_move=?, gross_pnl=?, net_pnl=?,
                 {FEE_MODEL_UPDATE_SET}, updated_at=?
             WHERE id=?
         """, [
             round(fee_quote["net_current_value"], 4),
+            price,
             round(pnl_pct, 2),
             fee_quote["gross_pnl"],
             fee_quote["net_pnl"],
