@@ -2396,6 +2396,38 @@ def pct_from_baseline(price, baseline):
     except Exception:
         return None
 
+def repair_quote_baselines_from_history(quote, history):
+    """Use recent candles to repair stale previous-close/open baselines."""
+    if not quote or not history:
+        return quote
+    try:
+        price = float(quote.get("price") or 0)
+        current_prev = float(quote.get("previous_close") or 0)
+        current_change = abs(pct_from_baseline(price, current_prev) or 0)
+        close_candidates = [
+            float(row.get("close"))
+            for row in history[-3:]
+            if row.get("close") not in (None, 0)
+        ]
+        better = [
+            close for close in close_candidates
+            if abs(pct_from_baseline(price, close) or 0) + 2 < current_change
+        ]
+        plausible = [
+            close for close in better
+            if abs(pct_from_baseline(price, close) or 0) <= 8
+        ]
+        if current_change >= 8 and plausible:
+            repaired_prev = min(plausible, key=lambda close: abs(price - close))
+            quote["previous_close"] = repaired_prev
+            quote["day_change_percent"] = pct_from_baseline(price, repaired_prev) or 0
+            quote["day_change_pct"] = quote["day_change_percent"]
+            quote["gap_percent"] = pct_from_baseline(quote.get("open", price), repaired_prev) or 0
+            quote["baseline_repaired_from_history"] = True
+    except Exception:
+        pass
+    return quote
+
 def canonical_signal_weights():
     """Protected original signal-weight baseline used to seed every universe."""
     return {
@@ -3507,8 +3539,8 @@ def fetch_price_data(tickers):
     Fetch daily OHLCV price data for scanning and scoring.
     
     Cache-first strategy:
-    - Loads all tickers from app_state cache first
-    - Fetches fresh Finnhub quotes only for tickers not in cache or cache >24h old
+    - Loads fresh tickers from app_state cache first
+    - Fetches fresh quotes for tickers missing a fresh cache row
     - Full candle history fetched only for top candidates (those with gap/volume signal)
     - Cache is refreshed incrementally — 60 tickers per scan cycle max
     
@@ -3519,10 +3551,10 @@ def fetch_price_data(tickers):
 
     log.info(f"Fetching price data for {len(tickers)} tickers...")
 
-    # Load all cached prices first
+    # Load fresh cached prices first. Rows without fetched_at are stale because
+    # stale previous_close values corrupt %CHG and gap math.
     results = {}
-    now_ts = int(__import__("time").time())
-    stale_cutoff = now_ts - 86400  # 24 hours
+    max_cache_age_seconds = int(os.getenv("SCAN_PRICE_CACHE_SECONDS", "900"))
 
     try:
         database = get_database()
@@ -3532,7 +3564,15 @@ def fetch_price_data(tickers):
             ).fetchone()
             if cached:
                 try:
-                    data = json.loads(cached["value"])
+                    payload = json.loads(cached["value"])
+                    if isinstance(payload, dict) and "data" in payload:
+                        fetched_at = datetime.fromisoformat(payload.get("fetched_at"))
+                        if (current_time_cst() - fetched_at).total_seconds() > max_cache_age_seconds:
+                            continue
+                        data = payload.get("data") or {}
+                        data["cached_at"] = payload.get("fetched_at")
+                    else:
+                        continue
                     results[ticker] = data
                 except:
                     pass
@@ -3544,7 +3584,8 @@ def fetch_price_data(tickers):
 
     # Fetch fresh quotes for missing or stale tickers — max 60 per cycle
     missing = [t for t in tickers if t not in results]
-    to_refresh = missing[:60]  # Refresh up to 60 per scan cycle
+    refresh_limit = int(os.getenv("SCAN_PRICE_REFRESH_LIMIT", str(SCAN_BATCH_SIZE)))
+    to_refresh = missing[:refresh_limit]
 
     if to_refresh:
         log.info(f"Refreshing {len(to_refresh)} tickers from Finnhub...")
@@ -3558,6 +3599,7 @@ def fetch_price_data(tickers):
                 history = fetch_finnhub_candles(ticker, days=60)
                 if history:
                     results[ticker]["daily_history"] = history
+                    repair_quote_baselines_from_history(results[ticker], history)
                     vols = [h["volume"] for h in history if h["volume"] > 0]
                     if vols:
                         avg_vol = sum(vols) / len(vols)
@@ -3568,7 +3610,10 @@ def fetch_price_data(tickers):
                     database = get_database()
                     cache_data = {k: v for k, v in results[ticker].items() if k != "daily_history"}
                     database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
-                                     [f"cache_{ticker}", json.dumps(cache_data)])
+                                     [f"cache_{ticker}", json.dumps({
+                                         "fetched_at": current_time_cst().isoformat(),
+                                         "data": cache_data,
+                                     })])
                     database.commit()
                     database.close()
                 except:
@@ -4946,7 +4991,7 @@ def enrich_with_live_prices(tickers, price_data):
             if in_premarket:
                 new_gap = (live_price - prev_close) / max(prev_close, 0.01) * 100
                 data["gap_percent"] = round(new_gap, 4)
-                data["day_change_percent"] = round(new_gap, 4)
+                data["premarket_change_percent"] = round(new_gap, 4)
             else:
                 new_change = (live_price - today_close) / max(today_close, 0.01) * 100
                 data["day_change_percent"] = round(new_change, 4)
