@@ -688,6 +688,65 @@ function calculateAggregateSessionPnl(rows = [], today) {
   };
 }
 
+function normalizeLedgerEquityHistory({ detail = {}, ledger = {}, today }) {
+  const startingCash = Number(ledger.starting_cash ?? detail?.portfolio?.starting_cash ?? 1000);
+  const currentEquity = Number(ledger.equity ?? startingCash);
+  const points = (detail?.equity_points || [])
+    .map(point => {
+      const timestamp = point.timestamp || point.date;
+      const ts = new Date(timestamp || 0).getTime();
+      const virtual = Number(point.equity ?? point.virtual);
+      if (!Number.isFinite(ts) || !Number.isFinite(virtual)) return null;
+      return {
+        ts,
+        date: equityPointDate(point),
+        virtual: roundMoney(virtual),
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.ts - b.ts);
+  const nowTs = Date.now();
+  const livePoint = { ts: nowTs, date: today, virtual: roundMoney(currentEquity), intraday: true };
+  if (!points.length) {
+    return [
+      { ts: nowTs - 60000, date: today, virtual: roundMoney(startingCash), seed: true },
+      livePoint,
+    ];
+  }
+  const last = points[points.length - 1];
+  if (Math.abs(Number(last.virtual) - currentEquity) > 0.005 || last.date !== today) {
+    return [...points, livePoint];
+  }
+  return points;
+}
+
+function calculateAggregateEquityHistory(rows = [], today) {
+  const histories = rows
+    .map(row => normalizeLedgerEquityHistory({
+      detail: row.detail,
+      ledger: row.ledger,
+      today,
+    }))
+    .filter(history => history.length);
+  if (!histories.length) return [];
+  const maxLength = Math.max(...histories.map(history => history.length));
+  const aggregate = [];
+  for (let index = 0; index < maxLength; index += 1) {
+    const values = histories
+      .map(history => history[Math.min(index, history.length - 1)])
+      .filter(Boolean);
+    if (!values.length) continue;
+    const anchor = values[values.length - 1];
+    aggregate.push({
+      ts: anchor.ts,
+      date: anchor.date,
+      virtual: roundMoney(avg(values.map(point => Number(point.virtual)))),
+      intraday: values.some(point => point.intraday),
+    });
+  }
+  return aggregate;
+}
+
 const SIGNAL_WEIGHT_LABELS = {
   rsi_momentum: "RSI Momentum",
   volume_surge: "Volume Surge",
@@ -2826,6 +2885,11 @@ export default function App() {
           today,
         })
     : null;
+  const selectedVariantChartData = selectedVariantMatchesTab && selectedVariantLedger
+    ? allStrategySelected
+      ? calculateAggregateEquityHistory(aggregateLedgerRows, today)
+      : normalizeLedgerEquityHistory({ detail: novaUniverse, ledger: selectedVariantLedger, today })
+    : [];
 
   const openLongPositions = selectedVariantMatchesTab && activeVariantBrain === "Vector"
     ? novaUniverseOpen.filter(t => (t.direction || "long") === "long")
@@ -2910,6 +2974,14 @@ export default function App() {
   const activeRealizedPnl = selectedVariantLedger?.realized_pnl != null
     ? Number(selectedVariantLedger.realized_pnl)
     : round2(activePortfolioBalance - activeStartingCash - activeOpenPnl);
+  const activeTotalPnl = selectedVariantLedger?.equity != null
+    ? round2(Number(selectedVariantLedger.equity) - activeStartingCash)
+    : round2(activePortfolioBalance - 1000);
+  const activeTotalPercent = activeStartingCash > 0 ? activeTotalPnl / activeStartingCash * 100 : 0;
+  const activeTotalUp = activeTotalPnl >= 0;
+  const activeChartData = selectedVariantMatchesTab && activeVariantBrain === "Vector" && selectedVariantChartData.length
+    ? selectedVariantChartData
+    : perfHistory;
 
   // perfFirst: baseline for percent gain calculation
   // 1D → yesterday's last settled balance (what we started today with)
@@ -2929,8 +3001,6 @@ export default function App() {
   })();
 
   const perfChange = activePortfolioBalance - perfFirst;
-  const perfPercent = perfFirst > 0 ? (perfChange / perfFirst * 100) : 0;
-  const perfUp = perfChange >= 0;
   const backendDayPnl = dayPnlStatus?.success ? Number(dayPnlStatus.display_day_pnl ?? dayPnlStatus.day_pnl ?? 0) : null;
   const marketState = dayPnlStatus?.market_state || null;
   const isLiveMarketSession = marketState === "open";
@@ -2944,7 +3014,6 @@ export default function App() {
     : backendDayPnl == null
       ? perfChange
       : backendDayPnl;
-  const activeDayUp = activeDayPnl >= 0;
   const selectedDayPnlModeLabel = selectedVariantMatchesTab && selectedVariantSession
     ? "last close"
     : dayPnlModeLabel;
@@ -2996,6 +3065,14 @@ export default function App() {
   const novaRealizedPnl = selectedVariantMatchesTab && activeVariantBrain === "Nova" && selectedVariantLedger?.realized_pnl != null
     ? Number(selectedVariantLedger.realized_pnl)
     : round2((novaUniverseBalance ?? Number(nnStats?.portfolio_value || 1000)) - novaStartingCash - novaOpenPnl);
+  const novaTotalPnl = selectedVariantMatchesTab && activeVariantBrain === "Nova" && selectedVariantLedger?.equity != null
+    ? round2(Number(selectedVariantLedger.equity) - novaStartingCash)
+    : round2((novaUniverseBalance ?? Number(nnStats?.portfolio_value || 1000)) - novaStartingCash);
+  const novaTotalPercent = novaStartingCash > 0 ? novaTotalPnl / novaStartingCash * 100 : 0;
+  const novaTotalUp = novaTotalPnl >= 0;
+  const novaChartData = selectedVariantMatchesTab && activeVariantBrain === "Nova" && selectedVariantChartData.length
+    ? selectedVariantChartData
+    : nnPerfHistory;
   const novaSessionPnl = selectedVariantMatchesTab && activeVariantBrain === "Nova" && selectedVariantSession
     ? selectedVariantSession.dayPnl
     : null;
@@ -3188,11 +3265,11 @@ export default function App() {
             </div>
 
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
-              <span style={{ fontSize: 13, fontWeight: 500, color: activeDayUp ? GREEN : RED }}>{perfUp ? "↑" : "↓"} {Math.abs(perfPercent).toFixed(2)}%</span>
-              <span style={{ fontSize: 12, color: T3 }}>{formatSignedCurrency(perfChange)}</span>
+              <span style={{ fontSize: 13, fontWeight: 500, color: activeTotalUp ? GREEN : RED }}>{activeTotalUp ? "↑" : "↓"} {Math.abs(activeTotalPercent).toFixed(2)}%</span>
+              <span style={{ fontSize: 12, color: T3 }}>{formatSignedCurrency(activeTotalPnl)}</span>
               <span style={{ fontSize: 10, color: T3 }}>(realized + open)</span>
             </div>
-            <MiniChart data={perfHistory} timeframe={perfTimeframe} feeAdjusted={feeAdjusted} />
+            <MiniChart data={activeChartData} timeframe={perfTimeframe} feeAdjusted={feeAdjusted} />
             <ProjectionLine projection={activeSimulationProjection} T3={T3} />
             <div style={{ display: "flex", alignItems: "center", marginTop: 8, position: "relative" }}>
               <div style={{ flex: 1, display: "flex", justifyContent: "center", gap: 4 }}>
@@ -3526,18 +3603,15 @@ export default function App() {
               </div>
 
               {(() => {
-                const nnFiltered = filterPerfHistoryForTimeframe(nnPerfHistory, nnPerfTimeframe);
+                const nnFiltered = filterPerfHistoryForTimeframe(novaChartData, nnPerfTimeframe);
                 const nnLast = novaUniverseBalance != null
                   ? novaUniverseBalance
                   : nnStats?.portfolio_value != null
                   ? Number(nnStats.portfolio_value)
                   : (nnFiltered[nnFiltered.length - 1]?.virtual || 1000);
-                const nnFirst = nnPerfTimeframe === "D"
-                  ? (selectedVariantSession?.previousClose ?? nnFiltered[0]?.virtual ?? nnLast)
-                  : (nnFiltered[0]?.virtual || 1000);
+                const nnFirst = selectedVariantSession?.previousClose ?? nnFiltered[0]?.virtual ?? nnLast;
                 const nnChange = novaSessionPnl == null ? round2(nnLast - nnFirst) : novaSessionPnl;
-                const nnPercent = nnFirst > 0 ? (nnChange / nnFirst * 100) : 0;
-                const nnUp = nnChange >= 0;
+                const nnUp = novaTotalUp;
                 return (
                   <div style={{ marginBottom: 14 }}>
                     <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 2 }}>
@@ -3552,11 +3626,11 @@ export default function App() {
                       </div>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
-                      <span style={{ fontSize: 13, fontWeight: 500, color: nnUp ? GREEN : RED }}>{nnUp ? "↑" : "↓"} {Math.abs(nnPercent).toFixed(2)}%</span>
-                      <span style={{ fontSize: 12, color: T3 }}>{formatSignedCurrency(nnChange)}</span>
+                      <span style={{ fontSize: 13, fontWeight: 500, color: novaTotalUp ? GREEN : RED }}>{novaTotalUp ? "↑" : "↓"} {Math.abs(novaTotalPercent).toFixed(2)}%</span>
+                      <span style={{ fontSize: 12, color: T3 }}>{formatSignedCurrency(novaTotalPnl)}</span>
                       <span style={{ fontSize: 10, color: T3 }}>(realized + open)</span>
                     </div>
-                    <MiniChart data={nnPerfHistory} timeframe={nnPerfTimeframe} feeAdjusted={feeAdjusted} />
+                    <MiniChart data={novaChartData} timeframe={nnPerfTimeframe} feeAdjusted={feeAdjusted} />
                     <ProjectionLine projection={novaSimulationProjection} T3={T3} />
                     <div style={{ display: "flex", alignItems: "center", marginTop: 8, position: "relative" }}>
                       <div style={{ flex: 1, display: "flex", justifyContent: "center", gap: 4 }}>
