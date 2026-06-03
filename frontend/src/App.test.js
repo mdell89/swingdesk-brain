@@ -2,6 +2,7 @@ import { render, screen } from '@testing-library/react';
 import App, {
   averageTradesByTicker,
   calculateAggregatePortfolio,
+  changedWeightDeltaRows,
   sortOpenTradesByMode,
 } from './App';
 
@@ -53,4 +54,17 @@ test('dedupes open trades by ticker and averages variant-specific values', () =>
   expect(averaged[0].current_value).toBe(16.7);
   expect(averaged[0].current_pnl_dollars).toBeCloseTo(1.7);
   expect(averaged[0].confidence).toBe(80);
+});
+
+test('formats changed signal weight deltas in percent points', () => {
+  const rows = changedWeightDeltaRows(
+    { rsi_momentum: 0.2174, volume_surge: 0.0887, vwap_reclaim: 0.0841 },
+    { rsi_momentum: 0.2095, volume_surge: 0.0939, vwap_reclaim: 0.0890 },
+  );
+
+  expect(rows.map(row => row.key)).toEqual(['rsi_momentum', 'volume_surge', 'vwap_reclaim']);
+  expect(rows[0].beforePct).toBeCloseTo(21.74);
+  expect(rows[0].afterPct).toBeCloseTo(20.95);
+  expect(rows[0].deltaPct).toBeCloseTo(-0.79);
+  expect(rows[1].deltaPct).toBeCloseTo(0.52);
 });

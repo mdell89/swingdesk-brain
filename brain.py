@@ -8081,7 +8081,6 @@ def api_audit_log():
         "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ? OFFSET ?",
         [limit if paged else 30, offset if paged else 0],
     ).fetchall()]
-    database.close()
     for row in rows:
         summary = (row.get("summary") or "").lower()
         if summary.startswith("audit failed:") or summary.startswith("local audit recorded") or "no configured llm provider" in summary:
@@ -8096,6 +8095,37 @@ def api_audit_log():
             row["provider_attempts"] = json.loads(row.get("provider_attempts") or "[]")
         except Exception:
             row["provider_attempts"] = []
+        prior = database.execute(
+            "SELECT timestamp FROM audit_log WHERE timestamp < ? ORDER BY timestamp DESC LIMIT 1",
+            [row.get("timestamp")]
+        ).fetchone()
+        prior_ts = prior["timestamp"] if prior else None
+        if prior_ts:
+            learning_rows = [dict(r) for r in database.execute("""
+                SELECT weights_before, weights_after
+                FROM variant_learning_events
+                WHERE timestamp > ? AND timestamp <= ?
+            """, [prior_ts, row.get("timestamp")]).fetchall()]
+        else:
+            learning_rows = [dict(r) for r in database.execute("""
+                SELECT weights_before, weights_after
+                FROM variant_learning_events
+                WHERE timestamp <= ?
+            """, [row.get("timestamp")]).fetchall()]
+        changed_count = 0
+        for event in learning_rows:
+            try:
+                before = json.loads(event.get("weights_before") or "{}")
+                after = json.loads(event.get("weights_after") or "{}")
+                if any(abs(float(before.get(k, 0) or 0) - float(after.get(k, 0) or 0)) > 0.000001 for k in canonical_signal_weights()):
+                    changed_count += 1
+            except Exception:
+                pass
+        row["prior_audit_timestamp"] = prior_ts
+        row["learning_events_since_prior"] = len(learning_rows)
+        row["learning_changed_events_since_prior"] = changed_count
+        row["learning_noop_events_since_prior"] = max(len(learning_rows) - changed_count, 0)
+    database.close()
     if paged:
         return jsonify({"rows": rows, "total": total, "limit": limit, "offset": offset})
     return jsonify(rows)

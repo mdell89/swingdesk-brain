@@ -685,6 +685,52 @@ function credibilityLabelForClosedTrades(sampleSize = 0) {
   return level === "New" ? "New sample" : `${level} sample`;
 }
 
+const SIGNAL_WEIGHT_LABELS = {
+  rsi_momentum: "RSI Momentum",
+  volume_surge: "Volume Surge",
+  overnight_gap_probability: "Overnight Gap",
+  earnings_catalyst: "Earnings Catalyst",
+  support_resistance: "S&R",
+  relative_strength: "Relative Strength",
+  sector_relative_strength: "Sector RS",
+  vwap_reclaim: "VWAP Reclaim",
+  volatility_squeeze: "Vol Squeeze",
+};
+
+const SIGNAL_WEIGHT_SHORT_LABELS = {
+  rsi_momentum: "RSI",
+  volume_surge: "VOL",
+  overnight_gap_probability: "GAP",
+  earnings_catalyst: "EARN",
+  support_resistance: "S&R",
+  relative_strength: "RS",
+  sector_relative_strength: "SECT",
+  vwap_reclaim: "VWAP",
+  volatility_squeeze: "SQZE",
+};
+
+function weightDeltaRows(before = {}, after = {}, labels = SIGNAL_WEIGHT_LABELS) {
+  return Object.keys(labels).map(key => {
+    const beforeValue = Number(before?.[key] || 0) * 100;
+    const afterValue = Number(after?.[key] || 0) * 100;
+    const delta = afterValue - beforeValue;
+    return {
+      key,
+      label: labels[key],
+      beforePct: beforeValue,
+      afterPct: afterValue,
+      deltaPct: delta,
+      changed: Math.abs(delta) > 0.0001,
+    };
+  });
+}
+
+function changedWeightDeltaRows(before = {}, after = {}, labels = SIGNAL_WEIGHT_LABELS) {
+  return weightDeltaRows(before, after, labels)
+    .filter(row => row.changed)
+    .sort((a, b) => Math.abs(b.deltaPct) - Math.abs(a.deltaPct));
+}
+
 function calculateSimulationProjection(trades = []) {
   const closed = trades.filter(t => t && t.outcome !== "open" && Number.isFinite(Number(t.actual_move)));
   const wins = closed.filter(t => Number(t.actual_move) > 0);
@@ -2202,9 +2248,11 @@ export {
   averageTradesByTicker,
   calculateAggregatePortfolio,
   calculateSimulationLedger,
+  changedWeightDeltaRows,
   getTradeOpenPnlDollars,
   getTradeOpenPnlPercent,
   sortOpenTradesByMode,
+  weightDeltaRows,
 };
 
 export default function App() {
@@ -2926,6 +2974,10 @@ export default function App() {
     : proofPendingLearningCount
       ? `${proofPendingLearningCount} pending`
       : "current";
+  const latestAuditEntry = auditLog[0] || null;
+  const latestAuditLearningTotal = Number(latestAuditEntry?.learning_events_since_prior || 0);
+  const latestAuditLearningChanged = Number(latestAuditEntry?.learning_changed_events_since_prior || 0);
+  const latestAuditLearningNoop = Number(latestAuditEntry?.learning_noop_events_since_prior || 0);
   const variantProofAttentionRows = Array.isArray(variantProof?.rows)
     ? variantProof.rows
       .filter(row => row.health === "attention" || !row.ledger_ok || row.evaluation_state === "evaluated_no_source_candidates")
@@ -4202,9 +4254,14 @@ export default function App() {
               {lastAuditSuccess === false
                 ? "Last audit failed. No weights were changed."
                 : lastAuditProvider
-                  ? `Last recap provider: ${lastAuditProvider}`
+                  ? `Last recap provider: ${lastAuditProvider}. Audit is read-only; ML learning runs separately at 7:00 PM Central.`
                   : `${learningTotal || learningEvents.length} ML events recorded. Next audit recap runs automatically.`}
             </div>
+            {latestAuditEntry && (
+              <div style={{ fontSize: 9, color: T3, marginTop: 6, fontFamily: "'DM Mono',monospace", lineHeight: 1.45 }}>
+                Latest recap interval: {latestAuditLearningChanged} changed · {latestAuditLearningNoop} no-op · {latestAuditLearningTotal} total ML events.
+              </div>
+            )}
           </div>
 
           {variantHealth && (
@@ -4383,9 +4440,14 @@ export default function App() {
                         <div style={{ fontSize: 8, color: T3, marginBottom: 3 }}>{new Date(entry.timestamp).toLocaleString()}</div>
                         <div style={{ color: auditSucceeded ? GREEN : RED, marginBottom: 3, fontWeight: 700 }}>
                           {auditSucceeded
-                            ? `LLM audit passed${entry.audit_provider ? ` via ${entry.audit_provider}` : ""}${entry.weights_changed === false ? " (weights unchanged)" : ""}`
+                            ? `LLM audit recap passed${entry.audit_provider ? ` via ${entry.audit_provider}` : ""} (read-only)`
                             : "LLM audit failed. Weights unchanged."}
                         </div>
+                        {auditSucceeded && (
+                          <div style={{ color: T3, marginBottom: 6, fontSize: 8, fontFamily: "'DM Mono',monospace" }}>
+                            ML since prior audit: {Number(entry.learning_changed_events_since_prior || 0)} changed · {Number(entry.learning_noop_events_since_prior || 0)} no-op · {Number(entry.learning_events_since_prior || 0)} total.
+                          </div>
+                        )}
                         <div style={{ color: T2, marginBottom: 6, lineHeight: 1.5 }}>{entry.summary || "Audit recorded."}</div>
                         <div style={{ display: "flex", gap: 8, color: T3, fontFamily: "'DM Mono',monospace", marginBottom: 6 }}>
                           <span>{entry.resolved_count || 0} resolved</span>
@@ -4403,7 +4465,7 @@ export default function App() {
                             const a = Math.round((after[k] || 0) * 100);
                             return { key: k, label: LABELS[k], b, a, delta: a - b };
                           }).filter(d => d.delta !== 0).sort((x, y) => Math.abs(y.delta) - Math.abs(x.delta));
-                          if (!diffs.length) return <div style={{ fontSize: 8, color: T3, marginBottom: 4 }}>No weight changes this audit.</div>;
+                          if (!diffs.length) return <div style={{ fontSize: 8, color: T3, marginBottom: 4 }}>Audit did not mutate weights. See ML Weight Adjustments for per-variant learning deltas.</div>;
                           return (
                             <div style={{ marginBottom: 6 }}>
                               {diffs.map(d => (
@@ -4465,19 +4527,16 @@ export default function App() {
               {learningEvents.length === 0 ? (
                 <div style={{ padding: "16px", color: T3, textAlign: "center", fontSize: 9 }}>No learning events yet - weights update once daily at 7:00 PM Central from closed trades.</div>
               ) : learningEvents.map((ev, i) => {
-                const LABELS = { rsi_momentum:"RSI", volume_surge:"VOL", overnight_gap_probability:"GAP", earnings_catalyst:"EARN", support_resistance:"S&R", relative_strength:"RS", sector_relative_strength:"SECT", vwap_reclaim:"VWAP", volatility_squeeze:"SQZE" };
                 const before = ev.weights_before || {};
                 const after = ev.weights_after || {};
-                const diffs = Object.keys(LABELS).map(k => ({
-                  k, label: LABELS[k],
-                  b: Math.round((before[k]||0)*100),
-                  a: Math.round((after[k]||0)*100),
-                  d: Math.round(((after[k]||0)-(before[k]||0))*100)
-                })).filter(x => x.d !== 0);
-                const isHit = ev.outcome === "hit";
+                const diffs = changedWeightDeltaRows(before, after, SIGNAL_WEIGHT_SHORT_LABELS);
+                const isHit = (ev.outcome || ev.trade_outcome) === "hit";
                 const ts = new Date(ev.timestamp);
                 const timeStr = ts.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
                 const dateStr = ts.toLocaleDateString([], {month:'short',day:'numeric'});
+                const noChangeReason = Array.isArray(ev.reasoning) && ev.reasoning.length
+                  ? ev.reasoning.slice(0, 3).join(" · ")
+                  : "No signal weight delta was recorded for this closed trade.";
                 return (
                   <div key={ev.id || i} style={{ padding: "7px 12px", borderBottom: `1px solid ${GREEN}15`, display: "flex", gap: 10, alignItems: "flex-start" }}>
                     {/* Timestamp */}
@@ -4505,18 +4564,23 @@ export default function App() {
                     {/* Weight diffs */}
                     <div style={{ flex: 1 }}>
                       {diffs.length === 0
-                        ? <span style={{ color: T3, fontSize: 7 }}>no change</span>
+                        ? (
+                          <div>
+                            <span style={{ color: T3, fontSize: 7, fontWeight: 800, textTransform: "uppercase" }}>no weight delta</span>
+                            <div style={{ marginTop: 3, color: T3, fontSize: 7, lineHeight: 1.4 }}>{noChangeReason}</div>
+                          </div>
+                        )
                         : diffs.map(d => (
-                          <span key={d.k} style={{ display: "inline-flex", alignItems: "center", gap: 2, marginRight: 6, marginBottom: 2 }}>
+                          <span key={d.key} style={{ display: "inline-flex", alignItems: "center", gap: 2, marginRight: 6, marginBottom: 2 }}>
                             <span style={{ color: T3 }}>{d.label}</span>
-                            <span style={{ color: T2 }}>{d.b}%</span>
+                            <span style={{ color: T2 }}>{d.beforePct.toFixed(2)}%</span>
                             <span style={{ color: T3 }}>→</span>
-                            <span style={{ color: T2 }}>{d.a}%</span>
-                            <span style={{ color: d.d > 0 ? GREEN : RED, fontWeight: 700 }}>{d.d > 0 ? "+" : ""}{d.d}%</span>
+                            <span style={{ color: T2 }}>{d.afterPct.toFixed(2)}%</span>
+                            <span style={{ color: d.deltaPct > 0 ? GREEN : RED, fontWeight: 700 }}>{d.deltaPct > 0 ? "+" : ""}{d.deltaPct.toFixed(2)}pp</span>
                           </span>
                         ))
                       }
-                      {Array.isArray(ev.reasoning) && ev.reasoning.length > 0 && (
+                      {diffs.length > 0 && Array.isArray(ev.reasoning) && ev.reasoning.length > 0 && (
                         <div style={{ marginTop: 3, color: T3, fontSize: 7, lineHeight: 1.4 }}>
                           {ev.reasoning.slice(0,3).join(" · ")}
                         </div>
