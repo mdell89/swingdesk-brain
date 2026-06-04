@@ -1,9 +1,22 @@
 """
-brain.py — Overnight Swing Desk Backend v19b (Push 47b)
+brain.py — Overnight Swing Desk Backend v20 (Push 48)
 ════════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 47b:
+Changes in Push 48:
+  - Fix CDT timezone: replaced hardcoded TIMEZONE_OFFSET with zoneinfo ZoneInfo("America/Chicago")
+    — current_time_cst() now handles CST/CDT automatically year-round
+  - Fix daily_history cache stripping: cache now stores full price data including daily_history
+    — restores all 9 signals (S&R, RS, Sector RS, Squeeze, RSI) from cached data
+  - Guard buy_price=0 at execution: skip trade insert if no valid price available
+  - Force-close price fallback chain: live fetch → quote cache (10min) → stored current_value → flag
+    — notifications now use fee_quote net_pnl, not raw pre-fee calculation
+    — buy_price=0 guard added to force-close path
+  - Sector system: get_sector() now checks DB cache before SECTOR_MAP
+    — fetch_and_cache_sector() fetches from Finnhub company profile
+    — /api/backfill-sectors endpoint for one-time universe-wide sector mapping
+
+Previous (Push 47b):
   - Switched from Twelve Data to Finnhub (free tier, 60 calls/min, no daily limit)
   - fetch_finnhub_quote(): single ticker quote — price, prev_close, OHLCV
   - fetch_finnhub_candles(): daily OHLCV history for RSI + confluence scoring
@@ -134,6 +147,7 @@ Confidence Floor:
 
 import os, json, sqlite3, time, logging, threading, random, math
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -167,7 +181,6 @@ MAX_ALL_VARIANT_OPEN_POSITIONS = 50
 ARCHIVED_VARIANT_OUTCOMES = ("archived_excess_open",)
 MODEL_STOP_LOSS_REASON = "model_stop_loss"
 LEGACY_STOP_LOSS_REASONS = {"stop_loss", MODEL_STOP_LOSS_REASON}
-TIMEZONE_OFFSET      = -5        # CST = UTC-5 (CDT during summer)
 MONITOR_INTERVAL     = 300       # 5 minutes in seconds
 SCAN_BATCH_SIZE      = 100       # Tickers per yfinance batch call
 
@@ -519,8 +532,8 @@ def nn_score_ticker(price_data_row, direction="long"):
 
 # ── TIME UTILITIES ────────────────────────────────────────────────────────────
 def current_time_cst():
-    """Returns current time adjusted to Central Standard Time."""
-    return datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
+    """Returns current time in US/Central — handles CST/CDT automatically."""
+    return datetime.now(ZoneInfo("America/Chicago")).replace(tzinfo=None)
 
 def is_weekday():
     """Returns True if today is a weekday (Mon-Fri)."""
@@ -733,8 +746,61 @@ SECTOR_MAP = {
 }
 
 def get_sector(ticker):
-    """Return the sector classification for a ticker, defaulting to 'Other'."""
+    """Return sector for ticker. Checks DB cache first, then SECTOR_MAP, then 'Other'."""
+    try:
+        db = get_database()
+        row = db.execute("SELECT value FROM app_state WHERE key=?",
+            [f"sector_{ticker}"]).fetchone()
+        db.close()
+        if row and row["value"] and row["value"] != "Other":
+            return row["value"]
+    except Exception:
+        pass
     return SECTOR_MAP.get(ticker, "Other")
+
+def fetch_and_cache_sector(ticker):
+    """
+    Fetch sector from Finnhub company profile and cache in DB permanently.
+    Falls back to SECTOR_MAP then 'Other'.
+    """
+    if not FINNHUB_KEY:
+        return SECTOR_MAP.get(ticker, "Other")
+    try:
+        import urllib.request
+        url = f"{FINNHUB_BASE}/stock/profile2?symbol={ticker}&token={FINNHUB_KEY}"
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            data = json.loads(resp.read())
+        finnhub_industry = data.get("finnhubIndustry") or ""
+        industry_map = {
+            "Technology": "Tech", "Semiconductors": "Tech",
+            "Software": "Tech", "Internet": "Tech", "Hardware": "Tech",
+            "Financial Services": "Finance", "Banks": "Finance",
+            "Insurance": "Finance", "Asset Management": "Finance",
+            "Energy": "Energy", "Oil & Gas": "Energy", "Utilities": "Energy",
+            "Healthcare": "Healthcare", "Biotechnology": "Healthcare",
+            "Pharmaceuticals": "Healthcare", "Medical Devices": "Healthcare",
+            "Industrials": "Industrial", "Aerospace": "Defense",
+            "Defense": "Defense", "Consumer Cyclical": "Consumer",
+            "Consumer Defensive": "Consumer", "Retail": "Consumer",
+            "Automotive": "Auto", "Electric Vehicles": "Auto",
+            "Crypto": "Crypto", "Digital Assets": "Crypto",
+            "Communication Services": "Tech", "Media": "Consumer",
+            "Real Estate": "Finance", "Materials": "Industrial",
+        }
+        sector = "Other"
+        for key, val in industry_map.items():
+            if key.lower() in finnhub_industry.lower():
+                sector = val
+                break
+        db = get_database()
+        db.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
+            [f"sector_{ticker}", sector])
+        db.commit()
+        db.close()
+        return sector
+    except Exception as e:
+        log.debug(f"Sector fetch failed for {ticker}: {e}")
+        return SECTOR_MAP.get(ticker, "Other")
 
 def build_ticker_universe():
     """
@@ -3391,7 +3457,9 @@ def fetch_finnhub_price_at_cst(ticker, target_dt_cst, resolution="5"):
         return None
     try:
         import urllib.request
-        target_utc = target_dt_cst - timedelta(hours=TIMEZONE_OFFSET)
+        # Localize naive Central time to proper timezone, then convert to UTC
+        central_aware = target_dt_cst.replace(tzinfo=ZoneInfo("America/Chicago"))
+        target_utc = central_aware.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
         from_ts = int((target_utc - timedelta(minutes=15)).timestamp())
         to_ts = int((target_utc + timedelta(minutes=20)).timestamp())
         target_ts = int(target_utc.timestamp())
@@ -3652,7 +3720,7 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
                 # Cache it
                 try:
                     database = get_database()
-                    cache_data = {k: v for k, v in results[ticker].items() if k != "daily_history"}
+                    cache_data = dict(results[ticker])
                     database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
                                      [f"cache_{ticker}", json.dumps({
                                          "fetched_at": current_time_cst().isoformat(),
@@ -6516,6 +6584,12 @@ def execute_opening_positions(trigger="scheduled", buy_time="08:45:00"):
 
             raw_price = current_prices.get(ticker)
             buy_price = (raw_price["price"] if isinstance(raw_price, dict) else raw_price) or pick.get("open_price") or pick.get("price") or 0
+            if not buy_price or buy_price <= 0:
+                log.warning(f"Skipping {ticker} — no valid buy price at execution (price fetch failed)")
+                existing.close()
+                status["skipped_count"] += 1
+                status["skipped"].append({"ticker": ticker, "reason": "no_valid_buy_price"})
+                continue
             confidence = pick.get("long_conf") if direction == "long" else pick.get("short_conf")
             expected_move = pick.get("long_move") if direction == "long" else pick.get("short_move")
             reasoning = pick.get("long_reasoning", "") if direction == "long" else pick.get("short_reasoning", "")
@@ -7323,14 +7397,38 @@ def force_close_previous_session():
 
     for position in previous_session_positions:
         ticker = position["ticker"]
+        buy_price = float(position.get("buy_price") or 0)
+        invested = float(position.get("invested_amount") or DEFAULT_INVESTMENT)
+
+        # Price resolution: live fetch → quote cache → last stored current_value → flag
         raw = current_prices.get(ticker)
-        price = raw["price"] if isinstance(raw, dict) else (raw or position.get("buy_price", 0))
-        buy_price = position["buy_price"]
-        invested = position["invested_amount"] or DEFAULT_INVESTMENT
+        if raw and (raw.get("price") if isinstance(raw, dict) else raw):
+            price = float(raw["price"] if isinstance(raw, dict) else raw)
+            price_source = "live"
+        else:
+            cached = _read_quote_cache(ticker, max_age_seconds=600)
+            if cached and cached.get("price"):
+                price = float(cached["price"])
+                price_source = "quote_cache"
+            elif position.get("current_value") and buy_price > 0:
+                price = float(position["current_value"]) / max(invested, 0.01) * buy_price
+                price_source = "stored_value"
+            else:
+                log.warning(f"Force-close {ticker}: no price available — flagging for manual review")
+                database.execute(
+                    "UPDATE virtual_trades SET sell_reason=? WHERE id=?",
+                    ["forced_close_no_price", position["id"]]
+                )
+                send_close_notification(ticker, 0.0, 0.0, "force close 2:45 PM — price unavailable, verify manually")
+                continue
+
+        if buy_price <= 0:
+            log.warning(f"Force-close {ticker}: buy_price is zero — skipping")
+            continue
+
         pnl_percent = (price - buy_price) / buy_price * 100
         if position["direction"] == "short":
             pnl_percent = -pnl_percent
-        pnl_dollars = invested * (pnl_percent / 100)
         fee_quote = calculate_stock_fee_model(invested, buy_price, price, position["direction"])
         ending_value = fee_quote["net_current_value"]
         outcome = "hit" if pnl_percent >= MIN_EXPECTED_MOVE else ("partial" if pnl_percent > 0 else "miss")
@@ -7355,11 +7453,12 @@ def force_close_previous_session():
         # Add ending value to queue — this is where compounding happens
         add_to_queue_on_connection(database, ending_value, position["id"])
         closed_count += 1
+        log.info(f"Force-closed {ticker} | {price_source} | {pnl_percent:+.1f}% | ${fee_quote['net_pnl']:+.2f}")
 
         # Send SMS notification
         send_close_notification(
-            ticker, round(pnl_dollars, 2), round(pnl_percent, 1),
-            "force closed in profit at 2:45 PM"
+            ticker, round(float(fee_quote["net_pnl"]), 2), round(pnl_percent, 1),
+            "force closed 2:45 PM"
         )
 
     database.commit()
@@ -10248,6 +10347,39 @@ def api_fix_buy_prices():
     except Exception as e:
         log.error(f"Fix buy prices error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+# ── SECTOR BACKFILL ──────────────────────────────────────────────────────────
+@app.route("/api/backfill-sectors", methods=["POST"])
+def api_backfill_sectors():
+    """
+    One-time backfill: fetch and cache Finnhub sector for all universe tickers.
+    Runs ~500 calls at 1.1s each — takes ~10 minutes. Call once, cached forever.
+    """
+    def _run():
+        universe = build_ticker_universe()
+        total = len(universe)
+        done = 0
+        updated = 0
+        for ticker in universe:
+            try:
+                existing = get_sector(ticker)
+                if existing != "Other":
+                    done += 1
+                    continue
+                sector = fetch_and_cache_sector(ticker)
+                if sector != "Other":
+                    updated += 1
+                time.sleep(1.1)
+            except Exception as e:
+                log.debug(f"Sector backfill skip {ticker}: {e}")
+            done += 1
+            if done % 50 == 0:
+                log.info(f"Sector backfill progress: {done}/{total} ({updated} mapped)")
+        log.info(f"Sector backfill complete: {updated}/{total} tickers mapped")
+        set_app_state("sector_backfill_done", current_time_cst().isoformat())
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"success": True, "message": "Sector backfill running in background. Check logs."})
 
 # ── BACKFILL TAGS ─────────────────────────────────────────────────────────────
 @app.route("/api/reprice-open-entries", methods=["POST"])
