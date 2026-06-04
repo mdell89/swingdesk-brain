@@ -1,9 +1,20 @@
 """
-brain.py — Overnight Swing Desk Backend v22 (Push 50)
+brain.py — Overnight Swing Desk Backend v23 (Push 51)
 ════════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 50:
+Changes in Push 51:
+  - Fix RSI to use Wilder's smoothed moving average — matches TradingView, Finviz,
+    and all standard implementations. Previous simple average diverged at extremes
+    where the 40/65 scoring thresholds fire.
+  - Remove dead duplicate fetch_current_prices definition — first copy was silently
+    shadowed by the second. Eliminates confusion for anyone reading the code.
+  - Fix dynamic confidence during monitoring — both primary and NN monitors now pull
+    daily_history from scan cache so RSI/S&R/RS/Sector RS/Squeeze compute from real
+    data instead of always returning neutral 0.5. Sell decisions based on confidence
+    changes during the day are now meaningful for the first time.
+
+Previous (Push 50):
   - Fix minutes_until_forced_close() to return 0 instead of negative after 2:45 PM
     — prevents downstream logic from using meaningless negative values
   - Add end-of-day equity snapshot job at 2:50 PM CST for all active variants
@@ -3767,27 +3778,6 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
 
 def fetch_current_prices(tickers, pin_to_845=False):
     """
-    Fetch current prices for monitoring.
-    Uses Finnhub /quote endpoint per ticker.
-    Returns {ticker: {"price": float, "day_change_pct": float}}
-    """
-    if not tickers:
-        return {}
-
-    if pin_to_845:
-        # For 8:45 AM entry price — use last available quote as approximation
-        results = {}
-        for ticker in tickers:
-            quote = fetch_finnhub_quote(ticker)
-            if quote:
-                results[ticker] = {"price": quote["price"], "day_change_pct": 0}
-            time.sleep(1.1)
-        return results
-
-    return fetch_twelve_data_live(tickers)
-
-def fetch_current_prices(tickers, pin_to_845=False):
-    """
     Fetch current prices for monitoring, or true 8:45 AM candle entries.
     Returns {ticker: {"price": float, "day_change_pct": float}}.
     """
@@ -3827,10 +3817,14 @@ def fetch_current_prices(tickers, pin_to_845=False):
 
 def calculate_rsi_batch(tickers, period=14, price_data=None):
     """
-    Calculate RSI for multiple tickers.
+    Calculate RSI for multiple tickers using Wilder's smoothed moving average.
     Uses daily_history already in price_data when available.
     Missing history defaults to neutral RSI instead of doing hundreds of
     per-ticker provider calls inside the scan hot path.
+
+    Wilder's method: first avg is simple, subsequent values use exponential
+    smoothing: avg = (prev_avg * (period-1) + current) / period
+    This matches TradingView, Finviz, and all standard RSI implementations.
     """
     rsi_values = {}
 
@@ -3850,14 +3844,18 @@ def calculate_rsi_batch(tickers, period=14, price_data=None):
             gains = [max(c, 0) for c in changes]
             losses = [max(-c, 0) for c in changes]
 
-            avg_gain = sum(gains[-period:]) / period
-            avg_loss = sum(losses[-period:]) / period
+            # Wilder's smoothed RSI: seed with simple average, then smooth
+            avg_gain = sum(gains[:period]) / period
+            avg_loss = sum(losses[:period]) / period
+            for i in range(period, len(gains)):
+                avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+                avg_loss = (avg_loss * (period - 1) + losses[i]) / period
 
             if avg_loss == 0:
                 rsi_values[ticker] = 100.0
             else:
                 rs = avg_gain / avg_loss
-                rsi_values[ticker] = 100 - (100 / (1 + rs))
+                rsi_values[ticker] = round(100 - (100 / (1 + rs)), 2)
         except:
             rsi_values[ticker] = 50.0
 
@@ -6964,6 +6962,17 @@ def monitor_nn_open_positions():
                 "gap_percent": price_data.get("gap_percent", 0),
                 "day_change_percent": day_change_pct,
             }}
+            # Pull daily_history from scan cache so RSI/S&R/RS/Squeeze compute from real data
+            try:
+                _cache_row = database.execute(
+                    "SELECT value FROM app_state WHERE key=?", [f"cache_{ticker}"]
+                ).fetchone()
+                if _cache_row:
+                    _cached = json.loads(_cache_row["value"]).get("data") or {}
+                    if _cached.get("daily_history"):
+                        price_data_for_dynamic[ticker]["daily_history"] = _cached["daily_history"]
+            except Exception:
+                pass
             weights = get_signal_weights()
             earnings = check_upcoming_earnings([ticker])
             rsi_val = calculate_rsi_batch([ticker], price_data=price_data_for_dynamic).get(ticker, 50.0)
@@ -7196,6 +7205,18 @@ def _monitor_open_positions_impl():
                 "day_change_percent": day_change_pct,
             }
         }
+        # Pull daily_history from scan cache so RSI/S&R/RS/Squeeze compute from real data
+        # during monitoring instead of always returning neutral 0.5 defaults
+        try:
+            _cache_row = database.execute(
+                "SELECT value FROM app_state WHERE key=?", [f"cache_{ticker}"]
+            ).fetchone()
+            if _cache_row:
+                _cached = json.loads(_cache_row["value"]).get("data") or {}
+                if _cached.get("daily_history"):
+                    price_data_for_dynamic[ticker]["daily_history"] = _cached["daily_history"]
+        except Exception:
+            pass
         try:
             weights = get_signal_weights()
             earnings_soon = check_upcoming_earnings([ticker])
