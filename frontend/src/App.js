@@ -11,8 +11,14 @@ const formatSellReason = reason => {
 };
 
 /*
- * Overnight Swing Desk — Frontend v33 (Push 56)
+ * Overnight Swing Desk — Frontend v34 (Push 57)
  * ══════════════════════════════════════════════
+ * Changes in Push 57:
+ *   - Fix Nova initialization: setNovaUniverse now loads Nova data first, not Vector
+ *   - Fix Day's P&L: removed Vector-only gate so all variants use their own session
+ *     calculation instead of falling through to backend (which only knows Vector trades)
+ *   - formatSellReason: forced_close_no_price label for flagged trades
+ *
  * Changes in Push 56:
  *   - Analytics: added Profitable rate (hits + partials / total) and Avg partial stats
  *   - Analytics: partials count now shown alongside hits and misses
@@ -2606,7 +2612,7 @@ export default function App() {
           ...(vectorUniverseData?.variant?.id ? { [vectorUniverseData.variant.id]: vectorUniverseData } : {}),
           ...(novaUniverseData?.variant?.id ? { [novaUniverseData.variant.id]: novaUniverseData } : {}),
         });
-        setNovaUniverse(vectorUniverseData || novaUniverseData);
+        setNovaUniverse(novaUniverseData || vectorUniverseData);
 
         setLoadStatus("Ready"); setLoadProgress(100);
       } catch (error) {
@@ -3017,7 +3023,7 @@ export default function App() {
     : isLiveMarketSession
       ? "live"
       : null;
-  const activeDayPnl = selectedVariantMatchesTab && activeVariantBrain === "Vector" && selectedVariantSession
+  const activeDayPnl = selectedVariantMatchesTab && selectedVariantSession
     ? selectedVariantSession.dayPnl
     : backendDayPnl == null
       ? perfChange
