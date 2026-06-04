@@ -4,14 +4,21 @@ const MODEL_STOP_LOSS_REASONS = new Set(["model_stop_loss", "stop_loss"]);
 const isModelStopLoss = reason => MODEL_STOP_LOSS_REASONS.has(reason);
 const formatSellReason = reason => {
   if (reason === "forced_close") return "Force closed 2:45 PM";
+  if (reason === "forced_close_no_price") return "Force closed — price unavailable";
   if (reason === "cut_loss") return "Cut at loss";
   if (isModelStopLoss(reason)) return "Model stop loss";
   return reason ? reason.replace(/_/g, " ") : "Closed";
 };
 
 /*
- * Overnight Swing Desk — Frontend v32 (Push 55)
+ * Overnight Swing Desk — Frontend v33 (Push 56)
  * ══════════════════════════════════════════════
+ * Changes in Push 56:
+ *   - Analytics: added Profitable rate (hits + partials / total) and Avg partial stats
+ *   - Analytics: partials count now shown alongside hits and misses
+ *   - Score Context tray: added muted note explaining signal percentages
+ *   - formatSellReason: added forced_close_no_price label for flagged trades
+ *
  * Changes in Push 55:
  *   - ScanPanel in Brain tab: full-width scan trigger, live ticker chips,
  *     progress bar, phase labels, warning note, polling at 1.2s
@@ -1293,7 +1300,8 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
             </div>
             {showScoreContext && (
               <div style={{ padding: "7px 8px", background: "#111113", border: `1px solid ${BORDER}`, borderRadius: 7 }}>
-                <div style={{ fontSize: 8, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .5, marginBottom: 6 }}>Score Context</div>
+                <div style={{ fontSize: 8, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .5, marginBottom: 4 }}>Score Context</div>
+                <div style={{ fontSize: 7, color: T3, fontStyle: "italic", marginBottom: 6, lineHeight: 1.4, opacity: 0.7 }}>0–100% per signal. Signals at 50% with no highlight had insufficient data.</div>
                 {!hasSignalScores ? (
                   <div style={{ fontSize: 9, color: T3, lineHeight: 1.45, padding: "3px 1px" }}>
                     Signal-score payload is missing on this cached pick. Fresh full scans after the backend deploy will populate this tray.
@@ -3910,9 +3918,12 @@ export default function App() {
           {(() => {
             const closedTrades = analyticsVariantTrades.filter(t => t.outcome !== "open");
             const hits = closedTrades.filter(t => t.outcome === "hit");
+            const partials = closedTrades.filter(t => t.outcome === "partial");
             const misses = closedTrades.filter(t => t.outcome === "miss");
             const winRate = closedTrades.length > 0 ? Math.round(hits.length / closedTrades.length * 100) : null;
+            const profitableRate = closedTrades.length > 0 ? Math.round((hits.length + partials.length) / closedTrades.length * 100) : null;
             const avgWin = hits.length > 0 ? hits.reduce((s, t) => s + getClosedTradePnlPercent(t), 0) / hits.length : null;
+            const avgPartial = partials.length > 0 ? partials.reduce((s, t) => s + getClosedTradePnlPercent(t), 0) / partials.length : null;
             const avgLoss = misses.length > 0 ? misses.reduce((s, t) => s + getClosedTradePnlPercent(t), 0) / misses.length : null;
             const expectancy = closedTrades.length && avgWin !== null && avgLoss !== null
               ? (hits.length / closedTrades.length) * avgWin + (misses.length / closedTrades.length) * avgLoss
@@ -3934,12 +3945,15 @@ export default function App() {
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 16 }}>
                   {[
                     ["Win rate", winRate !== null ? `${winRate}%` : "—", winRate >= 60 ? GREEN : winRate >= 45 ? AMBER : T2],
+                    ["Profitable", profitableRate !== null ? `${profitableRate}%` : "—", profitableRate >= 60 ? GREEN : profitableRate >= 45 ? AMBER : T2],
                     ["Avg win", avgWin !== null ? `+${avgWin.toFixed(1)}%` : "—", GREEN],
+                    ["Avg partial", avgPartial !== null ? `+${avgPartial.toFixed(1)}%` : "—", AMBER],
                     ["Avg loss", avgLoss !== null ? `${avgLoss.toFixed(1)}%` : "—", RED],
                     ["Expectancy", expectancy !== null ? `${expectancy >= 0 ? "+" : ""}${expectancy.toFixed(2)}%` : "-", expectancy == null ? T2 : expectancy >= 0 ? GREEN : RED],
                     ["Avg R", avgR !== null ? `${avgR.toFixed(2)}R` : "-", avgR == null ? T2 : avgR >= 1 ? GREEN : AMBER],
                     ["Total trades", closedTrades.length, T1],
                     ["Hits", hits.length, GREEN],
+                    ["Partials", partials.length, AMBER],
                     ["Misses", misses.length, RED],
                   ].map(([label, value, color]) => (
                     <div key={label} style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 12px" }}>
