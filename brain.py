@@ -1,9 +1,17 @@
 """
-brain.py — Overnight Swing Desk Backend v20 (Push 48)
+brain.py — Overnight Swing Desk Backend v21 (Push 49)
 ════════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 48:
+Changes in Push 49:
+  - Remove refresh_variant_open_quotes from /api/variant/<id> — eliminates 20-second
+    variant switch delay caused by live Finnhub calls per open position
+  - Fix execution-time signal snapshot: now reads cached price data (with daily_history)
+    from scan cache instead of building empty-history dict. All 9 signals now stored
+    correctly on every trade, enabling the learning loop to actually learn from
+    S&R, RS, Sector RS, and Squeeze outcomes for the first time.
+
+Previous (Push 48):
   - Fix CDT timezone: replaced hardcoded TIMEZONE_OFFSET with zoneinfo ZoneInfo("America/Chicago")
     — current_time_cst() now handles CST/CDT automatically year-round
   - Fix daily_history cache stripping: cache now stores full price data including daily_history
@@ -6458,13 +6466,32 @@ def _execute_opening_positions_legacy():
         try:
             _weights = get_signal_weights()
             _earnings = check_upcoming_earnings([ticker])
-            _open_price_data = {ticker: {
-                "price": buy_price,
-                "volume_ratio": pick.get("vol_ratio", 1.0),
-                "gap_percent": pick.get("overnight_gap_pct", 0),
-                "day_change_percent": pick.get("day_change_pct", 0),
-                "daily_history": [],
-            }}
+            # Pull real cached price data (with daily_history) from scan cache
+            _cached_row = existing.execute(
+                "SELECT value FROM app_state WHERE key=?", [f"cache_{ticker}"]
+            ).fetchone()
+            if _cached_row:
+                try:
+                    _cached_payload = json.loads(_cached_row["value"])
+                    _cached_data = _cached_payload.get("data") or {}
+                    _cached_data["price"] = buy_price  # pin to execution price
+                    _open_price_data = {ticker: _cached_data}
+                except Exception:
+                    _open_price_data = {ticker: {
+                        "price": buy_price,
+                        "volume_ratio": pick.get("vol_ratio", 1.0),
+                        "gap_percent": pick.get("overnight_gap_pct", 0),
+                        "day_change_percent": pick.get("day_change_pct", 0),
+                        "daily_history": [],
+                    }}
+            else:
+                _open_price_data = {ticker: {
+                    "price": buy_price,
+                    "volume_ratio": pick.get("vol_ratio", 1.0),
+                    "gap_percent": pick.get("overnight_gap_pct", 0),
+                    "day_change_percent": pick.get("day_change_pct", 0),
+                    "daily_history": [],
+                }}
             _sig_scores, _fired, _values = compute_signal_scores(ticker, _open_price_data, pick.get("rsi", 50.0), _earnings, _weights, direction)
             _signal_scores_json = json.dumps({"scores": _sig_scores, "fired": _fired, "values": _values})
         except:
@@ -6601,13 +6628,32 @@ def execute_opening_positions(trigger="scheduled", buy_time="08:45:00"):
             try:
                 _weights = get_signal_weights()
                 _earnings = check_upcoming_earnings([ticker])
-                _open_price_data = {ticker: {
-                    "price": buy_price,
-                    "volume_ratio": pick.get("vol_ratio", 1.0),
-                    "gap_percent": pick.get("overnight_gap_pct", 0),
-                    "day_change_percent": pick.get("day_change_pct", 0),
-                    "daily_history": [],
-                }}
+                # Pull real cached price data (with daily_history) from scan cache
+                _cached_row = existing.execute(
+                    "SELECT value FROM app_state WHERE key=?", [f"cache_{ticker}"]
+                ).fetchone()
+                if _cached_row:
+                    try:
+                        _cached_payload = json.loads(_cached_row["value"])
+                        _cached_data = _cached_payload.get("data") or {}
+                        _cached_data["price"] = buy_price  # pin to execution price
+                        _open_price_data = {ticker: _cached_data}
+                    except Exception:
+                        _open_price_data = {ticker: {
+                            "price": buy_price,
+                            "volume_ratio": pick.get("vol_ratio", 1.0),
+                            "gap_percent": pick.get("overnight_gap_pct", 0),
+                            "day_change_percent": pick.get("day_change_pct", 0),
+                            "daily_history": [],
+                        }}
+                else:
+                    _open_price_data = {ticker: {
+                        "price": buy_price,
+                        "volume_ratio": pick.get("vol_ratio", 1.0),
+                        "gap_percent": pick.get("overnight_gap_pct", 0),
+                        "day_change_percent": pick.get("day_change_pct", 0),
+                        "daily_history": [],
+                    }}
                 _sig_scores, _fired, _values = compute_signal_scores(
                     ticker, _open_price_data, pick.get("rsi", 50.0),
                     _earnings, _weights, direction
@@ -6759,13 +6805,32 @@ def execute_nn_opening_positions(trigger="scheduled", buy_time="08:45:00"):
             try:
                 weights = get_signal_weights()
                 earnings = check_upcoming_earnings([ticker])
-                open_price_data = {ticker: {
-                    "price": buy_price,
-                    "volume_ratio": pick.get("vol_ratio", 1.0),
-                    "gap_percent": pick.get("overnight_gap_pct", 0),
-                    "day_change_percent": pick.get("day_change_pct", 0),
-                    "daily_history": [],
-                }}
+                # Pull real cached price data (with daily_history) from scan cache
+                _cached_row = existing.execute(
+                    "SELECT value FROM app_state WHERE key=?", [f"cache_{ticker}"]
+                ).fetchone()
+                if _cached_row:
+                    try:
+                        _cached_payload = json.loads(_cached_row["value"])
+                        _cached_data = _cached_payload.get("data") or {}
+                        _cached_data["price"] = buy_price  # pin to execution price
+                        open_price_data = {ticker: _cached_data}
+                    except Exception:
+                        open_price_data = {ticker: {
+                            "price": buy_price,
+                            "volume_ratio": pick.get("vol_ratio", 1.0),
+                            "gap_percent": pick.get("overnight_gap_pct", 0),
+                            "day_change_percent": pick.get("day_change_pct", 0),
+                            "daily_history": [],
+                        }}
+                else:
+                    open_price_data = {ticker: {
+                        "price": buy_price,
+                        "volume_ratio": pick.get("vol_ratio", 1.0),
+                        "gap_percent": pick.get("overnight_gap_pct", 0),
+                        "day_change_percent": pick.get("day_change_pct", 0),
+                        "daily_history": [],
+                    }}
                 sig_scores, fired, sig_values = compute_signal_scores(
                     ticker, open_price_data, pick.get("rsi", 50.0), earnings, weights, direction
                 )
@@ -9146,9 +9211,6 @@ def api_variant_detail(variant_id):
             return jsonify({"error": "variant not found"}), 404
         portfolio = db.execute("SELECT * FROM variant_portfolios WHERE variant_id=?", [variant_id]).fetchone()
         weights = db.execute("SELECT * FROM variant_signal_weights WHERE variant_id=?", [variant_id]).fetchone()
-        refresh_variant_open_quotes(db, variant_id)
-        db.commit()
-        portfolio = db.execute("SELECT * FROM variant_portfolios WHERE variant_id=?", [variant_id]).fetchone()
         trades = [dict(r) for r in db.execute("""
             SELECT * FROM variant_virtual_trades
             WHERE variant_id=?
@@ -9160,7 +9222,7 @@ def api_variant_detail(variant_id):
             SELECT * FROM variant_equity_points
             WHERE variant_id=?
             ORDER BY timestamp DESC
-            LIMIT 200
+            LIMIT 500
         """, [variant_id]).fetchall()]
         db.close()
         payload = {
