@@ -11,8 +11,14 @@ const formatSellReason = reason => {
 };
 
 /*
- * Overnight Swing Desk — Frontend v35 (Push 58)
+ * Overnight Swing Desk — Frontend v36 (Push 59)
  * ══════════════════════════════════════════════
+ * Changes in Push 59:
+ *   - Day's P&L shows "—" when no prior-day equity baseline exists instead of
+ *     showing misleading lifetime total (glass house: don't display wrong data)
+ *   - Variant dropdown: "5:00 / All" → "5:00" — the time IS the variant, /All is noise
+ *   - Hardcoded "8:45 / All" fallback labels cleaned up across all headers
+ *
  * Changes in Push 58:
  *   - Rename "Method confluence" → "Confluence tags" across all card types
  *   - Add qualified_variants tags on pick cards (glass house): shows which
@@ -175,6 +181,39 @@ function mapPickFields(pick) {
     st: pick.sell_time,
     dayChg: getDisplayDayChangePercent(pick),
   };
+}
+
+function normalizeVariantPreviewPick(pick, variantRow = {}) {
+  const confidence = Number(pick?.confidence ?? pick?.long_conf ?? pick?.nn_score ?? 0);
+  const expectedMove = Number(pick?.move ?? pick?.long_move ?? pick?.expected_move ?? 0);
+  const displayDayChange = getDisplayDayChangePercent(pick);
+  return mapPickFields({
+    ...pick,
+    strategy: pick?.strategy || variantRow.strategy,
+    confluence_methods: pick?.confluence_methods || [variantRow.strategy].filter(Boolean),
+    long_conf: Number.isFinite(confidence) ? confidence : 0,
+    long_move: Number.isFinite(expectedMove) ? expectedMove : 0,
+    pct_change_prev_close: displayDayChange,
+    day_change_pct: displayDayChange,
+    source_variant_count: pick?.source_variant_count || 1,
+    qualified_variant_count: pick?.qualified_variant_count || 1,
+  });
+}
+
+function buildVariantPreviewPicks(variantRow, openTickers = new Set()) {
+  if (!variantRow || !Array.isArray(variantRow.qualified_preview)) {
+    return { hasPreview: false, picks: [] };
+  }
+  const picks = variantRow.qualified_preview
+    .filter(pick => pick?.ticker)
+    .filter(pick => Number(pick.confidence ?? pick.long_conf ?? pick.nn_score ?? 0) >= 65)
+    .map(pick => normalizeVariantPreviewPick(pick, variantRow))
+    .filter(pick => !openTickers.has(pick.ticker));
+  return { hasPreview: true, picks };
+}
+
+function cleanVariantDisplayLabel(label = "") {
+  return String(label || "").replace(/\s+\/\s+All$/i, "");
 }
 
 // ─── SENTIMENT ENGINE ─────────────────────────────────────────────────────────
@@ -678,13 +717,19 @@ function calculateLedgerSessionPnl({ equityPoints = [], currentEquity = 1000, st
   const priorPoint = sessionDate
     ? [...points].reverse().find(point => equityPointDate(point) < sessionDate)
     : null;
-  const previousClose = priorPoint ? Number(priorPoint.equity || startingCash || 1000) : Number(startingCash || 1000);
+  // Glass house: if no real prior-day equity point exists, dayPnl is unknown.
+  // Return null so the UI shows "—" instead of a misleading lifetime total.
+  // The EOD snapshot job writes a daily baseline at 2:50 PM; once that exists,
+  // next session's dayPnl will be real.
+  const hasPriorDay = !!priorPoint;
+  const previousClose = hasPriorDay ? Number(priorPoint.equity || startingCash || 1000) : Number(startingCash || 1000);
   return {
     currentEquity: roundMoney(current),
     previousClose: roundMoney(previousClose),
     sessionDate: sessionDate || null,
     previousCloseDate: priorPoint ? equityPointDate(priorPoint) : null,
-    dayPnl: roundMoney(current - previousClose),
+    dayPnl: hasPriorDay ? roundMoney(current - previousClose) : null,
+    hasPriorDay,
   };
 }
 
@@ -698,13 +743,25 @@ function calculateAggregateSessionPnl(rows = [], today) {
     }))
     .filter(session => Number.isFinite(Number(session.currentEquity)) && Number.isFinite(Number(session.previousClose)));
   if (!sessions.length) return null;
+  const allSessionsHavePriorDay = sessions.every(session => session.hasPriorDay);
   const currentEquity = avg(sessions.map(session => session.currentEquity));
+  if (!allSessionsHavePriorDay) {
+    return {
+      currentEquity: roundMoney(currentEquity),
+      previousClose: null,
+      previousCloseDate: null,
+      dayPnl: null,
+      hasPriorDay: false,
+      universeCount: sessions.length,
+    };
+  }
   const previousClose = avg(sessions.map(session => session.previousClose));
   return {
     currentEquity: roundMoney(currentEquity),
     previousClose: roundMoney(previousClose),
     previousCloseDate: null,
     dayPnl: roundMoney(currentEquity - previousClose),
+    hasPriorDay: true,
     universeCount: sessions.length,
   };
 }
@@ -1220,7 +1277,6 @@ const METHOD_DEFINITIONS = {
   "Gap & Go": "The gap shows conviction from overnight buyers — momentum tends to continue intraday. Stocks that gap up more than 2% at open with strong volume have institutional participation behind the move.",
   "Donchian": "Richard Donchian's channel system identifies genuine breakouts from recent ranges. Price breaking above the highest high of the last 20 days signals the stock is trading at levels not seen in 4 weeks.",
   "Inside Day": "Compression before expansion — the tighter the coil, the stronger the spring. Today's price range fits entirely within yesterday's range, then breaks out upward.",
-  "NR7": "Larry Connors popularized this as a reliable breakout precursor. The narrowest trading range of the last 7 days signals volatility contraction — which historically precedes volatility expansion.",
   "Bull Flag": "The flag is a pause, not a reversal — bulls are catching their breath before the next leg. A strong 5-day move up followed by tight consolidation today signals continuation.",
   "Pocket Pivot": "Gil Morales developed this to identify institutional buying before a breakout. An up day with volume exceeding any down day's volume over the last 10 sessions shows smart money accumulating.",
   "S&R": "ATR-adaptive support and resistance zone analysis. The brain identifies swing highs and lows over 60 days, clusters them into zones using Average True Range as the ruler, and scores based on overhead supply. Open air above current price means no resistance in range — nothing to stop the move.",
@@ -2499,13 +2555,11 @@ export default function App() {
     "Gap & Go",
     "VWAP Reclaim",
     "Inside Day",
-    "NR7",
     "Bull Flag",
     "Pocket Pivot",
     "Vol Squeeze Breakout",
     "Relative Strength Pullback",
     "EMA Trend Pullback",
-    "Opening Range Hold",
   ];
   const [expandedCards, setExpandedCards] = useState({});
   const [doneCuts, setDoneCuts] = useState({});
@@ -2926,8 +2980,8 @@ export default function App() {
   const activeVariantLabel = allStrategySelected
     ? `All Strategies / ${activeVariantBrain} / All`
     : selectedVariantMatchesTab && novaUniverse?.variant?.label
-      ? novaUniverse.variant.label
-      : `SwingDesk / ${activeVariantBrain} / 8:45 / All`;
+      ? cleanVariantDisplayLabel(novaUniverse.variant.label)
+      : `SwingDesk / ${activeVariantBrain} / 8:45`;
   const analyticsVariantTrades = selectedVariantMatchesTab ? rawSelectedVariantTrades : virtualTrades;
   const analyticsVariantLabel = selectedVariantMatchesTab ? activeVariantLabel : "Legacy SwingDesk";
   const selectedVariantLedger = selectedVariantMatchesTab
@@ -2999,13 +3053,22 @@ export default function App() {
     .filter(t => !dismissedClosed[t.id]);
 
   const activeOpenTickers = new Set(openLongPositions.map(t => t.ticker));
+  const selectedVariantPreviewRow = !allStrategySelected && selectedVariantId
+    ? strategyPreviewRows.find(row =>
+        row?.variant_id === selectedVariantId &&
+        row?.brain === activeVariantBrain
+      )
+    : null;
+  const selectedVariantPreview = buildVariantPreviewPicks(selectedVariantPreviewRow, activeOpenTickers);
   const aggregateBuyPicks = allStrategySelected
     ? averagePicksByTicker(strategyPreviewRows, activeVariantBrain).filter(pick => !activeOpenTickers.has(pick.ticker))
     : null;
   const activeBuyPicks = (
-    allStrategySelected && aggregateBuyPicks?.length
-      ? aggregateBuyPicks
-      : allBuyPicks
+    allStrategySelected
+      ? aggregateBuyPicks || []
+      : selectedVariantPreview.hasPreview && activeVariantBrain === "Vector"
+        ? selectedVariantPreview.picks
+        : allBuyPicks
   ).filter(pick => !activeOpenTickers.has(pick.ticker));
   const buyVisible = buyListExpanded ? activeBuyPicks : activeBuyPicks.slice(0, 20);
   const sellVisible = sellListExpanded ? sortedOpenFilteredPositions : sortedOpenFilteredPositions.slice(0, 20);
@@ -3081,7 +3144,9 @@ export default function App() {
       ? perfChange
       : backendDayPnl;
   const selectedDayPnlModeLabel = selectedVariantMatchesTab && selectedVariantSession
-    ? "last close"
+    ? selectedVariantSession.dayPnl == null
+      ? "no baseline"
+      : "last close"
     : dayPnlModeLabel;
   const novaOpenPositions = selectedVariantMatchesTab && activeVariantBrain === "Nova"
     ? novaUniverseOpen
@@ -3097,12 +3162,18 @@ export default function App() {
       ? novaFreshPositions
       : novaOpenPositions;
   const sortedNovaOpenFilteredPositions = sortPositions(novaOpenFilteredPositions);
+  const novaOpenTickersForPicks = new Set(novaOpenPositions.map(t => t.ticker));
+  const selectedNovaVariantPreview = selectedVariantPreviewRow?.brain === "Nova"
+    ? buildVariantPreviewPicks(selectedVariantPreviewRow, novaOpenTickersForPicks)
+    : { hasPreview: false, picks: [] };
   const aggregateNovaBuyPicks = allStrategySelected
-    ? averagePicksByTicker(strategyPreviewRows, "Nova").filter(pick => !new Set(novaOpenPositions.map(t => t.ticker)).has(pick.ticker))
+    ? averagePicksByTicker(strategyPreviewRows, "Nova").filter(pick => !novaOpenTickersForPicks.has(pick.ticker))
     : null;
-  const activeNovaBuyPicks = allStrategySelected && aggregateNovaBuyPicks?.length
-    ? aggregateNovaBuyPicks
-    : (nnPicks.recommended_longs || []);
+  const activeNovaBuyPicks = allStrategySelected
+    ? aggregateNovaBuyPicks || []
+    : selectedNovaVariantPreview.hasPreview && activeVariantBrain === "Nova"
+      ? selectedNovaVariantPreview.picks
+      : (nnPicks.recommended_longs || []).filter(pick => !novaOpenTickersForPicks.has(pick.ticker));
   const vectorPickTickers = new Set(activeBuyPicks.map(row => String(row?.ticker || "").toUpperCase()).filter(Boolean));
   const novaPickTickers = new Set(activeNovaBuyPicks.map(row => String(row?.ticker || "").toUpperCase()).filter(Boolean));
   const vectorOpenTickers = new Set(openLongPositions.map(row => String(row?.ticker || "").toUpperCase()).filter(Boolean));
@@ -3181,7 +3252,10 @@ export default function App() {
     if (!v) return "All";
     const time = v.execution_time === "reg" ? "Reg" : (v.execution_time || "").replace(/^0/, "");
     const mode = v.selection_mode || "All";
-    return time ? `${time} / ${mode}` : mode;
+    // When selection_mode is "All" (the only active mode), the time IS the variant.
+    // "5:00 / All" is redundant — just show "5:00".
+    if (mode === "All" && time) return time;
+    return cleanVariantDisplayLabel(time ? `${time} / ${mode}` : mode);
   };
   const renderPortfolioControls = (padded = true) => (
     <div style={{ padding: padded ? `0 16px ${HOME_ROW_GAP}px` : `0 0 ${HOME_ROW_GAP}px` }}>
@@ -3291,7 +3365,7 @@ export default function App() {
           <div style={{ padding: "10px 16px 14px" }}>
             {/* SwingDesk Brain row — evenly spaced across full width */}
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, minHeight: 24 }}>
-              <div style={{ fontSize: 10, color: BLUE, fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>{activeVariantBrain === "Vector" ? activeVariantLabel : "SwingDesk / Vector / 8:45 / All"}</div>
+              <div style={{ fontSize: 10, color: BLUE, fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>{activeVariantBrain === "Vector" ? activeVariantLabel : "SwingDesk / Vector / 8:45"}</div>
               <div style={{ display: "flex", alignItems: "center", gap: 6, position: "relative" }}>
                 <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
                   <button onClick={() => setShowNetInfo(v => !v)}
@@ -3321,12 +3395,15 @@ export default function App() {
               </div>
               {(() => {
                 const dayPnl = activeDayPnl;
-                const dayUp2 = dayPnl >= 0;
+                const dayKnown = dayPnl != null && Number.isFinite(dayPnl);
+                const dayUp2 = dayKnown && dayPnl >= 0;
                 return (
                   <div style={{ textAlign: "right", lineHeight: 1, paddingTop: 6 }}>
                     <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L{selectedDayPnlModeLabel ? ` · ${selectedDayPnlModeLabel}` : ""}</div>
-                    <div style={{ fontSize: 16, fontWeight: 600, color: dayUp2 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(dayPnl)}</div>
-
+                    {dayKnown
+                      ? <div style={{ fontSize: 16, fontWeight: 600, color: dayUp2 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(dayPnl)}</div>
+                      : <div style={{ fontSize: 14, fontWeight: 500, color: T3, fontFamily: "'DM Mono',monospace" }}>—</div>
+                    }
                   </div>
                 );
               })()}
@@ -3647,7 +3724,7 @@ export default function App() {
           {portfolioTab === "neural" && (
             <div style={{ padding: "10px 16px 0" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, minHeight: 24 }}>
-                <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>{activeVariantBrain === "Nova" ? activeVariantLabel : (novaUniverse?.variant?.label || "SwingDesk / Nova / 8:45 / All")}</div>
+                <div style={{ fontSize: 10, color: "#a78bfa", fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>{activeVariantBrain === "Nova" ? activeVariantLabel : (novaUniverse?.variant?.label || "SwingDesk / Nova / 8:45")}</div>
                 <div style={{ display: "flex", alignItems: "center", gap: 6, position: "relative" }}>
                   <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
                     <button onClick={() => setShowNetInfo(v => !v)}
@@ -3678,8 +3755,11 @@ export default function App() {
                   ? Number(nnStats.portfolio_value)
                   : (nnFiltered[nnFiltered.length - 1]?.virtual || 1000);
                 const nnFirst = selectedVariantSession?.previousClose ?? nnFiltered[0]?.virtual ?? nnLast;
-                const nnChange = novaSessionPnl == null ? round2(nnLast - nnFirst) : novaSessionPnl;
-                const nnUp = nnChange >= 0;
+                const nnChange = selectedVariantMatchesTab && activeVariantBrain === "Nova"
+                  ? novaSessionPnl
+                  : round2(nnLast - nnFirst);
+                const nnKnown = nnChange != null && Number.isFinite(nnChange);
+                const nnUp = nnKnown && nnChange >= 0;
                 return (
                   <div style={{ marginBottom: 14 }}>
                     <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 2 }}>
@@ -3690,7 +3770,10 @@ export default function App() {
                       </div>
                       <div style={{ textAlign: "right", lineHeight: 1, paddingTop: 6 }}>
                         <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L{selectedDayPnlModeLabel ? ` · ${selectedDayPnlModeLabel}` : ""}</div>
-                        <div style={{ fontSize: 16, fontWeight: 600, color: nnUp ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(nnChange)}</div>
+                        {nnKnown
+                          ? <div style={{ fontSize: 16, fontWeight: 600, color: nnUp ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(nnChange)}</div>
+                          : <div style={{ fontSize: 14, fontWeight: 500, color: T3, fontFamily: "'DM Mono',monospace" }}>—</div>
+                        }
                       </div>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>

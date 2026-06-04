@@ -1466,38 +1466,34 @@ def initialize_database():
 
     now_iso = current_time_cst().isoformat()
     default_variants = [
-        ("swingdesk_vector_0845_all", "SwingDesk", "Vector", "08:45", "All", "time_or_thesis", "SwingDesk / Vector / 8:45 / All"),
-        ("swingdesk_nova_0845_all", "SwingDesk", "Nova", "08:45", "All", "time_or_thesis", "SwingDesk / Nova / 8:45 / All"),
-        ("swingdesk_vector_0500_all", "SwingDesk", "Vector", "05:00", "All", "time_or_thesis", "SwingDesk / Vector / 5:00 / All"),
-        ("swingdesk_nova_0500_all", "SwingDesk", "Nova", "05:00", "All", "time_or_thesis", "SwingDesk / Nova / 5:00 / All"),
-        ("swingdesk_vector_0600_all", "SwingDesk", "Vector", "06:00", "All", "time_or_thesis", "SwingDesk / Vector / 6:00 / All"),
-        ("swingdesk_nova_0600_all", "SwingDesk", "Nova", "06:00", "All", "time_or_thesis", "SwingDesk / Nova / 6:00 / All"),
-        ("swingdesk_vector_0700_all", "SwingDesk", "Vector", "07:00", "All", "time_or_thesis", "SwingDesk / Vector / 7:00 / All"),
-        ("swingdesk_nova_0700_all", "SwingDesk", "Nova", "07:00", "All", "time_or_thesis", "SwingDesk / Nova / 7:00 / All"),
-        ("darvas_vector_reg_all", "Darvas", "Vector", "reg", "All", "strategy_exit", "Darvas / Vector / Reg / All"),
-        ("darvas_nova_reg_all", "Darvas", "Nova", "reg", "All", "strategy_exit", "Darvas / Nova / Reg / All"),
-        ("gap_go_vector_reg_all", "Gap & Go", "Vector", "reg", "All", "strategy_exit", "Gap & Go / Vector / Reg / All"),
-        ("gap_go_nova_reg_all", "Gap & Go", "Nova", "reg", "All", "strategy_exit", "Gap & Go / Nova / Reg / All"),
-        ("vwap_reclaim_vector_reg_all", "VWAP Reclaim", "Vector", "reg", "All", "strategy_exit", "VWAP Reclaim / Vector / Reg / All"),
-        ("vwap_reclaim_nova_reg_all", "VWAP Reclaim", "Nova", "reg", "All", "strategy_exit", "VWAP Reclaim / Nova / Reg / All"),
-        ("inside_day_vector_reg_all", "Inside Day", "Vector", "reg", "All", "strategy_exit", "Inside Day / Vector / Reg / All"),
-        ("inside_day_nova_reg_all", "Inside Day", "Nova", "reg", "All", "strategy_exit", "Inside Day / Nova / Reg / All"),
-        ("nr7_vector_reg_all", "NR7", "Vector", "reg", "All", "strategy_exit", "NR7 / Vector / Reg / All"),
-        ("nr7_nova_reg_all", "NR7", "Nova", "reg", "All", "strategy_exit", "NR7 / Nova / Reg / All"),
-        ("bull_flag_vector_reg_all", "Bull Flag", "Vector", "reg", "All", "strategy_exit", "Bull Flag / Vector / Reg / All"),
-        ("bull_flag_nova_reg_all", "Bull Flag", "Nova", "reg", "All", "strategy_exit", "Bull Flag / Nova / Reg / All"),
-        ("pocket_pivot_vector_reg_all", "Pocket Pivot", "Vector", "reg", "All", "strategy_exit", "Pocket Pivot / Vector / Reg / All"),
-        ("pocket_pivot_nova_reg_all", "Pocket Pivot", "Nova", "reg", "All", "strategy_exit", "Pocket Pivot / Nova / Reg / All"),
-        ("vol_squeeze_breakout_vector_reg_all", "Vol Squeeze Breakout", "Vector", "reg", "All", "strategy_exit", "Vol Squeeze Breakout / Vector / Reg / All"),
-        ("vol_squeeze_breakout_nova_reg_all", "Vol Squeeze Breakout", "Nova", "reg", "All", "strategy_exit", "Vol Squeeze Breakout / Nova / Reg / All"),
-        ("relative_strength_pullback_vector_reg_all", "Relative Strength Pullback", "Vector", "reg", "All", "strategy_exit", "Relative Strength Pullback / Vector / Reg / All"),
-        ("relative_strength_pullback_nova_reg_all", "Relative Strength Pullback", "Nova", "reg", "All", "strategy_exit", "Relative Strength Pullback / Nova / Reg / All"),
-        ("ema_trend_pullback_vector_reg_all", "EMA Trend Pullback", "Vector", "reg", "All", "strategy_exit", "EMA Trend Pullback / Vector / Reg / All"),
-        ("ema_trend_pullback_nova_reg_all", "EMA Trend Pullback", "Nova", "reg", "All", "strategy_exit", "EMA Trend Pullback / Nova / Reg / All"),
-        ("opening_range_hold_vector_reg_all", "Opening Range Hold", "Vector", "reg", "All", "strategy_exit", "Opening Range Hold / Vector / Reg / All"),
-        ("opening_range_hold_nova_reg_all", "Opening Range Hold", "Nova", "reg", "All", "strategy_exit", "Opening Range Hold / Nova / Reg / All"),
+        ("swingdesk_vector_0845_all", "SwingDesk", "Vector", "08:45", "All", "time_or_thesis", "SwingDesk / Vector / 8:45"),
+        ("swingdesk_nova_0845_all", "SwingDesk", "Nova", "08:45", "All", "time_or_thesis", "SwingDesk / Nova / 8:45"),
+        ("swingdesk_vector_0500_all", "SwingDesk", "Vector", "05:00", "All", "time_or_thesis", "SwingDesk / Vector / 5:00"),
+        ("swingdesk_nova_0500_all", "SwingDesk", "Nova", "05:00", "All", "time_or_thesis", "SwingDesk / Nova / 5:00"),
+        ("swingdesk_vector_0600_all", "SwingDesk", "Vector", "06:00", "All", "time_or_thesis", "SwingDesk / Vector / 6:00"),
+        ("swingdesk_nova_0600_all", "SwingDesk", "Nova", "06:00", "All", "time_or_thesis", "SwingDesk / Nova / 6:00"),
+        ("swingdesk_vector_0700_all", "SwingDesk", "Vector", "07:00", "All", "time_or_thesis", "SwingDesk / Vector / 7:00"),
+        ("swingdesk_nova_0700_all", "SwingDesk", "Nova", "07:00", "All", "time_or_thesis", "SwingDesk / Nova / 7:00"),
+        ("darvas_vector_reg_all", "Darvas", "Vector", "reg", "All", "strategy_exit", "Darvas / Vector / Reg"),
+        ("darvas_nova_reg_all", "Darvas", "Nova", "reg", "All", "strategy_exit", "Darvas / Nova / Reg"),
+        ("gap_go_vector_reg_all", "Gap & Go", "Vector", "reg", "All", "strategy_exit", "Gap & Go / Vector / Reg"),
+        ("gap_go_nova_reg_all", "Gap & Go", "Nova", "reg", "All", "strategy_exit", "Gap & Go / Nova / Reg"),
+        ("vwap_reclaim_vector_reg_all", "VWAP Reclaim", "Vector", "reg", "All", "strategy_exit", "VWAP Reclaim / Vector / Reg"),
+        ("vwap_reclaim_nova_reg_all", "VWAP Reclaim", "Nova", "reg", "All", "strategy_exit", "VWAP Reclaim / Nova / Reg"),
+        ("inside_day_vector_reg_all", "Inside Day", "Vector", "reg", "All", "strategy_exit", "Inside Day / Vector / Reg"),
+        ("inside_day_nova_reg_all", "Inside Day", "Nova", "reg", "All", "strategy_exit", "Inside Day / Nova / Reg"),
+        ("bull_flag_vector_reg_all", "Bull Flag", "Vector", "reg", "All", "strategy_exit", "Bull Flag / Vector / Reg"),
+        ("bull_flag_nova_reg_all", "Bull Flag", "Nova", "reg", "All", "strategy_exit", "Bull Flag / Nova / Reg"),
+        ("pocket_pivot_vector_reg_all", "Pocket Pivot", "Vector", "reg", "All", "strategy_exit", "Pocket Pivot / Vector / Reg"),
+        ("pocket_pivot_nova_reg_all", "Pocket Pivot", "Nova", "reg", "All", "strategy_exit", "Pocket Pivot / Nova / Reg"),
+        ("vol_squeeze_breakout_vector_reg_all", "Vol Squeeze Breakout", "Vector", "reg", "All", "strategy_exit", "Vol Squeeze Breakout / Vector / Reg"),
+        ("vol_squeeze_breakout_nova_reg_all", "Vol Squeeze Breakout", "Nova", "reg", "All", "strategy_exit", "Vol Squeeze Breakout / Nova / Reg"),
+        ("relative_strength_pullback_vector_reg_all", "Relative Strength Pullback", "Vector", "reg", "All", "strategy_exit", "Relative Strength Pullback / Vector / Reg"),
+        ("relative_strength_pullback_nova_reg_all", "Relative Strength Pullback", "Nova", "reg", "All", "strategy_exit", "Relative Strength Pullback / Nova / Reg"),
+        ("ema_trend_pullback_vector_reg_all", "EMA Trend Pullback", "Vector", "reg", "All", "strategy_exit", "EMA Trend Pullback / Vector / Reg"),
+        ("ema_trend_pullback_nova_reg_all", "EMA Trend Pullback", "Nova", "reg", "All", "strategy_exit", "EMA Trend Pullback / Nova / Reg"),
     ]
-    retired_strategies = ("Bullish Mean Reversion", "Donchian", "S&R Breakout")
+    retired_strategies = ("Bullish Mean Reversion", "Donchian", "S&R Breakout", "NR7", "Opening Range Hold")
     database.execute(
         f"UPDATE strategy_variants SET status='retired', updated_at=? WHERE strategy IN ({','.join(['?'] * len(retired_strategies))})",
         [now_iso, *retired_strategies],
@@ -1538,6 +1534,12 @@ def initialize_database():
             """, [*variant, now_iso, now_iso])
         except Exception as e:
             log.debug(f"strategy variant seed skipped: {e}")
+
+    for variant in default_variants:
+        database.execute(
+            "UPDATE strategy_variants SET label=?, updated_at=? WHERE id=? AND selection_mode='All'",
+            [variant[6], now_iso, variant[0]],
+        )
 
     baseline_weights = canonical_signal_weights()
     database.execute(
@@ -2953,6 +2955,8 @@ def explain_variant_strategy_match(strategy, pick):
             },
         }
 
+    if strategy in ("nr7", "opening range hold"):
+        return result(False, [f"{strategy} is retired from SwingDesk Stocks"])
     if strategy == "swingdesk":
         reasons = []
         if confidence < 65:
@@ -2994,15 +2998,6 @@ def explain_variant_strategy_match(strategy, pick):
             reasons.append(f"volume {volume:.2f}x below 0.8x")
         if not 45 <= rsi <= 65:
             reasons.append(f"RSI {rsi:.0f} outside 45-65")
-        return result(not reasons, reasons)
-    if strategy == "nr7":
-        reasons = []
-        if volume > 1.4:
-            reasons.append(f"volume {volume:.2f}x above NR7 quiet-range cap")
-        if abs(gap) > 5:
-            reasons.append(f"gap {gap:.1f}% outside NR7 range")
-        if day_change <= 0:
-            reasons.append(f"day change {day_change:.1f}% not positive")
         return result(not reasons, reasons)
     if strategy == "bull flag":
         reasons = []
@@ -3059,19 +3054,6 @@ def explain_variant_strategy_match(strategy, pick):
             reasons.append(f"RSI {rsi:.0f} outside 45-60")
         if volume < 0.9:
             reasons.append(f"volume {volume:.2f}x below 0.9x")
-        return result(not reasons, reasons)
-    if strategy == "opening range hold":
-        reasons = []
-        if confidence < 62:
-            reasons.append(f"confidence {confidence}% below 62%")
-        if gap < 1.0:
-            reasons.append(f"gap {gap:.1f}% below 1.0%")
-        if regular_open_change < -0.5:
-            reasons.append(f"regular-open change {regular_open_change:.1f}% too weak")
-        if day_change <= 0:
-            reasons.append(f"day change {day_change:.1f}% not positive")
-        if not 45 <= rsi <= 68:
-            reasons.append(f"RSI {rsi:.0f} outside 45-68")
         return result(not reasons, reasons)
     return result(confidence >= 65, [] if confidence >= 65 else [f"confidence {confidence}% below 65%"])
 
@@ -4106,12 +4088,11 @@ def calculate_method_confluence(ticker, price_data, scored_stocks=None):
     2.  Gap and Go          — gap up >2% + volume surge
     3.  Donchian Channel    — price above 20-day high
     4.  Inside Day          — today's range inside yesterday's + breaking up
-    5.  NR7                 — narrowest range of last 7 days
-    6.  Bull Flag           — strong prior move + tight consolidation
-    7.  Pocket Pivot        — up day with volume > any down-day vol of last 10 days
-    8.  Support & Resistance — ATR-adaptive zone analysis (open air or near support)
-    9.  VWAP Reclaim        — closing above VWAP, institutional buy-side conviction
-    10. Volatility Squeeze  — HV compression ratio, coiled spring setup
+    5.  Bull Flag           — strong prior move + tight consolidation
+    6.  Pocket Pivot        — up day with volume > any down-day vol of last 10 days
+    7.  Support & Resistance — ATR-adaptive zone analysis (open air or near support)
+    8.  VWAP Reclaim        — closing above VWAP, institutional buy-side conviction
+    9.  Volatility Squeeze  — HV compression ratio, coiled spring setup
 
     Returns: {"count": int, "methods": [list of method names that agree]}
     """
@@ -4158,21 +4139,14 @@ def calculate_method_confluence(ticker, price_data, scored_stocks=None):
         if inside_day and gap_pct > 0:
             methods_agree.append("Inside Day")
 
-    # 5. NR7 — today's range is narrowest of last 7 days (compression)
-    if daily_history and len(daily_history) >= 7:
-        ranges = [(d["high"] - d["low"]) for d in daily_history[-7:]]
-        today_range = high - low
-        if today_range <= min(ranges) * 1.05 and gap_pct > 0:
-            methods_agree.append("NR7")
-
-    # 6. Bull Flag — strong move in last 3-5 days + today consolidating/breaking up
+    # 5. Bull Flag — strong move in last 3-5 days + today consolidating/breaking up
     if daily_history and len(daily_history) >= 5:
         five_day_move = (price - daily_history[-5]["close"]) / max(daily_history[-5]["close"], 0.01) * 100
         recent_consolidation = abs(day_change) < 3  # Tight day = flag
         if five_day_move >= 8 and recent_consolidation and gap_pct >= 0:
             methods_agree.append("Bull Flag")
 
-    # 7. Pocket Pivot — up day with volume exceeding any down-day volume of last 10 days
+    # 6. Pocket Pivot — up day with volume exceeding any down-day volume of last 10 days
     if daily_history and len(daily_history) >= 10 and day_change > 0:
         down_day_volumes = [d["volume"] for d in daily_history[-10:] if d.get("close", 0) < d.get("open", 0)]
         current_volume = data.get("volume", 0)
@@ -4182,17 +4156,17 @@ def calculate_method_confluence(ticker, price_data, scored_stocks=None):
             # No down days in 10 days — strong uptrend, volume surge qualifies
             methods_agree.append("Pocket Pivot")
 
-    # 8. Support & Resistance — ATR-adaptive zone analysis
+    # 7. Support & Resistance — ATR-adaptive zone analysis
     sr = data.get("sr_analysis") or calculate_support_resistance(ticker, price_data)
     if sr["signal"] in ("open_air", "open_air+support_floor") or        ("support_floor" in sr["signal"] and sr["score"] >= 0.65):
         methods_agree.append("S&R")
 
-    # 9. VWAP Reclaim — price closing above VWAP shows institutional buy-side
+    # 8. VWAP Reclaim — price closing above VWAP shows institutional buy-side
     vwap_score = calculate_vwap_signal(ticker, price_data)
     if vwap_score >= 0.75:
         methods_agree.append("VWAP Reclaim")
 
-    # 10. Volatility Squeeze — compression precedes explosive directional move
+    # 9. Volatility Squeeze — compression precedes explosive directional move
     squeeze_score = calculate_volatility_squeeze(ticker, price_data)
     if squeeze_score >= 0.75:
         methods_agree.append("Vol Squeeze")
@@ -7870,156 +7844,149 @@ def run_self_audit():
 def run_scheduler():
     """
     Background scheduler for all automated tasks.
-    
-    All times are specified in UTC. Current Central daylight schedule uses UTC + 5 hours.
-    
-    Comprehensive scans run every 30 minutes during pre-market, regular market,
-    and post-market.
-    8:30 AM CST market open scan fires after queue lock-in for fresh open-market scores.
-    5-minute monitoring runs continuously during active hours (4 AM - 7 PM CST).
+
+    Scheduled jobs are keyed by America/Chicago wall-clock time. This avoids
+    the old hardcoded UTC offset problem where November-March jobs fired an
+    hour early during Central Standard Time.
     """
-    import schedule
+    def add_job(table, slot, name, callback):
+        table.setdefault(slot, []).append((name, callback))
 
-    # ── Pre-market comprehensive scans (every 30 min, 4:00-8:00 AM CST) ──
-    # Central daylight time + 5 = UTC
-    for hour_utc, label in [(9,"4:00am"),(9.5,"4:30am"),(10,"5:00am"),(10.5,"5:30am"),
-                             (11,"6:00am"),(11.5,"6:30am"),(12,"7:00am"),(12.5,"7:30am"),
-                             (13,"8:00am")]:
-        hour = int(hour_utc)
-        minute = int((hour_utc % 1) * 60)
-        time_str = f"{hour:02d}:{minute:02d}"
-        scan_label = f"pre_market_{label}"
-        schedule.every().day.at(time_str).do(lambda st=scan_label: run_comprehensive_scan(scan_type=st))
+    def add_scan(table, slot, scan_type):
+        add_job(table, slot, f"scan:{scan_type}", lambda st=scan_type: run_comprehensive_scan(scan_type=st))
 
-    # 8:15 AM CST = 13:15 UTC — Final pre-market scan
-    schedule.every().day.at("13:15").do(lambda: run_comprehensive_scan(scan_type="final_scan"))
-
-    # 8:25 AM CST = 13:25 UTC — Queue lock-in: no new picks after this
-    schedule.every().day.at("13:25").do(lock_pick_queue)
-
-    # 8:30 AM CST = 13:30 UTC — Market open scan: fresh scores at open for recs + ML data
-    schedule.every().day.at("13:30").do(lambda: run_comprehensive_scan(scan_type="market_open"))
-
-    # Regular-session comprehensive scans keep picks/current candidates fresh after open.
-    # The single-flight scan lock prevents overlap if a provider run is still active.
-    for hour_utc, label in [(14,"9:00am"),(14.5,"9:30am"),(15,"10:00am"),(15.5,"10:30am"),
-                             (16,"11:00am"),(16.5,"11:30am"),(17,"12:00pm"),(17.5,"12:30pm"),
-                             (18,"1:00pm"),(18.5,"1:30pm"),(19,"2:00pm"),(19.5,"2:30pm")]:
-        hour = int(hour_utc)
-        minute = int((hour_utc % 1) * 60)
-        time_str = f"{hour:02d}:{minute:02d}"
-        scan_label = f"regular_{label}"
-        schedule.every().day.at(time_str).do(lambda st=scan_label: run_comprehensive_scan(scan_type=st))
-
-    # Execution-time variant families. Each call only opens matching execution_time universes.
-    schedule.every().day.at("10:00").do(lambda: run_variant_universes_from_cache(trigger="scheduled_0500", buy_time="05:00:00"))
-    schedule.every().day.at("11:00").do(lambda: run_variant_universes_from_cache(trigger="scheduled_0600", buy_time="06:00:00"))
-    schedule.every().day.at("12:00").do(lambda: run_variant_universes_from_cache(trigger="scheduled_0700", buy_time="07:00:00"))
-
-    # 8:45 AM CST = 13:45 UTC — Execute positions at market open + 15 min
-    schedule.every().day.at("13:45").do(execute_opening_positions)
-    schedule.every().day.at("13:45").do(execute_nn_opening_positions)
-    schedule.every().day.at("13:45").do(lambda: run_variant_universes_from_cache(trigger="scheduled_0845", buy_time="08:45:00"))
-
-    # 2:45 PM CST = 19:45 UTC — Force-close previous session positions
-    schedule.every().day.at("19:45").do(force_close_previous_session)
-    schedule.every().day.at("19:45").do(force_close_nn_previous_session)
-
-    # 2:50 PM CST = 19:50 UTC — End-of-day equity snapshot for all active variants.
-    # Ensures every variant has at least one equity point per trading day, which the
-    # frontend needs to compute a proper Day's P&L baseline (glass house principle).
     def eod_variant_equity_snapshot():
+        """Store one ledger point for every active variant at the end of each market day."""
         if current_time_cst().weekday() >= 5:
             return
+        db = None
         try:
             db = get_database()
-            variants = [dict(r) for r in db.execute("""
+            variants = [dict(row) for row in db.execute("""
                 SELECT sv.id FROM strategy_variants sv
                 JOIN variant_portfolios vp ON vp.variant_id = sv.id
                 WHERE sv.status='active' AND vp.lifecycle_status!='archived'
             """).fetchall()]
-            for v in variants:
-                update_variant_portfolio(db, v["id"], note="eod_snapshot")
+            for variant in variants:
+                update_variant_portfolio(db, variant["id"], note="eod_snapshot")
             db.commit()
-            db.close()
             log.info(f"EOD equity snapshot: {len(variants)} variants updated")
-        except Exception as e:
-            log.error(f"EOD equity snapshot failed: {e}")
-    schedule.every().day.at("19:50").do(eod_variant_equity_snapshot)
+        except Exception as error:
+            log.error(f"EOD equity snapshot failed: {error}")
+        finally:
+            if db:
+                db.close()
 
-    # 3:00 PM CST = 20:00 UTC — Market close scan
-    schedule.every().day.at("20:00").do(lambda: run_comprehensive_scan(scan_type="market_close"))
+    def run_daily_learning_audit_and_training():
+        """Run the 7 PM Central closed-trade learning batch, read-only audit recap, and NN training."""
+        if current_time_cst().weekday() >= 5:
+            return
+        learning_result = run_daily_variant_learning()
+        log.info(f"Daily variant learning result: {learning_result}")
+        run_self_audit()
+        try:
+            train_neural_network()
+        except Exception as error:
+            log.error(f"NN training failed: {error}")
 
-    # ── Post-market comprehensive scans (every 30 min, 3:30-6:00 PM CST) ──
-    for hour_utc, label in [(20.5,"3:30pm"),(21,"4:00pm"),(21.5,"4:30pm"),
-                             (22,"5:00pm"),(22.5,"5:30pm"),(23,"6:00pm")]:
-        hour = int(hour_utc)
-        minute = int((hour_utc % 1) * 60)
-        time_str = f"{hour:02d}:{minute:02d}"
-        scan_label = f"post_market_{label}"
-        schedule.every().day.at(time_str).do(lambda st=scan_label: run_comprehensive_scan(scan_type=st))
+    def run_scheduled_job(name, callback):
+        try:
+            log.info(f"Scheduled job started: {name}")
+            callback()
+            log.info(f"Scheduled job finished: {name}")
+        except Exception as error:
+            log.error(f"Scheduled job failed ({name}): {error}")
 
-    # 4:00 AM CST = 09:00 UTC — Unlock queue for new pre-market session
-    schedule.every().day.at("09:00").do(unlock_pick_queue)
+    dispatch = {}
 
-    # Self-audit at 7:00 PM Central during daylight time = 00:00 UTC.
-    # Runs after post-market closes so brain has full day of data to learn from
-    # Skip weekends — no trading data on Sat/Sun
-    def run_audit_if_weekday():
-        if current_time_cst().weekday() < 5:
-            learning_result = run_daily_variant_learning()
-            log.info(f"Daily variant learning result: {learning_result}")
-            run_self_audit()
-            # Train NN after audit — fresh data available
-            try:
-                train_neural_network()
-            except Exception as nn_err:
-                log.error(f"NN training failed: {nn_err}")
-    schedule.every().day.at("00:00").do(run_audit_if_weekday)
-
-    # NN scoring now runs from each comprehensive scan snapshot.
-    for hour, minute, label in [
-        (9,"00","4:00am"),(9,30,"4:30am"),(10,"00","5:00am"),(10,30,"5:30am"),
-        (11,"00","6:00am"),(11,30,"6:30am"),(12,"00","7:00am"),(12,30,"7:30am"),
-        (13,"00","8:00am"),(13,30,"8:30am"),(14,"00","9:00am"),(14,30,"9:30am"),
-        (15,"00","10:00am"),(15,30,"10:30am"),(16,"00","11:00am"),(16,30,"11:30am"),
-        (17,"00","12:00pm"),(17,30,"12:30pm"),(18,"00","1:00pm"),(18,30,"1:30pm"),
-        (19,"00","2:00pm"),(19,30,"2:30pm"),(20,"00","3:00pm"),(20,30,"3:30pm"),
-        (21,"00","4:00pm"),(21,30,"4:30pm"),(22,"00","5:00pm"),(22,30,"5:30pm"),
-        (23,"00","6:00pm"),(23,30,"6:30pm"),(0,"00","7:00pm"),(0,30,"7:30pm"),
+    for slot, label in [
+        ("04:00", "4:00am"), ("04:30", "4:30am"),
+        ("05:00", "5:00am"), ("05:30", "5:30am"),
+        ("06:00", "6:00am"), ("06:30", "6:30am"),
+        ("07:00", "7:00am"), ("07:30", "7:30am"),
+        ("08:00", "8:00am"),
     ]:
-        time_str = f"{hour:02d}:{minute:02d}" if isinstance(minute, int) else f"{hour:02d}:{minute}"
-        # NN scoring now runs from the comprehensive scan snapshot.
-        # Keep manual /api/nn-scan-now for debugging, but do not schedule a second universe fetch.
-        pass
+        add_scan(dispatch, slot, f"pre_market_{label}")
 
-    log.info("Scheduler started — comprehensive shared scans every 30min, position monitoring 2.5min regular/5min extended")
+    add_job(dispatch, "04:00", "unlock_pick_queue", unlock_pick_queue)
+    add_job(dispatch, "05:00", "variant_0500", lambda: run_variant_universes_from_cache(trigger="scheduled_0500", buy_time="05:00:00"))
+    add_job(dispatch, "06:00", "variant_0600", lambda: run_variant_universes_from_cache(trigger="scheduled_0600", buy_time="06:00:00"))
+    add_job(dispatch, "07:00", "variant_0700", lambda: run_variant_universes_from_cache(trigger="scheduled_0700", buy_time="07:00:00"))
+    add_scan(dispatch, "08:15", "final_scan")
+    add_job(dispatch, "08:25", "lock_pick_queue", lock_pick_queue)
+    add_scan(dispatch, "08:30", "market_open")
+    add_job(dispatch, "08:45", "execute_opening_positions", execute_opening_positions)
+    add_job(dispatch, "08:45", "execute_nn_opening_positions", execute_nn_opening_positions)
+    add_job(dispatch, "08:45", "variant_0845", lambda: run_variant_universes_from_cache(trigger="scheduled_0845", buy_time="08:45:00"))
 
-    # Dynamic monitoring loop — 2.5 min during regular hours, 5 min during pre/post market
+    for slot, label in [
+        ("09:00", "9:00am"), ("09:30", "9:30am"),
+        ("10:00", "10:00am"), ("10:30", "10:30am"),
+        ("11:00", "11:00am"), ("11:30", "11:30am"),
+        ("12:00", "12:00pm"), ("12:30", "12:30pm"),
+        ("13:00", "1:00pm"), ("13:30", "1:30pm"),
+        ("14:00", "2:00pm"), ("14:30", "2:30pm"),
+    ]:
+        add_scan(dispatch, slot, f"regular_{label}")
+
+    add_job(dispatch, "14:45", "force_close_previous_session", force_close_previous_session)
+    add_job(dispatch, "14:45", "force_close_nn_previous_session", force_close_nn_previous_session)
+    add_job(dispatch, "14:50", "eod_variant_equity_snapshot", eod_variant_equity_snapshot)
+    add_scan(dispatch, "15:00", "market_close")
+
+    for slot, label in [
+        ("15:30", "3:30pm"), ("16:00", "4:00pm"),
+        ("16:30", "4:30pm"), ("17:00", "5:00pm"),
+        ("17:30", "5:30pm"), ("18:00", "6:00pm"),
+    ]:
+        add_scan(dispatch, slot, f"post_market_{label}")
+
+    add_job(dispatch, "19:00", "daily_learning_audit_nn_training", run_daily_learning_audit_and_training)
+
+    log.info("Scheduler started: Chicago-time dispatcher, 30min shared scans, 2.5min regular/5min extended monitoring")
+
+    fired_today = set()
+    fired_date = current_time_cst().date()
     last_monitor_time = 0
-    while True:
-        schedule.run_pending()
-        current_time = time.time()
 
+    while True:
+        current_time = time.time()
         now = current_time_cst()
+
+        if now.date() != fired_date:
+            fired_today.clear()
+            fired_date = now.date()
+
+        slot = now.strftime("%H:%M")
+        for name, callback in dispatch.get(slot, []):
+            fired_key = f"{fired_date}:{slot}:{name}"
+            if fired_key in fired_today:
+                continue
+            fired_today.add(fired_key)
+            threading.Thread(
+                target=run_scheduled_job,
+                args=(name, callback),
+                daemon=True,
+            ).start()
+
         is_regular = is_market_open()
         in_extended, _ = is_extended_hours()
         is_active = now.weekday() < 5 and (is_regular or in_extended or 4 <= now.hour < 20)
-
-        # 2.5 min during regular market hours, 5 min during pre/post market
-        dynamic_interval = 150 if is_regular else 300  # 150s = 2.5 min, 300s = 5 min
+        dynamic_interval = 150 if is_regular else 300
 
         if is_active and current_time - last_monitor_time >= dynamic_interval:
             last_monitor_time = current_time
-            try:
-                monitor_open_positions()
-                monitor_nn_open_positions()
-                monitor_variant_universes(trigger="scheduled")
-            except Exception as error:
-                log.error(f"Monitor error: {error}")
+            threading.Thread(
+                target=run_scheduled_job,
+                args=("dynamic_monitoring_cycle", lambda: (
+                    monitor_open_positions(),
+                    monitor_nn_open_positions(),
+                    monitor_variant_universes(trigger="scheduled"),
+                )),
+                daemon=True,
+            ).start()
 
         time.sleep(15)
-
 # ── API ROUTES ────────────────────────────────────────────────────────────────
 @app.route("/api/health")
 def health():
@@ -8815,7 +8782,7 @@ def api_method_stats():
     """Return win rate and signal history for all 7 trading methods."""
     try:
         database = get_database()
-        methods = ["Darvas", "Gap & Go", "Donchian", "Inside Day", "NR7", "Bull Flag", "Pocket Pivot", "S&R", "VWAP Reclaim", "Vol Squeeze"]
+        methods = ["Darvas", "Gap & Go", "Donchian", "Inside Day", "Bull Flag", "Pocket Pivot", "S&R", "VWAP Reclaim", "Vol Squeeze"]
         result = {}
 
         for method in methods:
