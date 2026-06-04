@@ -505,6 +505,15 @@ function getValuationFields(trade = {}, feeAdjusted = true) {
 }
 
 function getTradeOpenPnlDollars(trade = {}, feeAdjusted = true) {
+  if (trade.outcome === "open") {
+    const buy = Number(trade.buy_price || trade.entry_price || 0);
+    const currentPrice = Number(trade.current_price || trade.last_price || trade.price || 0);
+    const invested = Number(trade.invested_amount || 0);
+    if (buy > 0 && currentPrice > 0 && invested > 0) {
+      const grossCurrentValue = invested * (currentPrice / buy);
+      return grossCurrentValue - invested;
+    }
+  }
   const { invested, pnl } = getValuationFields(trade, feeAdjusted);
   const valuePnl = pnl;
   if (Math.abs(valuePnl) > 0.005) return valuePnl;
@@ -2568,7 +2577,7 @@ export default function App() {
   const [openDayFilter, setOpenDayFilter] = useState("all");
   const [queueLogOpen, setQueueLogOpen] = useState(false);
 
-  const [perfTimeframe, setPerfTimeframe] = useState("M");
+  const [perfTimeframe, setPerfTimeframe] = useState("D");
   const [feeAdjusted, setFeeAdjusted] = useState(true);
   const feeQuery = feeAdjusted ? "?fees=on" : "?fees=off";
   const [settingsOpen, setSettingsOpen] = useState(false);

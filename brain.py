@@ -1456,6 +1456,10 @@ def initialize_database():
     for column_definition in [
         "current_price REAL",
         "day_change_percent REAL",
+        "last_price_updated TEXT",
+        "entry_price_source TEXT",
+        "entry_integrity_status TEXT",
+        "entry_integrity_note TEXT",
         "confluence_count INTEGER DEFAULT 0",
         "confluence_methods TEXT DEFAULT '[]'",
     ] + FEE_MODEL_COLUMN_DEFINITIONS:
@@ -10552,6 +10556,167 @@ def api_reprice_open_entries():
     except Exception as e:
         log.error(f"Reprice open entries error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/reprice-variant-open-entries", methods=["POST"])
+def api_reprice_variant_open_entries():
+    """
+    Repair open variant trades whose entry prices were captured from stale quotes.
+
+    The repair is variant-aware: it replays each open row's recorded
+    buy_date + buy_time, fetches the nearest historical intraday candle, then
+    recalculates current mark, P&L, fees, and the owning variant ledger. This is
+    the backend source of truth for All-view open-card P&L.
+    """
+    body = request.get_json(silent=True) or {}
+    apply_changes = bool(body.get("apply", False))
+    target_tickers = {
+        str(t).upper()
+        for t in body.get("tickers", [])
+        if str(t or "").strip()
+    }
+
+    database = None
+    try:
+        database = get_database()
+        query = "SELECT * FROM variant_virtual_trades WHERE outcome='open'"
+        params = []
+        if target_tickers:
+            query += f" AND ticker IN ({','.join(['?'] * len(target_tickers))})"
+            params = sorted(target_tickers)
+        open_positions = [dict(row) for row in database.execute(query, params).fetchall()]
+
+        if not open_positions:
+            return jsonify({
+                "success": True,
+                "applied": apply_changes,
+                "updated": 0,
+                "results": [],
+            })
+
+        now_iso = current_time_cst().isoformat()
+        current_quotes = fetch_current_prices(sorted({row["ticker"] for row in open_positions}))
+        touched_variants = set()
+        results = []
+        updated = 0
+
+        for position in open_positions:
+            ticker = position["ticker"]
+            try:
+                buy_date = datetime.strptime(position["buy_date"], "%Y-%m-%d")
+                buy_time_raw = position.get("buy_time") or "08:45:00"
+                parts = [int(part) for part in str(buy_time_raw).split(":")[:3]]
+                while len(parts) < 3:
+                    parts.append(0)
+                target = buy_date.replace(hour=parts[0], minute=parts[1], second=parts[2], microsecond=0)
+
+                pinned = (
+                    fetch_finnhub_price_at_cst(ticker, target)
+                    or fetch_alpha_vantage_price_at_cst(ticker, target)
+                )
+                if not pinned:
+                    results.append({
+                        "id": position["id"],
+                        "variant_id": position["variant_id"],
+                        "ticker": ticker,
+                        "status": "no_historical_entry_price",
+                    })
+                    time.sleep(1.1)
+                    continue
+
+                raw_quote = current_quotes.get(ticker)
+                if not raw_quote:
+                    results.append({
+                        "id": position["id"],
+                        "variant_id": position["variant_id"],
+                        "ticker": ticker,
+                        "status": "no_current_quote",
+                    })
+                    time.sleep(1.1)
+                    continue
+
+                quote = normalize_monitor_quote(raw_quote, pinned["price"])
+                current_price = float(quote["price"])
+                new_buy_price = float(pinned["price"])
+                old_buy_price = float(position.get("buy_price") or 0)
+                invested = float(position.get("invested_amount") or DEFAULT_INVESTMENT)
+                direction = position.get("direction") or "long"
+                pnl_pct = (current_price - new_buy_price) / max(new_buy_price, 0.01) * 100
+                if direction == "short":
+                    pnl_pct = -pnl_pct
+                day_change_percent = float(quote.get("day_change_percent") or quote.get("day_change_pct") or 0)
+                fee_quote = calculate_stock_fee_model(invested, new_buy_price, current_price, direction)
+                entry_integrity_status, entry_integrity_note = build_entry_integrity(
+                    {**position, "buy_price": new_buy_price},
+                    quote,
+                )
+
+                result = {
+                    "id": position["id"],
+                    "variant_id": position["variant_id"],
+                    "ticker": ticker,
+                    "buy_date": position.get("buy_date"),
+                    "buy_time": buy_time_raw,
+                    "old_buy_price": round(old_buy_price, 4),
+                    "new_buy_price": round(new_buy_price, 4),
+                    "current_price": round(current_price, 4),
+                    "old_pnl_pct": round(float(position.get("actual_move") or 0), 2),
+                    "new_pnl_pct": round(pnl_pct, 2),
+                    "day_change_percent": round(day_change_percent, 4),
+                    "entry_source": pinned.get("source"),
+                    "entry_integrity_status": entry_integrity_status,
+                    "applied": apply_changes,
+                    "status": "would_update" if not apply_changes else "updated",
+                }
+
+                if apply_changes:
+                    database.execute(f"""
+                        UPDATE variant_virtual_trades
+                        SET buy_price=?, current_price=?, current_value=?, day_change_percent=?,
+                            actual_move=?, gross_pnl=?, net_pnl=?, {FEE_MODEL_UPDATE_SET},
+                            entry_price_source=?, entry_integrity_status=?, entry_integrity_note=?,
+                            last_price_updated=?, updated_at=?
+                        WHERE id=?
+                    """, [
+                        round(new_buy_price, 4), round(current_price, 4), round(fee_quote["net_current_value"], 4),
+                        round(day_change_percent, 4), round(pnl_pct, 2),
+                        fee_quote["gross_pnl"], fee_quote["net_pnl"], *fee_model_values(fee_quote),
+                        pinned.get("source"), entry_integrity_status, entry_integrity_note,
+                        now_iso, now_iso, position["id"],
+                    ])
+                    touched_variants.add(position["variant_id"])
+                    updated += 1
+
+                results.append(result)
+                time.sleep(1.1)
+            except Exception as item_error:
+                results.append({
+                    "id": position.get("id"),
+                    "variant_id": position.get("variant_id"),
+                    "ticker": ticker,
+                    "status": "error",
+                    "error": str(item_error),
+                })
+
+        if apply_changes:
+            for variant_id in touched_variants:
+                update_variant_portfolio(database, variant_id, note="reprice_variant_open_entries")
+            database.commit()
+
+        return jsonify({
+            "success": True,
+            "applied": apply_changes,
+            "updated": updated,
+            "touched_variants": sorted(touched_variants),
+            "results": results,
+        })
+    except Exception as e:
+        if database:
+            database.rollback()
+        log.error(f"Variant reprice open entries error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        if database:
+            database.close()
 
 @app.route("/api/backfill-tags", methods=["POST"])
 def api_backfill_tags():
