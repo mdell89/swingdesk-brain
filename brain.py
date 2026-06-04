@@ -2857,12 +2857,13 @@ def variant_cache_snapshot(database, require_fresh=True, max_age_minutes=180):
     """Load the shared Vector/Nova cache pair and reject stale or incomplete manual runs."""
     status_row = database.execute("SELECT value FROM app_state WHERE key=?", [NN_SCAN_STATUS_KEY]).fetchone()
     scan_status = json.loads(status_row["value"]) if status_row and status_row["value"] else {}
+    running_scan_refusal = None
     if scan_status.get("status") in ("queued", "running"):
-        return None, {
+        running_scan_refusal = {
             "success": False,
             "refused": True,
             "reason": "shared_scan_running",
-            "message": "Shared scan is still running; wait for /api/nn-scan-status to complete before running universes.",
+            "message": "Shared scan is still running; using the latest completed shared cache when it is fresh enough.",
             "scan_status": scan_status,
         }
 
@@ -2916,7 +2917,7 @@ def variant_cache_snapshot(database, require_fresh=True, max_age_minutes=180):
             "cache_gap_minutes": cache_gap,
         }
 
-    return {
+    snapshot = {
         "vector_payload": vector_payload,
         "nova_payload": nova_payload,
         "vector_cache_time": vector_time,
@@ -2925,7 +2926,10 @@ def variant_cache_snapshot(database, require_fresh=True, max_age_minutes=180):
         "nova_cache_age_minutes": nova_age,
         "cache_gap_minutes": cache_gap,
         "scan_status": scan_status,
-    }, None
+    }
+    if running_scan_refusal:
+        snapshot["cache_warning"] = running_scan_refusal
+    return snapshot, None
 
 def explain_variant_strategy_match(strategy, pick):
     """Explain one strategy filter decision for variant aliveness diagnostics."""
@@ -3194,9 +3198,11 @@ def update_variant_portfolio(database, variant_id, note="snapshot"):
     closed_rows = [dict(r) for r in database.execute(
         "SELECT * FROM variant_virtual_trades WHERE variant_id=? AND outcome!='open' AND outcome NOT IN ('archived_excess_open')", [variant_id]
     ).fetchall()]
-    cash = float(portfolio["cash"] or 0)
+    starting_cash = float(portfolio["starting_cash"] or 1000.0)
+    open_invested = sum(float(r.get("invested_amount") or 0) for r in open_rows)
     open_value = sum(float(r.get("current_value") or r.get("invested_amount") or 0) for r in open_rows)
     realized_pnl = sum(float(r.get("net_pnl") if r.get("net_pnl") is not None else r.get("gross_pnl") or 0) for r in closed_rows)
+    cash = round(starting_cash + realized_pnl - open_invested, 4)
     equity = round(cash + open_value, 4)
     max_equity = max(float(portfolio["max_equity"] or 1000.0), equity)
     drawdown = 0.0 if max_equity <= 0 else round((max_equity - equity) / max_equity * 100, 2)
@@ -3211,11 +3217,11 @@ def update_variant_portfolio(database, variant_id, note="snapshot"):
     now = current_time_cst().isoformat()
     database.execute("""
         UPDATE variant_portfolios
-        SET equity=?, open_value=?, realized_pnl=?, open_count=?, closed_count=?,
+        SET cash=?, equity=?, open_value=?, realized_pnl=?, open_count=?, closed_count=?,
             win_count=?, loss_count=?, max_equity=?, max_drawdown_pct=?,
             recommended_status=?, lifecycle_reasons=?, updated_at=?
         WHERE variant_id=?
-    """, [equity, round(open_value, 4), round(realized_pnl, 4), len(open_rows), len(closed_rows),
+    """, [cash, equity, round(open_value, 4), round(realized_pnl, 4), len(open_rows), len(closed_rows),
           len(wins), len(losses), max_equity, drawdown, recommended_status, json.dumps(reasons), now, variant_id])
     point_id = f"{variant_id}_{int(time.time())}_{note}"
     database.execute("""
@@ -10674,15 +10680,16 @@ def api_reprice_open_entries():
 @app.route("/api/reprice-variant-open-entries", methods=["POST"])
 def api_reprice_variant_open_entries():
     """
-    Repair open variant trades whose entry prices were captured from stale quotes.
+    Repair variant trades whose entry prices were captured from stale quotes.
 
-    The repair is variant-aware: it replays each open row's recorded
-    buy_date + buy_time, fetches the nearest historical intraday candle, then
-    recalculates current mark, P&L, fees, and the owning variant ledger. This is
-    the backend source of truth for All-view open-card P&L.
+    The repair is variant-aware: it replays each row's recorded buy_date +
+    buy_time, fetches the nearest historical intraday candle, then recalculates
+    P&L, fees, and the owning variant ledger. Closed rows are included only
+    when explicitly requested because they affect realized P&L and win rate.
     """
     body = request.get_json(silent=True) or {}
     apply_changes = bool(body.get("apply", False))
+    include_closed = bool(body.get("include_closed", False))
     target_tickers = {
         str(t).upper()
         for t in body.get("tickers", [])
@@ -10692,7 +10699,10 @@ def api_reprice_variant_open_entries():
     database = None
     try:
         database = get_database()
-        query = "SELECT * FROM variant_virtual_trades WHERE outcome='open'"
+        if include_closed:
+            query = "SELECT * FROM variant_virtual_trades WHERE outcome!='archived_excess_open'"
+        else:
+            query = "SELECT * FROM variant_virtual_trades WHERE outcome='open'"
         params = []
         if target_tickers:
             query += f" AND ticker IN ({','.join(['?'] * len(target_tickers))})"
@@ -10708,7 +10718,11 @@ def api_reprice_variant_open_entries():
             })
 
         now_iso = current_time_cst().isoformat()
-        current_quotes = fetch_current_prices(sorted({row["ticker"] for row in open_positions}))
+        current_quotes = fetch_current_prices(sorted({
+            row["ticker"]
+            for row in open_positions
+            if row.get("outcome") == "open"
+        }))
         touched_variants = set()
         results = []
         updated = 0
@@ -10739,7 +10753,8 @@ def api_reprice_variant_open_entries():
                     continue
 
                 raw_quote = current_quotes.get(ticker)
-                if not raw_quote:
+                is_open_row = position.get("outcome") == "open"
+                if is_open_row and not raw_quote:
                     results.append({
                         "id": position["id"],
                         "variant_id": position["variant_id"],
@@ -10749,8 +10764,8 @@ def api_reprice_variant_open_entries():
                     time.sleep(1.1)
                     continue
 
-                quote = normalize_monitor_quote(raw_quote, pinned["price"])
-                current_price = float(quote["price"])
+                quote = normalize_monitor_quote(raw_quote, pinned["price"]) if raw_quote else {}
+                current_price = float(quote.get("price") or position.get("sell_price") or position.get("current_price") or pinned["price"])
                 new_buy_price = float(pinned["price"])
                 old_buy_price = float(position.get("buy_price") or 0)
                 invested = float(position.get("invested_amount") or DEFAULT_INVESTMENT)
@@ -10758,7 +10773,12 @@ def api_reprice_variant_open_entries():
                 pnl_pct = (current_price - new_buy_price) / max(new_buy_price, 0.01) * 100
                 if direction == "short":
                     pnl_pct = -pnl_pct
-                day_change_percent = float(quote.get("day_change_percent") or quote.get("day_change_pct") or 0)
+                day_change_percent = float(
+                    quote.get("day_change_percent")
+                    or quote.get("day_change_pct")
+                    or position.get("day_change_percent")
+                    or 0
+                )
                 fee_quote = calculate_stock_fee_model(invested, new_buy_price, current_price, direction)
                 entry_integrity_status, entry_integrity_note = build_entry_integrity(
                     {**position, "buy_price": new_buy_price},
@@ -10777,6 +10797,7 @@ def api_reprice_variant_open_entries():
                     "old_pnl_pct": round(float(position.get("actual_move") or 0), 2),
                     "new_pnl_pct": round(pnl_pct, 2),
                     "day_change_percent": round(day_change_percent, 4),
+                    "outcome": position.get("outcome"),
                     "entry_source": pinned.get("source"),
                     "entry_integrity_status": entry_integrity_status,
                     "applied": apply_changes,
