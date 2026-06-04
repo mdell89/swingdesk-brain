@@ -3558,6 +3558,110 @@ def fetch_alpha_vantage_price_at_cst(ticker, target_dt_cst, interval="5min"):
         log.debug(f"Alpha Vantage intraday price error {ticker}: {e}")
         return None
 
+def fetch_yfinance_price_at_cst(ticker, target_dt_cst, interval="5m"):
+    """
+    Fetch the recent intraday candle open nearest to a Central-time target.
+
+    yfinance is a repair fallback, not the primary live quote source. It is
+    useful here because it can return recent pre/post-market 5-minute candles
+    when the direct provider candle endpoints miss an entry timestamp.
+    """
+    try:
+        import yfinance as yf
+        central_aware = target_dt_cst.replace(tzinfo=ZoneInfo("America/Chicago"))
+        target_utc = central_aware.astimezone(ZoneInfo("UTC"))
+        start = (target_utc - timedelta(hours=1)).date().isoformat()
+        end = (target_utc + timedelta(days=1)).date().isoformat()
+        frame = yf.download(
+            ticker,
+            start=start,
+            end=end,
+            interval=interval,
+            prepost=True,
+            auto_adjust=True,
+            progress=False,
+        )
+        if frame is None or frame.empty:
+            return None
+
+        def row_value(row, field):
+            value = row.get(field)
+            if hasattr(value, "iloc"):
+                value = value.iloc[0]
+            return value
+
+        best_index = min(frame.index, key=lambda ts: abs(ts.to_pydatetime() - target_utc))
+        row = frame.loc[best_index]
+        price = row_value(row, "Open") or row_value(row, "Close")
+        if price is None:
+            return None
+        return {
+            "price": float(price),
+            "timestamp": int(best_index.timestamp()),
+            "source": f"yfinance_{interval}_candle",
+        }
+    except Exception as e:
+        log.debug(f"yfinance intraday price error {ticker}: {e}")
+        return None
+
+
+def fetch_entry_price_at_cst(ticker, target_dt_cst, cycle=None):
+    """
+    Resolve a simulated trade entry from the candle nearest its intended
+    Central-time execution slot.
+
+    Entry price is ledger-critical: if this is wrong, open P&L, account value,
+    win rate, and learning data all become untrustworthy. Prefer historical
+    intraday candles, then fall back to an uncached live quote only when the
+    trade is being opened at that moment and no candle provider has coverage.
+    """
+    pinned = (
+        fetch_finnhub_price_at_cst(ticker, target_dt_cst)
+        or fetch_alpha_vantage_price_at_cst(ticker, target_dt_cst)
+        or fetch_yfinance_price_at_cst(ticker, target_dt_cst)
+    )
+    if pinned:
+        return {
+            "price": pinned["price"],
+            "day_change_pct": 0,
+            "day_change_percent": 0,
+            "source": pinned.get("source", "historical_entry_candle"),
+            "timestamp": pinned.get("timestamp"),
+        }
+
+    quote = fetch_quote_with_fallback(ticker, cycle=cycle, use_cache=False)
+    if not quote:
+        return None
+
+    fallback_price = quote.get("price") or quote.get("open")
+    if not fallback_price:
+        return None
+
+    return {
+        **quote,
+        "price": float(fallback_price),
+        "source": f"{quote.get('source', 'provider')}_live_entry_fallback",
+    }
+
+
+def fetch_entry_prices_at_cst(tickers, target_dt_cst):
+    """
+    Batch wrapper for simulated entry prices. Intentionally rate-limited because
+    it may touch several providers while protecting ledger correctness.
+    """
+    if not tickers:
+        return {}
+
+    cycle = ProviderCycle("entry_price")
+    results = {}
+    for ticker in tickers:
+        entry_quote = fetch_entry_price_at_cst(ticker, target_dt_cst, cycle=cycle)
+        if entry_quote:
+            results[ticker] = entry_quote
+        time.sleep(1.1)
+    set_app_state("last_price_provider_summary", json.dumps(cycle.summary()))
+    return results
+
 def fetch_twelve_data_batch(tickers, interval="1day", outputsize=60):
     """
     Fetch OHLCV + history for multiple tickers.
@@ -3776,9 +3880,9 @@ def fetch_current_prices(tickers, pin_to_845=False):
         results = {}
         target = current_time_cst().replace(hour=8, minute=45, second=0, microsecond=0)
         for ticker in tickers:
-            pinned = fetch_finnhub_price_at_cst(ticker, target) or fetch_alpha_vantage_price_at_cst(ticker, target)
+            pinned = fetch_entry_price_at_cst(ticker, target, cycle=cycle)
             if pinned:
-                results[ticker] = {"price": pinned["price"], "day_change_pct": 0, "source": pinned["source"]}
+                results[ticker] = pinned
             else:
                 quote = fetch_quote_with_fallback(ticker, cycle=cycle, use_cache=False)
                 if quote:
@@ -5689,6 +5793,15 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None, require_fr
     today = current_time_cst().strftime("%Y-%m-%d")
     buy_time = buy_time or current_time_cst().strftime("%H:%M:%S")
     target_execution_time = buy_time[:5]
+    buy_time_parts = [int(part) for part in buy_time.split(":")[:3]]
+    while len(buy_time_parts) < 3:
+        buy_time_parts.append(0)
+    entry_target_dt = datetime.strptime(today, "%Y-%m-%d").replace(
+        hour=buy_time_parts[0],
+        minute=buy_time_parts[1],
+        second=buy_time_parts[2],
+        microsecond=0,
+    )
     database = get_database()
     try:
         snapshot, refusal = variant_cache_snapshot(database, require_fresh=require_fresh)
@@ -5752,9 +5865,9 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None, require_fr
                 status["skipped_count"] += 1
                 update_variant_portfolio(database, variant["id"], note="no_picks")
                 continue
-            entry_quotes = fetch_current_prices(
+            entry_quotes = fetch_entry_prices_at_cst(
                 sorted({pick.get("ticker") for pick in selected if pick.get("ticker")}),
-                pin_to_845=(target_execution_time == "08:45"),
+                entry_target_dt,
             )
             variant_opened = 0
             variant_skipped = 0
@@ -10497,6 +10610,7 @@ def api_reprice_open_entries():
                 pinned = (
                     fetch_finnhub_price_at_cst(ticker, target)
                     or fetch_alpha_vantage_price_at_cst(ticker, target)
+                    or fetch_yfinance_price_at_cst(ticker, target)
                 )
                 quote = fetch_finnhub_quote(ticker)
                 if not quote:
@@ -10612,6 +10726,7 @@ def api_reprice_variant_open_entries():
                 pinned = (
                     fetch_finnhub_price_at_cst(ticker, target)
                     or fetch_alpha_vantage_price_at_cst(ticker, target)
+                    or fetch_yfinance_price_at_cst(ticker, target)
                 )
                 if not pinned:
                     results.append({
