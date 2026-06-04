@@ -11,8 +11,14 @@ const formatSellReason = reason => {
 };
 
 /*
- * Overnight Swing Desk — Frontend v34 (Push 57)
+ * Overnight Swing Desk — Frontend v35 (Push 58)
  * ══════════════════════════════════════════════
+ * Changes in Push 58:
+ *   - Rename "Method confluence" → "Confluence tags" across all card types
+ *   - Add qualified_variants tags on pick cards (glass house): shows which
+ *     entry-time variant universes would trade this pick, only in All view
+ *   - averagePicksByTicker now tracks variant execution_time per pick group
+ *
  * Changes in Push 57:
  *   - Fix Nova initialization: setNovaUniverse now loads Nova data first, not Vector
  *   - Fix Day's P&L: removed Vector-only gate so all variants use their own session
@@ -664,17 +670,19 @@ function calculateLedgerSessionPnl({ equityPoints = [], currentEquity = 1000, st
   const points = [...(equityPoints || [])]
     .filter(point => equityPointDate(point))
     .sort((a, b) => new Date(a.timestamp || a.date || 0) - new Date(b.timestamp || b.date || 0));
-  const latestDate = points.reduce((max, point) => {
+  const latestPointDate = points.reduce((max, point) => {
     const date = equityPointDate(point);
     return date && (!today || date <= today) && date > max ? date : max;
   }, "");
-  const priorPoint = latestDate
-    ? [...points].reverse().find(point => equityPointDate(point) < latestDate)
+  const sessionDate = today || latestPointDate;
+  const priorPoint = sessionDate
+    ? [...points].reverse().find(point => equityPointDate(point) < sessionDate)
     : null;
   const previousClose = priorPoint ? Number(priorPoint.equity || startingCash || 1000) : Number(startingCash || 1000);
   return {
     currentEquity: roundMoney(current),
     previousClose: roundMoney(previousClose),
+    sessionDate: sessionDate || null,
     previousCloseDate: priorPoint ? equityPointDate(priorPoint) : null,
     dayPnl: roundMoney(current - previousClose),
   };
@@ -742,22 +750,30 @@ function calculateAggregateEquityHistory(rows = [], today) {
     }))
     .filter(history => history.length);
   if (!histories.length) return [];
-  const maxLength = Math.max(...histories.map(history => history.length));
-  const aggregate = [];
-  for (let index = 0; index < maxLength; index += 1) {
+  const anchors = [...new Set(histories.flatMap(history => history.map(point => point.ts)))]
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+  return anchors.map(anchorTs => {
     const values = histories
-      .map(history => history[Math.min(index, history.length - 1)])
+      .map(history => {
+        let latest = null;
+        for (const point of history) {
+          if (point.ts > anchorTs) break;
+          latest = point;
+        }
+        return latest;
+      })
       .filter(Boolean);
-    if (!values.length) continue;
+    if (!values.length) return null;
     const anchor = values[values.length - 1];
-    aggregate.push({
-      ts: anchor.ts,
+    return {
+      ts: anchorTs,
       date: anchor.date,
       virtual: roundMoney(avg(values.map(point => Number(point.virtual)))),
       intraday: values.some(point => point.intraday),
-    });
-  }
-  return aggregate;
+      universeCount: values.length,
+    };
+  }).filter(Boolean);
 }
 
 const SIGNAL_WEIGHT_LABELS = {
@@ -920,17 +936,26 @@ function sortOpenTradesByMode(trades = [], sortMode = "smart", feeAdjusted = tru
   }
 }
 
+/**
+ * averagePicksByTicker — deduplicates picks across variant universes.
+ * Glass house principle: when viewing "All", each ticker appears once with
+ * averaged confidence and a qualified_variants list showing which entry-time
+ * variants would actually trade this pick. This lets the user see at a glance
+ * which universes agree on a ticker and which don't.
+ */
 function averagePicksByTicker(rows = [], brain = "") {
   const ACTIONABLE_PICK_FLOOR = 65;
   const groups = new Map();
   rows
     .filter(row => row?.brain === brain && String(row.selection_mode || "").toLowerCase() === "all")
     .forEach(row => {
+      const variantTime = row.execution_time || "reg";
+      const variantLabel = row.label || `${row.strategy}/${variantTime}`;
       (row.qualified_preview || []).forEach(pick => {
         if (!pick?.ticker) return;
         if (Number(pick.confidence || 0) < ACTIONABLE_PICK_FLOOR) return;
         if (!groups.has(pick.ticker)) groups.set(pick.ticker, []);
-        groups.get(pick.ticker).push({ ...pick, strategy: row.strategy });
+        groups.get(pick.ticker).push({ ...pick, strategy: row.strategy, _variant_time: variantTime, _variant_label: variantLabel });
       });
     });
   return Array.from(groups.entries()).map(([ticker, group]) => {
@@ -938,6 +963,8 @@ function averagePicksByTicker(rows = [], brain = "") {
     const confidence = Math.round(avg(group.map(p => Number(p.confidence || 0))));
     const move = avg(group.map(p => Number(p.move || 0)));
     const dayChange = avg(group.map(getDisplayDayChangePercent));
+    // qualified_variants: which entry-time variants would trade this pick (glass house)
+    const qualifiedVariants = uniqueList(group.map(p => p._variant_time)).sort();
     return mapPickFields({
       ticker,
       strategy: "All",
@@ -953,6 +980,8 @@ function averagePicksByTicker(rows = [], brain = "") {
       source_variant_count: group.length,
       aggregate_confidence: group.length > 1,
       aggregate_confidence_basis: group.map(p => `${p.strategy}: ${Number(p.confidence || 0)}%`),
+      qualified_variants: qualifiedVariants,
+      qualified_variant_count: qualifiedVariants.length,
     });
   }).sort((a, b) => (b.lc || 0) - (a.lc || 0));
 }
@@ -1330,7 +1359,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
             )}
             {visibleMethods.length > 0 && (
               <div style={{ padding: "6px 10px 6px 4px", background: "#000", borderRadius: 7, marginBottom: 6, border: "1px solid rgba(255,255,255,0.12)" }}>
-                <span style={{ fontSize: 8, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, display: "block", marginBottom: 6, textAlign: "center" }}>Method confluence</span>
+                <span style={{ fontSize: 8, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, display: "block", marginBottom: 6, textAlign: "center" }}>Confluence tags</span>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
                   {visibleMethods.map(m => (
                     <span key={m} onClick={(e) => { e.stopPropagation(); setExpandedMethod(expandedMethod === m ? null : m); }}
@@ -1343,6 +1372,24 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
                     {METHOD_DEFINITIONS[expandedMethod]}
                   </div>
                 )}
+              </div>
+            )}
+            {/* Qualified variants — glass house: shows which entry-time variant
+                universes would actually open a position on this pick. Only visible
+                in the "All" view; when a specific variant is selected, this is
+                redundant since the user already knows the scope. */}
+            {Array.isArray(pick.qualified_variants) && pick.qualified_variants.length > 0 && (
+              <div style={{ padding: "5px 10px", background: "#0a0a12", borderRadius: 7, marginBottom: 6, border: "1px solid rgba(255,255,255,0.08)" }}>
+                <span style={{ fontSize: 7, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, display: "block", marginBottom: 5 }}>Qualified variants</span>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                  {pick.qualified_variants.map(time => (
+                    <span key={time} style={{
+                      fontSize: 8, color: T2, padding: "2px 6px", borderRadius: 3,
+                      border: `1px solid ${BLUE}44`, background: `${BLUE}11`,
+                      fontFamily: "'DM Mono',monospace", letterSpacing: .3
+                    }}>{time === "reg" ? "Reg" : time.replace(/^0/, "")}</span>
+                  ))}
+                </div>
               </div>
             )}
             <div style={{ borderTop: `1px solid ${CARD_BORDER_LONG}`, paddingTop: 6 }}>
@@ -1627,7 +1674,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
           )}
           {(visibleMethods.length > 0 || (trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7)) && (
             <div style={{ padding: "6px 10px 6px 4px", background: "#000", borderRadius: 7, marginTop: 4, border: "1px solid rgba(255,255,255,0.12)" }}>
-              <span style={{ fontSize: 8, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, display: "block", marginBottom: 6, textAlign: "center" }}>Method confluence</span>
+              <span style={{ fontSize: 8, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, display: "block", marginBottom: 6, textAlign: "center" }}>Confluence tags</span>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
                 {visibleMethods.map(m => (
                   <span key={m} className={glowing ? "tag-glow" : ""} onClick={(e) => { e.stopPropagation(); setExpandedMethod(expandedMethod === m ? null : m); setExpandedSignal(null); }}
@@ -2875,7 +2922,6 @@ export default function App() {
   const rawSelectedVariantTrades = allStrategySelected ? aggregateTrades : selectedUniverseTrades;
   const novaUniverseOpen = novaUniverseTrades.filter(t => t.outcome === "open");
   const novaUniverseClosed = novaUniverseTrades.filter(t => t.outcome !== "open");
-  const activeSimulationProjection = calculateSimulationProjection(novaUniverseClosed.length ? novaUniverseClosed : virtualTrades);
   const selectedVariantMatchesTab = allStrategySelected || novaUniverse?.variant?.brain === activeVariantBrain;
   const activeVariantLabel = allStrategySelected
     ? `All Strategies / ${activeVariantBrain} / All`
@@ -2904,6 +2950,12 @@ export default function App() {
       ? calculateAggregateEquityHistory(aggregateLedgerRows, today)
       : normalizeLedgerEquityHistory({ detail: novaUniverse, ledger: selectedVariantLedger, today })
     : [];
+  const selectedClosedTradesForProjection = selectedVariantMatchesTab
+    ? rawSelectedVariantTrades.filter(trade => trade.outcome !== "open")
+    : [];
+  const activeSimulationProjection = calculateSimulationProjection(
+    selectedVariantMatchesTab ? selectedClosedTradesForProjection : virtualTrades
+  );
 
   const openLongPositions = selectedVariantMatchesTab && activeVariantBrain === "Vector"
     ? novaUniverseOpen.filter(t => (t.direction || "long") === "long")
@@ -3034,7 +3086,9 @@ export default function App() {
   const novaOpenPositions = selectedVariantMatchesTab && activeVariantBrain === "Nova"
     ? novaUniverseOpen
     : nnPositions.filter(t => t.outcome === "open");
-  const novaSimulationProjection = calculateSimulationProjection(novaUniverseClosed.length ? novaUniverseClosed : nnPositions);
+  const novaSimulationProjection = calculateSimulationProjection(
+    selectedVariantMatchesTab && activeVariantBrain === "Nova" ? selectedClosedTradesForProjection : nnPositions
+  );
   const novaFreshPositions = novaOpenPositions.filter(t => t.buy_date === today);
   const novaCarryPositions = isWeekendNow ? novaOpenPositions : novaOpenPositions.filter(t => t.buy_date < today);
   const novaOpenFilteredPositions = openDayFilter === "day2"
@@ -3317,7 +3371,7 @@ export default function App() {
             </div>
           </div>
 
-          {portfolioTab === "classic" && allViewScopeNote && (
+          {portfolioTab === "brain" && allViewScopeNote && (
             <div style={{ margin: `0 16px ${HOME_ROW_GAP}px`, fontSize: 8.5, lineHeight: 1.35, color: T3, fontFamily: "'DM Mono',monospace" }}>
               {allViewScopeNote} Deduped card sum {visibleOpenCardPnl >= 0 ? "+" : "-"}${Math.abs(visibleOpenCardPnl).toFixed(2)}.
             </div>
@@ -3625,7 +3679,7 @@ export default function App() {
                   : (nnFiltered[nnFiltered.length - 1]?.virtual || 1000);
                 const nnFirst = selectedVariantSession?.previousClose ?? nnFiltered[0]?.virtual ?? nnLast;
                 const nnChange = novaSessionPnl == null ? round2(nnLast - nnFirst) : novaSessionPnl;
-                const nnUp = novaTotalUp;
+                const nnUp = nnChange >= 0;
                 return (
                   <div style={{ marginBottom: 14 }}>
                     <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 2 }}>
