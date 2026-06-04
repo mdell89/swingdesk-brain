@@ -1,9 +1,19 @@
 """
-brain.py — Overnight Swing Desk Backend v21 (Push 49)
+brain.py — Overnight Swing Desk Backend v22 (Push 50)
 ════════════════════════════════════════════════════════
 Trading Engine with Self-Regulating Queue System
 
-Changes in Push 49:
+Changes in Push 50:
+  - Fix minutes_until_forced_close() to return 0 instead of negative after 2:45 PM
+    — prevents downstream logic from using meaningless negative values
+  - Add end-of-day equity snapshot job at 2:50 PM CST for all active variants
+    — ensures every variant has a daily equity baseline for frontend Day's P&L
+    — glass house principle: Day's P&L should always show real daily change
+  - Add SIGTERM/atexit graceful shutdown handler — if Railway deploys after 2:45 PM,
+    emergency force-close runs before the process dies, preventing positions from
+    staying open overnight due to deploy timing
+
+Previous (Push 49):
   - Remove refresh_variant_open_quotes from /api/variant/<id> — eliminates 20-second
     variant switch delay caused by live Finnhub calls per open position
   - Fix execution-time signal snapshot: now reads cached price data (with daily_history)
@@ -566,10 +576,10 @@ def market_session_state(now=None):
     return "afterhours"
 
 def minutes_until_forced_close():
-    """Returns minutes remaining until the 2:45 PM CST forced close."""
+    """Returns minutes remaining until the 2:45 PM CST forced close. Returns 0 after 2:45 PM."""
     now = current_time_cst()
     close_time = now.replace(hour=14, minute=45, second=0)
-    return int((close_time - now).total_seconds() / 60)
+    return max(0, int((close_time - now).total_seconds() / 60))
 
 def stock_regulatory_sell_fee(sell_notional, share_quantity):
     """Return SEC + FINRA sell-side regulatory fees for a stock liquidation."""
@@ -7894,6 +7904,28 @@ def run_scheduler():
     schedule.every().day.at("19:45").do(force_close_previous_session)
     schedule.every().day.at("19:45").do(force_close_nn_previous_session)
 
+    # 2:50 PM CST = 19:50 UTC — End-of-day equity snapshot for all active variants.
+    # Ensures every variant has at least one equity point per trading day, which the
+    # frontend needs to compute a proper Day's P&L baseline (glass house principle).
+    def eod_variant_equity_snapshot():
+        if current_time_cst().weekday() >= 5:
+            return
+        try:
+            db = get_database()
+            variants = [dict(r) for r in db.execute("""
+                SELECT sv.id FROM strategy_variants sv
+                JOIN variant_portfolios vp ON vp.variant_id = sv.id
+                WHERE sv.status='active' AND vp.lifecycle_status!='archived'
+            """).fetchall()]
+            for v in variants:
+                update_variant_portfolio(db, v["id"], note="eod_snapshot")
+            db.commit()
+            db.close()
+            log.info(f"EOD equity snapshot: {len(variants)} variants updated")
+        except Exception as e:
+            log.error(f"EOD equity snapshot failed: {e}")
+    schedule.every().day.at("19:50").do(eod_variant_equity_snapshot)
+
     # 3:00 PM CST = 20:00 UTC — Market close scan
     schedule.every().day.at("20:00").do(lambda: run_comprehensive_scan(scan_type="market_close"))
 
@@ -11786,6 +11818,33 @@ if os.environ.get("SWINGDESK_DISABLE_STARTUP_TASKS") != "1":
     backfill_nn_missed_closes()
     threading.Thread(target=run_scheduler, daemon=True).start()
     threading.Thread(target=keep_server_alive, daemon=True).start()
+
+# ── GRACEFUL SHUTDOWN ─────────────────────────────────────────────────────────
+# Railway sends SIGTERM on every deploy. Scheduler threads are daemon threads
+# and die immediately. If a force-close is in progress or overdue, this handler
+# ensures positions don't stay open overnight due to deploy timing.
+import signal, atexit
+_shutdown_requested = False
+def _graceful_shutdown(signum=None, frame=None):
+    global _shutdown_requested
+    if _shutdown_requested:
+        return
+    _shutdown_requested = True
+    now = current_time_cst()
+    log.info(f"Shutdown signal received at {now.strftime('%H:%M:%S')} CST")
+    # If it's past 2:45 PM on a weekday and positions might still be open, run force-close
+    if now.weekday() < 5 and (now.hour > 14 or (now.hour == 14 and now.minute >= 45)):
+        try:
+            log.info("Emergency force-close check on shutdown...")
+            force_close_previous_session()
+            force_close_nn_previous_session()
+        except Exception as e:
+            log.error(f"Emergency force-close failed: {e}")
+try:
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    atexit.register(_graceful_shutdown)
+except Exception:
+    pass  # signal handling may not work in all environments
 log.info("Brain v4 initialized — full trading engine with self-regulating queue system + SwingDeskNet NN")
 
 if __name__ == "__main__":
