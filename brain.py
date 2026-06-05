@@ -198,6 +198,7 @@ OPENROUTER_API_KEY   = os.getenv("OPENROUTER_API_KEY")
 XAI_API_KEY          = os.getenv("XAI_API_KEY")
 PERPLEXITY_API_KEY   = os.getenv("PERPLEXITY_API_KEY")
 ALPHA_VANTAGE_KEY    = os.getenv("ALPHA_VANTAGE_KEY")
+MASSIVE_API_KEY      = os.getenv("MASSIVE_API_KEY") or os.getenv("POLYGON_API_KEY")
 DATABASE_PATH        = Path(os.environ.get("DATABASE_PATH", "/app/data/portfolio_brain.db"))
 DEFAULT_INVESTMENT   = 10.00     # Fallback when queue is empty
 STARTING_PORTFOLIO_VALUE = 1000.0
@@ -2394,15 +2395,16 @@ TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 TWELVE_DATA_BASE = "https://api.twelvedata.com"
 FINNHUB_KEY = os.getenv("FINNHUB_KEY")
 FINNHUB_BASE = "https://finnhub.io/api/v1"
+MASSIVE_BASE = os.getenv("MASSIVE_BASE", "https://api.massive.com").rstrip("/")
 QUOTE_CACHE_SECONDS = int(os.getenv("QUOTE_CACHE_SECONDS", "90"))
 PROVIDER_CHAIN = [p.strip() for p in os.getenv(
     "PRICE_PROVIDER_CHAIN",
-    "finnhub,alpha_vantage,twelve_data"
+    "massive,finnhub,alpha_vantage,twelve_data"
 ).split(",") if p.strip()]
 
 class ProviderCycle:
     """Per-job provider memory so a global failure is not retried for every ticker."""
-    def __init__(self, purpose="quote", max_layers=3):
+    def __init__(self, purpose="quote", max_layers=4):
         self.purpose = purpose
         self.max_layers = max_layers
         self.unhealthy = set()
@@ -2421,6 +2423,8 @@ class ProviderCycle:
                 self.errors[provider] = str(error)[:160]
             if global_failure:
                 self.unhealthy.add(provider)
+        if failure_type == "disabled":
+            return
         record_provider_health(
             provider,
             ok,
@@ -2489,6 +2493,19 @@ def _normalize_quote(price, previous_close=None, open_price=None, high=None, low
         "day_change_percent": (price - prev) / max(prev, 0.01) * 100,
         "source": source,
     }
+
+def _first_number(*values):
+    """Return the first value that can be safely interpreted as a non-zero float."""
+    for value in values:
+        try:
+            if value in (None, ""):
+                continue
+            number = float(value)
+            if number != 0:
+                return number
+        except Exception:
+            continue
+    return None
 
 def pct_from_baseline(price, baseline):
     """Return percent change from a baseline, or None when the baseline is unusable."""
@@ -3289,6 +3306,88 @@ def _provider_quote(provider, ticker):
         import urllib.parse
         import urllib.request
         provider = provider.lower()
+        if provider in ("massive", "polygon"):
+            if not MASSIVE_API_KEY:
+                return None, "disabled", "missing MASSIVE_API_KEY", True
+            params = urllib.parse.urlencode({
+                "ticker": ticker,
+                "type": "stocks",
+                "limit": 1,
+                "apiKey": MASSIVE_API_KEY,
+            })
+            urls = [
+                f"{MASSIVE_BASE}/v3/snapshot?{params}",
+                f"{MASSIVE_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/{urllib.parse.quote(ticker)}?apiKey={urllib.parse.quote(MASSIVE_API_KEY)}",
+            ]
+            last_error = None
+            for url in urls:
+                try:
+                    with urllib.request.urlopen(url, timeout=8) as resp:
+                        data = json.loads(resp.read())
+                except Exception as exc:
+                    last_error = exc
+                    continue
+
+                status_text = str(data.get("status") or data.get("error") or "").lower()
+                if data.get("error") or status_text in ("error", "auth_failed"):
+                    message = data.get("error") or data.get("message") or data.get("status")
+                    failure = "rate_limit" if "limit" in str(message).lower() else "bad_response"
+                    return None, failure, message, failure != "bad_response"
+
+                snapshot = None
+                results = data.get("results")
+                if isinstance(results, list) and results:
+                    snapshot = results[0]
+                elif isinstance(results, dict):
+                    snapshot = results
+                elif isinstance(data.get("ticker"), dict):
+                    snapshot = data["ticker"]
+                elif any(isinstance(data.get(key), dict) for key in ("session", "day", "prevDay", "lastTrade")):
+                    snapshot = data
+                if not snapshot:
+                    continue
+
+                session = snapshot.get("session") or {}
+                day = snapshot.get("day") or {}
+                minute = snapshot.get("minute") or snapshot.get("min") or {}
+                previous_day = snapshot.get("prevDay") or snapshot.get("prev_day") or {}
+                last_trade = snapshot.get("lastTrade") or snapshot.get("last_trade") or {}
+                last_quote = snapshot.get("lastQuote") or snapshot.get("last_quote") or {}
+
+                price = _first_number(
+                    session.get("price"),
+                    snapshot.get("value"),
+                    last_trade.get("p"),
+                    last_trade.get("price"),
+                    minute.get("c"),
+                    minute.get("close"),
+                    day.get("c"),
+                    day.get("close"),
+                    last_quote.get("p"),
+                    last_quote.get("price"),
+                )
+                if not price:
+                    continue
+                previous_close = _first_number(
+                    session.get("previous_close"),
+                    previous_day.get("c"),
+                    previous_day.get("close"),
+                    day.get("vw"),
+                    price,
+                )
+                open_price = _first_number(session.get("open"), day.get("o"), day.get("open"), price)
+                high = _first_number(session.get("high"), day.get("h"), day.get("high"), price)
+                low = _first_number(session.get("low"), day.get("l"), day.get("low"), price)
+                quote = _normalize_quote(price, previous_close, open_price, high, low, "massive")
+                volume = _first_number(session.get("volume"), day.get("v"), day.get("volume"), minute.get("v"))
+                if volume is not None:
+                    quote["volume"] = volume
+                return quote, None, None, False
+
+            if last_error:
+                raise last_error
+            return None, "missing", "no massive snapshot price", False
+
         if provider == "finnhub":
             if not FINNHUB_KEY:
                 return None, "disabled", "missing FINNHUB_KEY", True
@@ -3469,6 +3568,67 @@ def fetch_finnhub_candles(ticker, days=60):
         log.debug(f"Finnhub candles error {ticker}: {e}")
         return []
 
+def fetch_massive_price_at_cst(ticker, target_dt_cst, multiplier=5, timespan="minute"):
+    """
+    Fetch the aggregate-bar open nearest to a Central-time execution slot.
+
+    Massive is the preferred historical entry source when configured because
+    wrong simulated entry prices poison P&L, win rate, and learning data.
+    """
+    if not MASSIVE_API_KEY:
+        return None
+    try:
+        import urllib.parse
+        import urllib.request
+
+        central_aware = target_dt_cst.replace(tzinfo=ZoneInfo("America/Chicago"))
+        target_utc = central_aware.astimezone(ZoneInfo("UTC"))
+        target_ms = int(target_utc.timestamp() * 1000)
+        from_ms = int((target_utc - timedelta(minutes=45)).timestamp() * 1000)
+        to_ms = int((target_utc + timedelta(minutes=45)).timestamp() * 1000)
+        encoded_ticker = urllib.parse.quote(ticker.upper())
+        params = urllib.parse.urlencode({
+            "adjusted": "false",
+            "sort": "asc",
+            "limit": 5000,
+            "apiKey": MASSIVE_API_KEY,
+        })
+        url = (
+            f"{MASSIVE_BASE}/v2/aggs/ticker/{encoded_ticker}/range/"
+            f"{multiplier}/{timespan}/{from_ms}/{to_ms}?{params}"
+        )
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+
+        status_text = str(data.get("status") or data.get("error") or "").lower()
+        if data.get("error") or status_text in ("error", "auth_failed"):
+            log.debug(f"Massive aggregate error {ticker}: {data.get('error') or data.get('message') or data.get('status')}")
+            return None
+
+        bars = data.get("results") or []
+        if not bars:
+            return None
+
+        def bar_time_ms(row):
+            return int(row.get("t") or row.get("timestamp") or 0)
+
+        best = min(bars, key=lambda row: abs(bar_time_ms(row) - target_ms))
+        best_ms = bar_time_ms(best)
+        if not best_ms or abs(best_ms - target_ms) > 45 * 60 * 1000:
+            return None
+
+        price = _first_number(best.get("o"), best.get("open"), best.get("c"), best.get("close"))
+        if price is None:
+            return None
+        return {
+            "price": float(price),
+            "timestamp": int(best_ms / 1000),
+            "source": f"massive_{multiplier}m_candle",
+        }
+    except Exception as e:
+        log.debug(f"Massive intraday price error {ticker}: {e}")
+        return None
+
 def fetch_finnhub_price_at_cst(ticker, target_dt_cst, resolution="5"):
     """
     Fetch the intraday candle open nearest to a target CST/CDT time.
@@ -3622,7 +3782,8 @@ def fetch_entry_price_at_cst(ticker, target_dt_cst, cycle=None):
     trade is being opened at that moment and no candle provider has coverage.
     """
     pinned = (
-        fetch_finnhub_price_at_cst(ticker, target_dt_cst)
+        fetch_massive_price_at_cst(ticker, target_dt_cst)
+        or fetch_finnhub_price_at_cst(ticker, target_dt_cst)
         or fetch_alpha_vantage_price_at_cst(ticker, target_dt_cst)
         or fetch_yfinance_price_at_cst(ticker, target_dt_cst)
     )
@@ -3677,11 +3838,12 @@ def fetch_twelve_data_batch(tickers, interval="1day", outputsize=60):
                        day_change_percent, daily_history}}
     """
     results = {}
+    cycle = ProviderCycle("daily_quote_batch")
     RATE_LIMIT_DELAY = 1.1  # 60 calls/min = 1 call/sec + small buffer
 
     for ticker in tickers:
         # First get current quote
-        quote = fetch_finnhub_quote(ticker)
+        quote = fetch_quote_with_fallback(ticker, cycle=cycle, use_cache=True)
         if quote is None:
             time.sleep(RATE_LIMIT_DELAY)
             continue
@@ -3702,7 +3864,7 @@ def fetch_twelve_data_batch(tickers, interval="1day", outputsize=60):
         results[ticker] = quote
         time.sleep(RATE_LIMIT_DELAY)
 
-    log.info(f"Finnhub returned {len(results)}/{len(tickers)} tickers")
+    log.info(f"Price providers returned {len(results)}/{len(tickers)} tickers")
     return results
 
 
@@ -3718,7 +3880,7 @@ def fetch_twelve_data_live(tickers):
     RATE_LIMIT_DELAY = 1.1
 
     for ticker in tickers:
-        quote = fetch_finnhub_quote(ticker)
+        quote = fetch_quote_with_fallback(ticker, use_cache=True)
         if quote:
             results[ticker] = {
                 "price": quote["price"],
@@ -3754,7 +3916,7 @@ def fetch_twelve_data_live(tickers):
     except Exception as e:
         log.debug(f"Volume enrichment skipped: {e}")
 
-    log.info(f"Finnhub live: {len(results)}/{len(tickers)} tickers")
+    log.info(f"Live price providers: {len(results)}/{len(tickers)} tickers")
     return results
 
 
@@ -10614,11 +10776,12 @@ def api_reprice_open_entries():
                 target = buy_date.replace(hour=hour, minute=minute, second=second, microsecond=0)
 
                 pinned = (
-                    fetch_finnhub_price_at_cst(ticker, target)
+                    fetch_massive_price_at_cst(ticker, target)
+                    or fetch_finnhub_price_at_cst(ticker, target)
                     or fetch_alpha_vantage_price_at_cst(ticker, target)
                     or fetch_yfinance_price_at_cst(ticker, target)
                 )
-                quote = fetch_finnhub_quote(ticker)
+                quote = fetch_quote_with_fallback(ticker, use_cache=False)
                 if not quote:
                     results.append({"ticker": ticker, "status": "no_current_quote"})
                     time.sleep(1.1)
@@ -10738,7 +10901,8 @@ def api_reprice_variant_open_entries():
                 target = buy_date.replace(hour=parts[0], minute=parts[1], second=parts[2], microsecond=0)
 
                 pinned = (
-                    fetch_finnhub_price_at_cst(ticker, target)
+                    fetch_massive_price_at_cst(ticker, target)
+                    or fetch_finnhub_price_at_cst(ticker, target)
                     or fetch_alpha_vantage_price_at_cst(ticker, target)
                     or fetch_yfinance_price_at_cst(ticker, target)
                 )
