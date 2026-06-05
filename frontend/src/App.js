@@ -773,7 +773,12 @@ function calculateLedgerSessionPnl({ equityPoints = [], currentEquity = 1000, st
     const date = equityPointDate(point);
     return date && (!today || date <= today) && date > max ? date : max;
   }, "");
-  const sessionDate = today || latestPointDate;
+  const hasTodayPoint = Boolean(today && points.some(point => equityPointDate(point) === today));
+  const sessionDate = hasTodayPoint ? today : latestPointDate;
+  const sessionPoint = sessionDate
+    ? [...points].reverse().find(point => equityPointDate(point) === sessionDate)
+    : null;
+  const sessionEquity = hasTodayPoint ? current : Number(sessionPoint?.equity ?? sessionPoint?.virtual ?? current);
   const priorPoint = sessionDate
     ? [...points].reverse().find(point => equityPointDate(point) < sessionDate)
     : null;
@@ -784,11 +789,12 @@ function calculateLedgerSessionPnl({ equityPoints = [], currentEquity = 1000, st
   const hasPriorDay = !!priorPoint;
   const previousClose = hasPriorDay ? Number(priorPoint.equity || startingCash || 1000) : Number(startingCash || 1000);
   return {
-    currentEquity: roundMoney(current),
+    currentEquity: roundMoney(sessionEquity),
     previousClose: roundMoney(previousClose),
     sessionDate: sessionDate || null,
     previousCloseDate: priorPoint ? equityPointDate(priorPoint) : null,
-    dayPnl: hasPriorDay ? roundMoney(current - previousClose) : null,
+    dayPnl: hasPriorDay ? roundMoney(sessionEquity - previousClose) : null,
+    isLastCompletedSession: Boolean(today && sessionDate && sessionDate < today),
     hasPriorDay,
   };
 }
@@ -812,6 +818,7 @@ function calculateAggregateSessionPnl(rows = [], today) {
       previousCloseDate: null,
       dayPnl: null,
       hasPriorDay: false,
+      isLastCompletedSession: false,
       universeCount: sessions.length,
     };
   }
@@ -822,6 +829,7 @@ function calculateAggregateSessionPnl(rows = [], today) {
     previousCloseDate: null,
     dayPnl: roundMoney(currentEquity - previousClose),
     hasPriorDay: true,
+    isLastCompletedSession: sessions.every(session => session.isLastCompletedSession),
     universeCount: sessions.length,
   };
 }
@@ -3248,7 +3256,9 @@ export default function App() {
   const selectedDayPnlModeLabel = selectedVariantMatchesTab && selectedVariantSession
     ? selectedVariantSession.dayPnl == null
       ? "no baseline"
-      : "last close"
+      : selectedVariantSession.isLastCompletedSession
+        ? "last session"
+        : "live"
     : dayPnlModeLabel;
   const novaOpenPositions = selectedVariantMatchesTab && activeVariantBrain === "Nova"
     ? novaUniverseOpen
@@ -3501,9 +3511,9 @@ export default function App() {
                 const dayUp2 = dayKnown && dayPnl >= 0;
                 return (
                   <div style={{ textAlign: "right", lineHeight: 1, paddingTop: 6 }}>
-                    <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L{selectedDayPnlModeLabel ? ` · ${selectedDayPnlModeLabel}` : ""}</div>
+                    <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Session P&amp;L{selectedDayPnlModeLabel ? ` · ${selectedDayPnlModeLabel}` : ""}</div>
                     {dayKnown
-                      ? <div style={{ fontSize: 16, fontWeight: 600, color: dayUp2 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(dayPnl)}</div>
+                      ? <div style={{ fontSize: 16, fontWeight: 600, color: Math.abs(dayPnl) < 0.005 ? T3 : dayUp2 ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(dayPnl)}</div>
                       : <div style={{ fontSize: 14, fontWeight: 500, color: T3, fontFamily: "'DM Mono',monospace" }}>—</div>
                     }
                   </div>
@@ -3512,6 +3522,7 @@ export default function App() {
             </div>
 
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+              <span style={{ fontSize: 9, color: T3, fontWeight: 700, letterSpacing: .5, textTransform: "uppercase" }}>Total return</span>
               <span style={{ fontSize: 13, fontWeight: 500, color: activeTotalUp ? GREEN : RED }}>{activeTotalUp ? "↑" : "↓"} {Math.abs(activeTotalPercent).toFixed(2)}%</span>
               <span style={{ fontSize: 12, color: T3 }}>{formatSignedCurrency(activeTotalPnl)}</span>
               <span style={{ fontSize: 10, color: T3 }}>(realized + open)</span>
@@ -3871,14 +3882,15 @@ export default function App() {
                         </div>
                       </div>
                       <div style={{ textAlign: "right", lineHeight: 1, paddingTop: 6 }}>
-                        <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Day's P&amp;L{selectedDayPnlModeLabel ? ` · ${selectedDayPnlModeLabel}` : ""}</div>
+                        <div style={{ fontSize: 9, color: T3, marginBottom: 2 }}>Session P&amp;L{selectedDayPnlModeLabel ? ` · ${selectedDayPnlModeLabel}` : ""}</div>
                         {nnKnown
-                          ? <div style={{ fontSize: 16, fontWeight: 600, color: nnUp ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(nnChange)}</div>
+                          ? <div style={{ fontSize: 16, fontWeight: 600, color: Math.abs(nnChange) < 0.005 ? T3 : nnUp ? GREEN : RED, fontFamily: "'DM Mono',monospace" }}>{formatSignedCurrency(nnChange)}</div>
                           : <div style={{ fontSize: 14, fontWeight: 500, color: T3, fontFamily: "'DM Mono',monospace" }}>—</div>
                         }
                       </div>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+                      <span style={{ fontSize: 9, color: T3, fontWeight: 700, letterSpacing: .5, textTransform: "uppercase" }}>Total return</span>
                       <span style={{ fontSize: 13, fontWeight: 500, color: novaTotalUp ? GREEN : RED }}>{novaTotalUp ? "↑" : "↓"} {Math.abs(novaTotalPercent).toFixed(2)}%</span>
                       <span style={{ fontSize: 12, color: T3 }}>{formatSignedCurrency(novaTotalPnl)}</span>
                       <span style={{ fontSize: 10, color: T3 }}>(realized + open)</span>
