@@ -2300,6 +2300,8 @@ function SettingsDrawer({ open, onClose, T1, T2, T3, BORDER, BG, CARD, GREEN, BL
 
   const provider = settings.provider || "twilio";
   const telegramConfigured = settings.telegram_configured;
+  const legacyAlertsRetired = settings.legacy_trade_notifications_retired !== false;
+  const alertChannelLabel = provider === "telegram" ? "Telegram bot" : "Twilio SMS";
 
   if (!open) return null;
   return (
@@ -2324,13 +2326,18 @@ function SettingsDrawer({ open, onClose, T1, T2, T3, BORDER, BG, CARD, GREEN, BL
         <div style={{ fontSize: 11, fontWeight: 600, color: T3, textTransform: "uppercase", letterSpacing: .5, marginBottom: 10 }}>Notifications</div>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px", background: BG, borderRadius: 10, border: `1px solid ${BORDER}`, marginBottom: 8 }}>
           <div>
-            <div style={{ fontSize: 13, color: T1, fontWeight: 500 }}>Notify when a position closes</div>
+            <div style={{ fontSize: 13, color: T1, fontWeight: 500 }}>Trade alerts</div>
             <div style={{ fontSize: 10, color: T3, marginTop: 2 }}>
-              {provider === "telegram" ? "via Telegram bot" : "SMS via Twilio"} — cut, force close, or reversal
+              {legacyAlertsRetired
+                ? `Legacy alerts retired. ${alertChannelLabel} is route-test only until variant alerts ship.`
+                : `${alertChannelLabel} - cut, force close, or reversal`}
             </div>
           </div>
-          <div onClick={toggle} style={{ cursor: "pointer", width: 44, height: 24, borderRadius: 12, background: notifyOn ? GREEN : BORDER, transition: "background 0.2s", position: "relative", flexShrink: 0, marginLeft: 12 }}>
-            <div style={{ position: "absolute", top: 2, left: notifyOn ? 22 : 2, width: 20, height: 20, borderRadius: "50%", background: "#fff", transition: "left 0.2s" }}/>
+          <div
+            onClick={legacyAlertsRetired ? undefined : toggle}
+            style={{ cursor: legacyAlertsRetired ? "not-allowed" : "pointer", width: 44, height: 24, borderRadius: 12, background: legacyAlertsRetired ? BORDER : notifyOn ? GREEN : BORDER, opacity: legacyAlertsRetired ? 0.65 : 1, transition: "background 0.2s", position: "relative", flexShrink: 0, marginLeft: 12 }}
+          >
+            <div style={{ position: "absolute", top: 2, left: legacyAlertsRetired ? 2 : notifyOn ? 22 : 2, width: 20, height: 20, borderRadius: "50%", background: "#fff", transition: "left 0.2s" }}/>
           </div>
         </div>
 

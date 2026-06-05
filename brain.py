@@ -212,6 +212,8 @@ SCAN_EVENT_RETENTION_DAYS = 30   # Raw operational scan telemetry retention
 ARCHIVED_VARIANT_OUTCOMES = ("archived_excess_open",)
 MODEL_STOP_LOSS_REASON = "model_stop_loss"
 LEGACY_STOP_LOSS_REASONS = {"stop_loss", MODEL_STOP_LOSS_REASON}
+LEGACY_TRADE_ENGINE_ENABLED = os.environ.get("SWINGDESK_LEGACY_TRADE_ENGINE", "0").lower() in {"1", "true", "yes", "on"}
+LEGACY_TRADE_NOTIFICATIONS_ENABLED = os.environ.get("SWINGDESK_LEGACY_TRADE_NOTIFICATIONS", "0").lower() in {"1", "true", "yes", "on"}
 MONITOR_INTERVAL     = 300       # 5 minutes in seconds
 SCAN_BATCH_SIZE      = 100       # Tickers per yfinance batch call
 
@@ -1674,6 +1676,14 @@ def notification_enabled():
         return get_app_state_value("notify_on_close", "true") != "false"
     except Exception:
         return True
+
+def legacy_trade_engine_enabled():
+    """Return whether the retired virtual_trades opener may create new trades."""
+    return LEGACY_TRADE_ENGINE_ENABLED
+
+def legacy_trade_notifications_enabled():
+    """Return whether retired virtual_trades alerts may reach the user."""
+    return LEGACY_TRADE_NOTIFICATIONS_ENABLED and notification_enabled()
 
 def record_monitor_status(**updates):
     """Persist the latest open-position monitor status for UI and alerting."""
@@ -5303,6 +5313,10 @@ def send_close_notification(ticker, pnl_dollar, pnl_pct, close_reason, close_tim
     Provider: NOTIFY_PROVIDER env var — 'telegram' or 'twilio' (default twilio).
     Only fires if notifications are enabled in app_state.
     """
+    if not legacy_trade_notifications_enabled():
+        log.info(f"Legacy close notification suppressed for {ticker}: {close_reason}")
+        return
+
     try:
         db = get_database()
         setting = db.execute("SELECT value FROM app_state WHERE key='notify_on_close'").fetchone()
@@ -5347,6 +5361,9 @@ def is_visible_weak_state(position, pnl_percent):
 
 def update_weak_alert_state(position, pnl_percent, should_sell=False):
     """Send low-noise Weak alerts based on the same binary state the UI shows."""
+    if not legacy_trade_notifications_enabled():
+        return
+
     ticker = position.get("ticker")
     trade_id = position.get("id") or f"{ticker}_{position.get('buy_date')}"
     if not ticker or should_sell:
@@ -5390,6 +5407,9 @@ def update_weak_alert_state(position, pnl_percent, should_sell=False):
 
 def send_sell_rule_alert(position, pnl_percent, reason):
     """Send immediate sell-rule alert and suppress future weak alerts for this trade."""
+    if not legacy_trade_notifications_enabled():
+        return
+
     ticker = position.get("ticker")
     trade_id = position.get("id") or f"{ticker}_{position.get('buy_date')}"
     if not ticker:
@@ -6955,6 +6975,12 @@ def execute_opening_positions(trigger="scheduled", buy_time="08:45:00"):
     }
     record_open_execution_status(status)
 
+    if not legacy_trade_engine_enabled():
+        status["disabled"] = True
+        status["last_error"] = "Legacy virtual_trades opener retired; variant universe is authoritative."
+        log.info(status["last_error"])
+        return record_open_execution_status(status)
+
     try:
         today = current_time_cst().strftime("%Y-%m-%d")
         database = get_database()
@@ -7133,6 +7159,12 @@ def execute_nn_opening_positions(trigger="scheduled", buy_time="08:45:00"):
         "last_error": None,
     }
     record_nn_open_execution_status(status)
+
+    if not legacy_trade_engine_enabled():
+        status["disabled"] = True
+        status["last_error"] = "Legacy NN opener retired; variant universe is authoritative."
+        log.info(status["last_error"])
+        return record_nn_open_execution_status(status)
 
     try:
         today = current_time_cst().strftime("%Y-%m-%d")
@@ -8334,8 +8366,11 @@ def run_scheduler():
     add_scan(dispatch, "08:15", "final_scan")
     add_job(dispatch, "08:25", "lock_pick_queue", lock_pick_queue)
     add_scan(dispatch, "08:30", "market_open")
-    add_job(dispatch, "08:45", "execute_opening_positions", execute_opening_positions)
-    add_job(dispatch, "08:45", "execute_nn_opening_positions", execute_nn_opening_positions)
+    if legacy_trade_engine_enabled():
+        add_job(dispatch, "08:45", "execute_opening_positions", execute_opening_positions)
+        add_job(dispatch, "08:45", "execute_nn_opening_positions", execute_nn_opening_positions)
+    else:
+        log.info("Legacy virtual_trades openers disabled; variant universe is authoritative")
     add_job(dispatch, "08:45", "variant_0845", lambda: run_variant_universes_from_cache(trigger="scheduled_0845", buy_time="08:45:00"))
 
     for slot, label in [
@@ -12265,6 +12300,11 @@ def api_get_notification_settings():
             "provider": provider,
             "telegram_configured": telegram_configured,
             "twilio_configured": twilio_configured,
+            "trade_alert_source": "variant_universe",
+            "legacy_trade_engine_enabled": legacy_trade_engine_enabled(),
+            "legacy_trade_notifications_env_enabled": LEGACY_TRADE_NOTIFICATIONS_ENABLED,
+            "legacy_trade_notifications_enabled": legacy_trade_notifications_enabled(),
+            "legacy_trade_notifications_retired": not legacy_trade_notifications_enabled(),
         })
     except Exception as e:
         return jsonify({"notify_on_close": True, "error": str(e)})
@@ -12287,7 +12327,10 @@ def api_set_notification_settings():
 def api_test_notification():
     try:
         provider = os.environ.get("NOTIFY_PROVIDER", "twilio").lower()
-        test_msg = "SwingDesk: Test notification working. You'll be notified on cut, force close, and overnight reversal."
+        test_msg = (
+            "SwingDesk: Test notification route working. "
+            "Legacy trade alerts are retired; variant-universe alerts are next."
+        )
 
         if provider == "telegram":
             success = send_telegram_notification(test_msg)
