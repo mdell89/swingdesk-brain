@@ -208,6 +208,7 @@ MAX_LONG_PICKS       = 20        # Maximum long recommendations per scan
 MAX_SHORT_PICKS      = 10        # Maximum short recommendations per scan
 MIN_VOLUME_RATIO     = 1.2       # Minimum volume activity to confirm a real setup
 MAX_ALL_VARIANT_OPEN_POSITIONS = 50
+SCAN_EVENT_RETENTION_DAYS = 30   # Raw operational scan telemetry retention
 ARCHIVED_VARIANT_OUTCOMES = ("archived_excess_open",)
 MODEL_STOP_LOSS_REASON = "model_stop_loss"
 LEGACY_STOP_LOSS_REASONS = {"stop_loss", MODEL_STOP_LOSS_REASON}
@@ -1689,6 +1690,30 @@ def get_monitor_status():
     if last_monitor and not status.get("last_success_at"):
         status["last_success_at"] = last_monitor.get("checked_at")
     return status
+
+def prune_scan_history(retention_days=SCAN_EVENT_RETENTION_DAYS):
+    """Delete raw scan telemetry older than the operational retention window."""
+    cutoff = (current_time_cst() - timedelta(days=retention_days)).isoformat()
+    database = get_database()
+    scan_events_deleted = database.execute(
+        "DELETE FROM scan_events WHERE started_at < ?",
+        [cutoff],
+    ).rowcount
+    legacy_scan_cache_deleted = database.execute(
+        "DELETE FROM scan_cache WHERE scan_time < ?",
+        [cutoff],
+    ).rowcount
+    database.commit()
+    database.close()
+    result = {
+        "retention_days": retention_days,
+        "cutoff": cutoff,
+        "scan_events_deleted": max(scan_events_deleted, 0),
+        "legacy_scan_cache_deleted": max(legacy_scan_cache_deleted, 0),
+    }
+    if result["scan_events_deleted"] or result["legacy_scan_cache_deleted"]:
+        log.info(f"Pruned raw scan history: {result}")
+    return result
 
 def begin_scan_event(scan_type, job_type="scan", tickers_attempted=0):
     """Create a durable scan/monitor event row and return its id."""
@@ -3340,6 +3365,34 @@ def update_variant_portfolio(database, variant_id, note="snapshot"):
         "recommended_status": recommended_status,
         "lifecycle_reasons": reasons,
     }
+
+def classify_variant_equity_point(point):
+    """Classify a variant equity point by source so charts do not infer from raw notes."""
+    note = str((point or {}).get("note") or "").lower()
+    if note == "seed":
+        return "seed"
+    if any(token in note for token in ("reprice", "repair", "backfill")):
+        return "maintenance"
+    if note == "eod_snapshot":
+        return "eod"
+    if note.startswith("monitor"):
+        return "monitor"
+    if note == "detail_refresh":
+        return "monitor"
+    if note.startswith("run_"):
+        return "trade_execution"
+    if note.startswith("no_strategy_picks"):
+        return "evaluation"
+    return "market"
+
+def decorate_variant_equity_point(point):
+    """Attach glass-house metadata to a variant equity point without mutating storage."""
+    decorated = dict(point or {})
+    point_type = classify_variant_equity_point(decorated)
+    decorated["point_type"] = point_type
+    decorated["chart_eligible"] = point_type != "maintenance"
+    decorated["is_market_performance"] = point_type in {"monitor", "eod", "trade_execution", "market"}
+    return decorated
 
 def recommend_variant_lifecycle(closed_count, win_count, equity, max_drawdown_pct):
     """Deterministic lifecycle flags; Aegis explains, user approves movement."""
@@ -8248,6 +8301,13 @@ def run_scheduler():
         except Exception as error:
             log.error(f"NN training failed: {error}")
 
+    def run_scan_history_retention():
+        """Apply the 30-day raw scan telemetry retention policy."""
+        try:
+            prune_scan_history(SCAN_EVENT_RETENTION_DAYS)
+        except Exception as error:
+            log.error(f"Scan history retention failed: {error}")
+
     def run_scheduled_job(name, callback):
         try:
             log.info(f"Scheduled job started: {name}")
@@ -8301,6 +8361,7 @@ def run_scheduler():
         add_scan(dispatch, slot, f"post_market_{label}")
 
     add_job(dispatch, "19:00", "daily_learning_audit_nn_training", run_daily_learning_audit_and_training)
+    add_job(dispatch, "19:10", "scan_history_retention", run_scan_history_retention)
 
     log.info("Scheduler started: Chicago-time dispatcher, 30min shared scans, 2.5min regular/5min extended monitoring")
 
@@ -9611,6 +9672,7 @@ def api_variant_detail(variant_id):
             ORDER BY timestamp DESC
             LIMIT 500
         """, [variant_id]).fetchall()]
+        equity = [decorate_variant_equity_point(point) for point in equity]
         db.close()
         payload = {
             "variant": dict(variant),
@@ -12366,6 +12428,10 @@ def backfill_nn_missed_closes():
         log.error(f"NN startup backfill failed: {e}")
 
 if os.environ.get("SWINGDESK_DISABLE_STARTUP_TASKS") != "1":
+    try:
+        prune_scan_history(SCAN_EVENT_RETENTION_DAYS)
+    except Exception as e:
+        log.error(f"Startup scan history retention failed: {e}")
     backfill_missed_closes()
     backfill_nn_missed_closes()
     threading.Thread(target=run_scheduler, daemon=True).start()

@@ -765,6 +765,7 @@ function equityPointDate(point = {}) {
 }
 
 function isMaintenanceEquityPoint(point = {}) {
+  if (point.chart_eligible === false || point.point_type === "maintenance") return true;
   const note = String(point.note || "").toLowerCase();
   return note.includes("reprice") || note.includes("repair") || note.includes("backfill");
 }
@@ -857,6 +858,7 @@ function normalizeLedgerEquityHistory({ detail = {}, ledger = {}, today }) {
         ts,
         date: equityPointDate(point),
         virtual: roundMoney(virtual),
+        pointType: point.point_type || "market",
         synthetic: false,
       };
     })
