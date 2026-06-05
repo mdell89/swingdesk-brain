@@ -764,10 +764,16 @@ function equityPointDate(point = {}) {
   return String(point.date || point.timestamp || "").slice(0, 10);
 }
 
+function isMaintenanceEquityPoint(point = {}) {
+  const note = String(point.note || "").toLowerCase();
+  return note.includes("reprice") || note.includes("repair") || note.includes("backfill");
+}
+
 function calculateLedgerSessionPnl({ equityPoints = [], currentEquity = 1000, startingCash = 1000, today }) {
   const current = Number(currentEquity ?? startingCash ?? 1000);
   const points = [...(equityPoints || [])]
     .filter(point => equityPointDate(point))
+    .filter(point => !isMaintenanceEquityPoint(point))
     .sort((a, b) => new Date(a.timestamp || a.date || 0) - new Date(b.timestamp || b.date || 0));
   const latestPointDate = points.reduce((max, point) => {
     const date = equityPointDate(point);
@@ -837,7 +843,11 @@ function calculateAggregateSessionPnl(rows = [], today) {
 function normalizeLedgerEquityHistory({ detail = {}, ledger = {}, today }) {
   const startingCash = Number(ledger.starting_cash ?? detail?.portfolio?.starting_cash ?? 1000);
   const currentEquity = Number(ledger.equity ?? startingCash);
+  const openCount = Number(ledger.open_count ?? detail?.portfolio?.open_count ?? 0);
+  const openValue = Number(ledger.open_value ?? detail?.portfolio?.open_value ?? 0);
+  const hasOpenExposure = openCount > 0 || Math.abs(openValue) > 0.005;
   const points = (detail?.equity_points || [])
+    .filter(point => !isMaintenanceEquityPoint(point))
     .map(point => {
       const timestamp = point.timestamp || point.date;
       const ts = new Date(timestamp || 0).getTime();
@@ -855,13 +865,13 @@ function normalizeLedgerEquityHistory({ detail = {}, ledger = {}, today }) {
   const nowTs = Date.now();
   const livePoint = { ts: nowTs, date: today, virtual: roundMoney(currentEquity), intraday: true, synthetic: true };
   if (!points.length) {
-    return [
+    return hasOpenExposure ? [
       { ts: nowTs - 60000, date: today, virtual: roundMoney(startingCash), seed: true },
       livePoint,
-    ];
+    ] : [];
   }
   const last = points[points.length - 1];
-  if (Math.abs(Number(last.virtual) - currentEquity) > 0.005 || last.date !== today) {
+  if (hasOpenExposure && Math.abs(Number(last.virtual) - currentEquity) > 0.005) {
     return [...points, livePoint];
   }
   return points;
@@ -1276,7 +1286,7 @@ function filterPerfHistoryForTimeframe(data, timeframe, lastTradingDate) {
     const latestDay = latestTradingPoint.date || lastTradingDate;
     const dayPoints = data.filter(p => p.date === latestDay);
     const regularSessionPoints = dayPoints.filter(isRegularSessionChartPoint);
-    const chartDayPoints = regularSessionPoints.length >= 2 ? regularSessionPoints : dayPoints;
+    const chartDayPoints = regularSessionPoints.length >= 2 ? regularSessionPoints : dayPoints.filter(point => !point.synthetic);
 
     if (chartDayPoints.length < 2) return chartDayPoints;
     return chartDayPoints;
@@ -1303,7 +1313,7 @@ function MiniChart({ data, timeframe, feeAdjusted = false }) {
 
   if (filteredData.length < 2) return (
     <div style={{ height: HEIGHT, display: "flex", alignItems: "center", justifyContent: "center", color: "#444", fontSize: 11 }}>
-      Waiting for trade data...
+      {timeframe === "D" ? "No session chart data" : "Waiting for trade data..."}
     </div>
   );
 
