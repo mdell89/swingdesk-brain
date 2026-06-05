@@ -1247,6 +1247,15 @@ def initialize_database():
             news_article_count INTEGER DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS retired_legacy_trades (
+            source_table TEXT NOT NULL,
+            trade_id TEXT NOT NULL,
+            retired_at TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            PRIMARY KEY (source_table, trade_id)
+        );
+
         CREATE TABLE IF NOT EXISTS personal_trades (
             id TEXT PRIMARY KEY,
             ticker TEXT NOT NULL,
@@ -1684,6 +1693,48 @@ def legacy_trade_engine_enabled():
 def legacy_trade_notifications_enabled():
     """Return whether retired virtual_trades alerts may reach the user."""
     return LEGACY_TRADE_NOTIFICATIONS_ENABLED and notification_enabled()
+
+def retire_open_legacy_trades(reason="legacy_trade_system_retired"):
+    """Archive and remove active rows from retired legacy trade tables."""
+    if legacy_trade_engine_enabled():
+        return {"retired": False, "reason": "legacy trade engine enabled"}
+
+    retired_at = current_time_cst().isoformat()
+    database = get_database()
+    summary = {}
+    try:
+        for table_name in ("virtual_trades", "nn_virtual_trades"):
+            rows = [dict(row) for row in database.execute(
+                f"SELECT * FROM {table_name} WHERE outcome='open'"
+            ).fetchall()]
+            for row in rows:
+                trade_id = row.get("id")
+                if not trade_id:
+                    continue
+                database.execute("""
+                    INSERT OR REPLACE INTO retired_legacy_trades
+                    (source_table, trade_id, retired_at, reason, payload)
+                    VALUES (?, ?, ?, ?, ?)
+                """, [table_name, trade_id, retired_at, reason, json.dumps(row, default=str)])
+                database.execute(f"DELETE FROM {table_name} WHERE id=?", [trade_id])
+            summary[table_name] = len(rows)
+
+        database.execute(
+            "INSERT OR REPLACE INTO app_state VALUES (?, ?)",
+            ["legacy_trade_retirement", json.dumps({
+                "retired_at": retired_at,
+                "reason": reason,
+                "summary": summary,
+            })],
+        )
+        database.commit()
+    finally:
+        database.close()
+
+    retired_count = sum(summary.values())
+    if retired_count:
+        log.warning(f"Retired {retired_count} active legacy trade rows: {summary}")
+    return {"retired": True, "retired_count": retired_count, "summary": summary}
 
 def record_monitor_status(**updates):
     """Persist the latest open-position monitor status for UI and alerting."""
@@ -7324,6 +7375,10 @@ def execute_nn_opening_positions(trigger="scheduled", buy_time="08:45:00"):
 
 def monitor_nn_open_positions():
     """Update and settle open NN positions using the NN portfolio ledger."""
+    if not legacy_trade_engine_enabled():
+        retire_open_legacy_trades("legacy_nn_monitor_retired")
+        return {"success": True, "retired": True, "updated": 0, "closed": 0}
+
     database = get_database()
     open_positions = [dict(t) for t in database.execute(
         "SELECT * FROM nn_virtual_trades WHERE outcome='open'"
@@ -7850,6 +7905,17 @@ def _monitor_open_positions_impl():
 
 def monitor_open_positions():
     """Run the open-position monitor with watchdog cleanup around the hot path."""
+    if not legacy_trade_engine_enabled():
+        result = retire_open_legacy_trades("legacy_monitor_retired")
+        status = record_monitor_status(
+            status="retired",
+            started=False,
+            finished_at=current_time_cst().isoformat(),
+            error=None,
+            retired_legacy_trades=result,
+        )
+        return {"success": True, "retired": True, "status": status}
+
     started_at = current_time_cst().isoformat()
     if not _monitor_singleflight_lock.acquire(blocking=False):
         event_id = begin_scan_event("open_position_monitor", job_type="monitor", tickers_attempted=0)
@@ -7884,6 +7950,11 @@ def force_close_previous_session():
     Their ending values are added to the trade queue for compounding.
     Order is randomized to avoid alphabetical bias.
     """
+    if not legacy_trade_engine_enabled():
+        result = retire_open_legacy_trades("legacy_force_close_retired")
+        log.info(f"force_close_previous_session retired legacy rows instead of force-closing: {result}")
+        return result
+
     now = current_time_cst()
     # Skip weekends — markets are closed, Finnhub returns stale/zero prices
     if now.weekday() >= 5:
@@ -7982,6 +8053,11 @@ def force_close_previous_session():
 # ── SELF-AUDIT ENGINE ─────────────────────────────────────────────────────────
 def force_close_nn_previous_session():
     """Force-close previous-session NN positions without touching the main queue."""
+    if not legacy_trade_engine_enabled():
+        result = retire_open_legacy_trades("legacy_nn_force_close_retired")
+        log.info(f"force_close_nn_previous_session retired legacy rows instead of force-closing: {result}")
+        return result
+
     now = current_time_cst()
     if now.weekday() >= 5:
         log.info("force_close_nn_previous_session: skipping weekend")
@@ -8383,8 +8459,9 @@ def run_scheduler():
     ]:
         add_scan(dispatch, slot, f"regular_{label}")
 
-    add_job(dispatch, "14:45", "force_close_previous_session", force_close_previous_session)
-    add_job(dispatch, "14:45", "force_close_nn_previous_session", force_close_nn_previous_session)
+    if legacy_trade_engine_enabled():
+        add_job(dispatch, "14:45", "force_close_previous_session", force_close_previous_session)
+        add_job(dispatch, "14:45", "force_close_nn_previous_session", force_close_nn_previous_session)
     add_job(dispatch, "14:50", "eod_variant_equity_snapshot", eod_variant_equity_snapshot)
     add_scan(dispatch, "15:00", "market_close")
 
@@ -8431,13 +8508,17 @@ def run_scheduler():
 
         if is_active and current_time - last_monitor_time >= dynamic_interval:
             last_monitor_time = current_time
-            threading.Thread(
-                target=run_scheduled_job,
-                args=("dynamic_monitoring_cycle", lambda: (
+            if legacy_trade_engine_enabled():
+                monitor_callback = lambda: (
                     monitor_open_positions(),
                     monitor_nn_open_positions(),
                     monitor_variant_universes(trigger="scheduled"),
-                )),
+                )
+            else:
+                monitor_callback = lambda: monitor_variant_universes(trigger="scheduled")
+            threading.Thread(
+                target=run_scheduled_job,
+                args=("dynamic_monitoring_cycle", monitor_callback),
                 daemon=True,
             ).start()
 
@@ -12378,6 +12459,10 @@ def backfill_missed_closes():
     Uses last known current_value as the closing price — best available data.
     All writes use a single DB connection to avoid locking conflicts.
     """
+    if not legacy_trade_engine_enabled():
+        log.info("Startup backfill skipped; legacy virtual_trades system is retired")
+        return
+
     try:
         now = current_time_cst()
         if now.weekday() >= 5 or (now.hour < 14 or (now.hour == 14 and now.minute < 45)):
@@ -12430,6 +12515,10 @@ def backfill_missed_closes():
 
 def backfill_nn_missed_closes():
     """Settle NN positions left open from previous sessions after restarts."""
+    if not legacy_trade_engine_enabled():
+        log.info("NN startup backfill skipped; legacy NN trade system is retired")
+        return
+
     try:
         now = current_time_cst()
         if now.weekday() >= 5 or (now.hour < 14 or (now.hour == 14 and now.minute < 45)):
@@ -12475,6 +12564,7 @@ if os.environ.get("SWINGDESK_DISABLE_STARTUP_TASKS") != "1":
         prune_scan_history(SCAN_EVENT_RETENTION_DAYS)
     except Exception as e:
         log.error(f"Startup scan history retention failed: {e}")
+    retire_open_legacy_trades("startup_legacy_trade_system_retired")
     backfill_missed_closes()
     backfill_nn_missed_closes()
     threading.Thread(target=run_scheduler, daemon=True).start()
@@ -12497,8 +12587,9 @@ def _graceful_shutdown(signum=None, frame=None):
     if now.weekday() < 5 and (now.hour > 14 or (now.hour == 14 and now.minute >= 45)):
         try:
             log.info("Emergency force-close check on shutdown...")
-            force_close_previous_session()
-            force_close_nn_previous_session()
+            if legacy_trade_engine_enabled():
+                force_close_previous_session()
+                force_close_nn_previous_session()
         except Exception as e:
             log.error(f"Emergency force-close failed: {e}")
 try:
