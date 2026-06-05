@@ -1238,6 +1238,27 @@ function CardActionRow({ statusLabel, statusPhrase, statusColor, staleTime, acti
 
 // ─── MINI CHART ───────────────────────────────────────────────────────────────
 const TIMEFRAME_DAYS = { D: 1, W: 7, M: 30, "3M": 90, Y: 365, ALL: 9999 };
+const REGULAR_SESSION_START_MINUTES_CT = 8 * 60 + 30;
+const REGULAR_SESSION_END_MINUTES_CT = 15 * 60;
+
+function isRegularSessionChartPoint(point) {
+  if (!point?.ts) return false;
+  const timestamp = new Date(point.ts);
+  const day = timestamp.getDay();
+  const minutes = timestamp.getHours() * 60 + timestamp.getMinutes();
+  return day >= 1 &&
+    day <= 5 &&
+    minutes >= REGULAR_SESSION_START_MINUTES_CT &&
+    minutes <= REGULAR_SESSION_END_MINUTES_CT;
+}
+
+function formatChartTooltipTimestamp(point) {
+  if (!point?.ts) return point?.date || "";
+  const timestamp = new Date(point.ts);
+  const date = point.date || timestamp.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  const time = timestamp.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  return `${date} ${time}`;
+}
 
 function filterPerfHistoryForTimeframe(data, timeframe, lastTradingDate) {
   if (!data || !data.length) return [];
@@ -1254,18 +1275,11 @@ function filterPerfHistoryForTimeframe(data, timeframe, lastTradingDate) {
     if (!latestTradingPoint) return data.slice(-20);
     const latestDay = latestTradingPoint.date || lastTradingDate;
     const dayPoints = data.filter(p => p.date === latestDay);
+    const regularSessionPoints = dayPoints.filter(isRegularSessionChartPoint);
+    const chartDayPoints = regularSessionPoints.length >= 2 ? regularSessionPoints : dayPoints;
 
-    if (dayPoints.length < 2) {
-      const priorPoints = sorted.filter(p => p.date < latestDay && new Date(p.ts).getDay() >= 1 && new Date(p.ts).getDay() <= 5);
-      if (priorPoints.length > 0) {
-        const priorDay = priorPoints[0].date;
-        const priorDayPoints = data.filter(p => p.date === priorDay);
-        const anchor = priorDayPoints[priorDayPoints.length - 1];
-        return anchor ? [anchor, ...dayPoints] : (dayPoints.length ? dayPoints : data.slice(-20));
-      }
-      return dayPoints.length ? dayPoints : data.slice(-20);
-    }
-    return dayPoints;
+    if (chartDayPoints.length < 2) return chartDayPoints;
+    return chartDayPoints;
   }
 
   const sorted = [...data].sort((a, b) => a.ts - b.ts);
@@ -1298,7 +1312,12 @@ function MiniChart({ data, timeframe, feeAdjusted = false }) {
   const toX = index => PAD_LEFT + (index / (filteredData.length - 1)) * (WIDTH - PAD_LEFT - PAD_RIGHT);
   const toY = value => PAD_TOP + (1 - (value - minVal) / range) * (HEIGHT - PAD_TOP - PAD_BOTTOM);
 
-  const points = filteredData.map((point, index) => ({ x: toX(index), y: toY(values[index]), v: values[index], date: point.date }));
+  const points = filteredData.map((point, index) => ({
+    x: toX(index),
+    y: toY(values[index]),
+    v: values[index],
+    timestampLabel: formatChartTooltipTimestamp(point),
+  }));
   const linePath = points.map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
   const areaPath = linePath + ` L${points[points.length - 1].x.toFixed(1)},${(HEIGHT - PAD_BOTTOM).toFixed(1)} L${points[0].x.toFixed(1)},${(HEIGHT - PAD_BOTTOM).toFixed(1)} Z`;
   const isPositive = values[values.length - 1] >= values[0];
@@ -1335,7 +1354,7 @@ function MiniChart({ data, timeframe, feeAdjusted = false }) {
       </svg>
       {hoveredPoint && (
         <div style={{ position: "absolute", top: 2, left: hoveredPoint.x > WIDTH * 0.6 ? "auto" : `${(hoveredPoint.x / WIDTH * 100).toFixed(0)}%`, right: hoveredPoint.x > WIDTH * 0.6 ? "4px" : "auto", background: "#111", border: "1px solid #222", borderRadius: 4, padding: "3px 7px", fontSize: 10, pointerEvents: "none", whiteSpace: "nowrap", transform: hoveredPoint.x > WIDTH * 0.6 ? "none" : "translateX(-50%)" }}>
-          <span style={{ color: "#666", fontSize: 9 }}>{hoveredPoint.date} </span>
+          <span style={{ color: "#666", fontSize: 9 }}>{hoveredPoint.timestampLabel} </span>
           <span style={{ color: T1, fontWeight: 600 }}>${hoveredPoint.v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
         </div>
       )}
