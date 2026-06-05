@@ -27,6 +27,28 @@ def _summarize_pick(pick):
     }
 
 
+def _outcome_integrity_issue(row):
+    """Return a short issue string when outcome label contradicts realized P&L."""
+    outcome = row.get("outcome")
+    if outcome not in ("hit", "partial", "miss"):
+        return None
+    try:
+        actual_move = float(row.get("actual_move") or 0)
+    except Exception:
+        actual_move = 0.0
+    try:
+        net_pnl = float(row.get("net_pnl") if row.get("net_pnl") is not None else row.get("gross_pnl") or 0)
+    except Exception:
+        net_pnl = 0.0
+    profitable = actual_move > 0 or net_pnl > 0
+    losing = actual_move <= 0 and net_pnl <= 0
+    if outcome in ("hit", "partial") and losing:
+        return f"{outcome}_with_nonpositive_pnl"
+    if outcome == "miss" and profitable:
+        return "miss_with_positive_pnl"
+    return None
+
+
 def build_variant_ledger_proof(database, variant, snapshot=None, get_weights=None, filter_picks=None, select_picks=None, explain_strategy=None):
     """Return one variant's aliveness and ledger reconciliation proof."""
     variant = dict(variant)
@@ -50,6 +72,19 @@ def build_variant_ledger_proof(database, variant, snapshot=None, get_weights=Non
         WHERE variant_id=? AND trade_id IS NOT NULL
     """, [variant_id]).fetchall()]
     learned_trade_ids = {r["trade_id"] for r in learned_rows}
+    outcome_mismatches = [
+        {
+            "id": row.get("id"),
+            "ticker": row.get("ticker"),
+            "outcome": row.get("outcome"),
+            "actual_move": row.get("actual_move"),
+            "net_pnl": row.get("net_pnl"),
+            "issue": issue,
+        }
+        for row in closed_rows
+        for issue in [_outcome_integrity_issue(row)]
+        if issue
+    ]
 
     cash = round(float(portfolio.get("cash") or 0), 4)
     stored_equity = round(float(portfolio.get("equity") or 0), 4)
@@ -145,6 +180,8 @@ def build_variant_ledger_proof(database, variant, snapshot=None, get_weights=Non
         proof_issues.append("ledger_mismatch")
     if learned_open_trade_ids:
         proof_issues.append("learning_event_points_to_open_trade")
+    if outcome_mismatches:
+        proof_issues.append("closed_outcome_pnl_mismatch")
     if evaluation_issues:
         proof_issues.extend(evaluation_issues)
 
@@ -200,6 +237,10 @@ def build_variant_ledger_proof(database, variant, snapshot=None, get_weights=Non
             "open_missing_signal_score_count": len(open_missing_signal_scores),
             "open_missing_signal_score_ids": open_missing_signal_scores[:25],
         },
+        "outcome_integrity": {
+            "mismatch_count": len(outcome_mismatches),
+            "mismatches": outcome_mismatches[:25],
+        },
         "issues": proof_issues,
         "health": "ok" if not proof_issues else "attention",
     }
@@ -213,5 +254,6 @@ def proof_contract():
         "evaluation": "selected_count explains live picks; evaluated_no_pick rows include source/qualified counts and filter reasons when the source list was non-empty.",
         "ledger": "equity must equal cash plus open_value; open_value and realized_pnl must tie to variant_virtual_trades.",
         "learning": "daily learning may only consume closed trades with sell_date; every eligible closed trade must produce either a weight-change event or an explicit no-op event.",
+        "outcome_integrity": "closed trade outcome labels must agree with realized P&L; profitable labels cannot carry nonpositive P&L and misses cannot carry positive P&L.",
         "audit": "audit is read-only recap; weights_before and weights_after in audit_log are expected to match.",
     }

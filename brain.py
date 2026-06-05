@@ -2721,7 +2721,12 @@ def learn_variant_from_closed_trade(database, trade_row, outcome, actual_move):
     reasoning = []
     status = "updated"
     if scores:
-        direction = 1 if outcome == "hit" else -1
+        if outcome == "hit":
+            direction = 1.0
+        elif outcome == "partial":
+            direction = 0.35
+        else:
+            direction = -1.0
         strength = min(abs(float(actual_move or 0)) / 10.0, 1.0)
         for key in canonical_signal_weights():
             signal_score = float(scores.get(key, 0.5) or 0.5)
@@ -2749,6 +2754,15 @@ def learn_variant_from_closed_trade(database, trade_row, outcome, actual_move):
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [f"{trade_row.get('id')}_{int(time.time())}", variant_id, trade_row.get("id"), ts, outcome, actual_move, json.dumps(before), json.dumps(after), json.dumps(reasoning[:6])])
     return status
+
+def classify_variant_outcome_from_pnl(pnl_percent):
+    """Single source of truth for variant closed-trade labels from realized P&L."""
+    pnl = float(pnl_percent or 0)
+    if pnl >= MIN_EXPECTED_MOVE:
+        return "hit"
+    if pnl > 0:
+        return "partial"
+    return "miss"
 
 def run_daily_variant_learning():
     """Apply variant ML once per day from closed trades that have not been learned yet."""
@@ -2795,6 +2809,66 @@ def run_daily_variant_learning():
         return {"success": False, "error": str(exc), "learned": 0}
     finally:
         database.close()
+
+def rebuild_variant_learning_for_variants(database, variant_ids):
+    """Replay ML weights from baseline after trade-history repairs.
+
+    Repricing historical entries can change realized moves and outcomes. Leaving
+    old learning events in place would preserve poisoned weight changes, so this
+    helper resets affected variants to their baseline profile and replays every
+    closed trade in chronological order.
+    """
+    rebuilt = []
+    for variant_id in sorted({v for v in variant_ids if v}):
+        weights_row = database.execute(
+            "SELECT baseline_weights_json FROM variant_signal_weights WHERE variant_id=?",
+            [variant_id],
+        ).fetchone()
+        if not weights_row:
+            continue
+        try:
+            baseline = json.loads(weights_row["baseline_weights_json"] or "{}")
+        except Exception:
+            baseline = {}
+        if not baseline:
+            baseline = canonical_signal_weights()
+        now = current_time_cst().isoformat()
+        database.execute(
+            """
+            UPDATE variant_signal_weights
+            SET weights_json=?, learning_revision=COALESCE(learning_revision, 0)+1, updated_at=?
+            WHERE variant_id=?
+            """,
+            [json.dumps(normalize_signal_weights(baseline)), now, variant_id],
+        )
+        database.execute("DELETE FROM variant_learning_events WHERE variant_id=?", [variant_id])
+        rows = [dict(r) for r in database.execute(
+            """
+            SELECT *
+            FROM variant_virtual_trades
+            WHERE variant_id=?
+              AND outcome!='open'
+              AND outcome!='archived_excess_open'
+              AND sell_date IS NOT NULL
+            ORDER BY sell_date ASC, COALESCE(sell_time, '') ASC, id ASC
+            """,
+            [variant_id],
+        ).fetchall()]
+        status_counts = {"updated": 0, "unchanged": 0, "missing_signal_scores": 0}
+        for row in rows:
+            status = learn_variant_from_closed_trade(
+                database,
+                row,
+                row.get("outcome"),
+                row.get("actual_move"),
+            )
+            status_counts[status] = status_counts.get(status, 0) + 1
+        rebuilt.append({
+            "variant_id": variant_id,
+            "replayed_closed_trades": len(rows),
+            "status_counts": status_counts,
+        })
+    return rebuilt
 
 def build_entry_integrity(position, price_data):
     """Lightweight audit comparing stored entry against quote context."""
@@ -9416,6 +9490,10 @@ def api_variant_ledger_proof():
             row for row in rows
             if row["learning"]["unlearned_closed_trade_count"] > 0
         ]
+        outcome_mismatches = [
+            row for row in rows
+            if row.get("outcome_integrity", {}).get("mismatch_count", 0) > 0
+        ]
         no_pick_rows = [
             row for row in rows
             if row["evaluation_state"] == "evaluated_no_pick"
@@ -9431,6 +9509,7 @@ def api_variant_ledger_proof():
             "ledger_mismatch_count": len(ledger_mismatches),
             "learned_open_trade_count": len(learned_open),
             "unlearned_closed_variant_count": len(unlearned_closed),
+            "outcome_mismatch_variant_count": len(outcome_mismatches),
             "evaluated_no_pick_count": len(no_pick_rows),
             "rows": rows,
             "contract": proof_contract(),
@@ -9477,6 +9556,7 @@ def api_variant_strategy_preview():
                 "selected_tickers": [p.get("ticker") for p in selected[:20]],
                 "qualified_preview": [
                     {
+                        **p,
                         "ticker": p.get("ticker"),
                         "confidence": p.get("long_conf") or p.get("confidence") or p.get("nn_score"),
                         "move": p.get("long_move") or p.get("expected_move"),
@@ -9490,6 +9570,8 @@ def api_variant_strategy_preview():
                             if p.get("overnight_gap_pct") is not None
                             else p.get("gap_percent")
                         ),
+                        "source_scan_time": p.get("source_scan_time") or snapshot.get("vector_cache_time" if variant["brain"] == "Vector" else "nova_cache_time"),
+                        "source_variant_id": variant["id"],
                     }
                     for p in qualified[:10]
                 ],
@@ -10887,6 +10969,7 @@ def api_reprice_variant_open_entries():
             if row.get("outcome") == "open"
         }))
         touched_variants = set()
+        learning_rebuild_variants = set()
         results = []
         updated = 0
 
@@ -10948,6 +11031,9 @@ def api_reprice_variant_open_entries():
                     {**position, "buy_price": new_buy_price},
                     quote,
                 )
+                old_outcome = position.get("outcome")
+                repaired_outcome = old_outcome if is_open_row else classify_variant_outcome_from_pnl(pnl_pct)
+                outcome_changed = (not is_open_row) and repaired_outcome != old_outcome
 
                 result = {
                     "id": position["id"],
@@ -10961,7 +11047,9 @@ def api_reprice_variant_open_entries():
                     "old_pnl_pct": round(float(position.get("actual_move") or 0), 2),
                     "new_pnl_pct": round(pnl_pct, 2),
                     "day_change_percent": round(day_change_percent, 4),
-                    "outcome": position.get("outcome"),
+                    "outcome": old_outcome,
+                    "repaired_outcome": repaired_outcome,
+                    "outcome_changed": outcome_changed,
                     "entry_source": pinned.get("source"),
                     "entry_integrity_status": entry_integrity_status,
                     "applied": apply_changes,
@@ -10972,18 +11060,20 @@ def api_reprice_variant_open_entries():
                     database.execute(f"""
                         UPDATE variant_virtual_trades
                         SET buy_price=?, current_price=?, current_value=?, day_change_percent=?,
-                            actual_move=?, gross_pnl=?, net_pnl=?, {FEE_MODEL_UPDATE_SET},
+                            actual_move=?, gross_pnl=?, net_pnl=?, outcome=?, {FEE_MODEL_UPDATE_SET},
                             entry_price_source=?, entry_integrity_status=?, entry_integrity_note=?,
                             last_price_updated=?, updated_at=?
                         WHERE id=?
                     """, [
                         round(new_buy_price, 4), round(current_price, 4), round(fee_quote["net_current_value"], 4),
                         round(day_change_percent, 4), round(pnl_pct, 2),
-                        fee_quote["gross_pnl"], fee_quote["net_pnl"], *fee_model_values(fee_quote),
+                        fee_quote["gross_pnl"], fee_quote["net_pnl"], repaired_outcome, *fee_model_values(fee_quote),
                         pinned.get("source"), entry_integrity_status, entry_integrity_note,
                         now_iso, now_iso, position["id"],
                     ])
                     touched_variants.add(position["variant_id"])
+                    if not is_open_row:
+                        learning_rebuild_variants.add(position["variant_id"])
                     updated += 1
 
                 results.append(result)
@@ -11000,6 +11090,13 @@ def api_reprice_variant_open_entries():
         if apply_changes:
             for variant_id in touched_variants:
                 update_variant_portfolio(database, variant_id, note="reprice_variant_open_entries")
+            learning_rebuilt = rebuild_variant_learning_for_variants(database, learning_rebuild_variants)
+        else:
+            learning_rebuilt = []
+            for result in results:
+                if result.get("outcome_changed"):
+                    learning_rebuild_variants.add(result.get("variant_id"))
+        if apply_changes:
             database.commit()
 
         return jsonify({
@@ -11007,6 +11104,8 @@ def api_reprice_variant_open_entries():
             "applied": apply_changes,
             "updated": updated,
             "touched_variants": sorted(touched_variants),
+            "learning_rebuild_required": sorted(v for v in learning_rebuild_variants if v),
+            "learning_rebuilt": learning_rebuilt,
             "results": results,
         })
     except Exception as e:

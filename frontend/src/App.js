@@ -183,6 +183,44 @@ function mapPickFields(pick) {
   };
 }
 
+function formatOptionalCurrency(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? `$${n.toFixed(2)}` : "—";
+}
+
+function formatOptionalRatio(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? `${n.toFixed(2).replace(/\.00$/, "")}x` : "—";
+}
+
+function formatOptionalPercent(value, decimals = 1) {
+  const n = Number(value);
+  return Number.isFinite(n) ? `${n >= 0 ? "+" : ""}${n.toFixed(decimals)}%` : "—";
+}
+
+function formatShortDateTime(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return null;
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function dataBasisText(item = {}, fallback = "scan") {
+  const source = item.price_provider || item.provider || item.entry_price_source || item.source || fallback;
+  const stamped = formatShortDateTime(
+    item.source_scan_time || item.scan_time || item.last_price_updated || item.updated_at || item.created_at
+  );
+  if (source && stamped) return `${source} · ${stamped}`;
+  if (stamped) return stamped;
+  if (source) return source;
+  return null;
+}
+
 function normalizeVariantPreviewPick(pick, variantRow = {}) {
   const confidence = Number(pick?.confidence ?? pick?.long_conf ?? pick?.nn_score ?? 0);
   const expectedMove = Number(pick?.move ?? pick?.long_move ?? pick?.expected_move ?? 0);
@@ -505,34 +543,42 @@ function getValuationFields(trade = {}, feeAdjusted = true) {
 }
 
 function getTradeOpenPnlDollars(trade = {}, feeAdjusted = true) {
+  const invested = Number(trade.invested_amount || 0);
   if (trade.outcome === "open") {
+    const preferredValue = feeAdjusted ? trade.current_value : trade.gross_current_value;
+    if (preferredValue != null && invested > 0 && Number.isFinite(Number(preferredValue))) {
+      return Number(preferredValue) - invested;
+    }
     const buy = Number(trade.buy_price || trade.entry_price || 0);
     const currentPrice = Number(trade.current_price || trade.last_price || trade.price || 0);
-    const invested = Number(trade.invested_amount || 0);
     if (buy > 0 && currentPrice > 0 && invested > 0) {
       const grossCurrentValue = invested * (currentPrice / buy);
       return grossCurrentValue - invested;
     }
   }
-  const { invested, pnl } = getValuationFields(trade, feeAdjusted);
-  const valuePnl = pnl;
+  const valuation = getValuationFields(trade, feeAdjusted);
+  const valuePnl = valuation.pnl;
   if (Math.abs(valuePnl) > 0.005) return valuePnl;
   if (feeAdjusted && trade.net_pnl != null) return Number(trade.net_pnl);
   if (!feeAdjusted && trade.gross_pnl != null) return Number(trade.gross_pnl);
   if (trade.current_pnl_dollars != null) return Number(trade.current_pnl_dollars);
   const pct = Number(trade.current_pnl_percent ?? trade.actual_move ?? 0);
-  return invested * (pct / 100);
+  return valuation.invested * (pct / 100);
 }
 
 function getTradeOpenPnlPercent(trade = {}, feeAdjusted = true) {
+  const invested = Number(trade.invested_amount || 0);
   if (trade.outcome === "open") {
+    const preferredValue = feeAdjusted ? trade.current_value : trade.gross_current_value;
+    if (preferredValue != null && invested > 0 && Number.isFinite(Number(preferredValue))) {
+      return ((Number(preferredValue) - invested) / invested) * 100;
+    }
     const buy = Number(trade.buy_price || trade.entry_price || 0);
     const currentPrice = Number(trade.current_price || trade.last_price || trade.price || 0);
     if (buy > 0 && currentPrice > 0) {
       const pct = (currentPrice - buy) / buy * 100;
       return (trade.direction || "long") === "short" ? -pct : pct;
     }
-    const invested = Number(trade.invested_amount || 0);
     if (invested > 0) return (getTradeOpenPnlDollars(trade, feeAdjusted) / invested) * 100;
   }
   if (trade.current_pnl_percent != null && Number.isFinite(Number(trade.current_pnl_percent))) {
@@ -541,7 +587,6 @@ function getTradeOpenPnlPercent(trade = {}, feeAdjusted = true) {
   if (trade.actual_move != null && Number.isFinite(Number(trade.actual_move))) {
     return Number(trade.actual_move);
   }
-  const invested = Number(trade.invested_amount || 0);
   if (invested > 0) return (getTradeOpenPnlDollars(trade, feeAdjusted) / invested) * 100;
   const buy = Number(trade.buy_price || trade.entry_price || 0);
   const current = Number(trade.current_price || trade.last_price || trade.price || 0);
@@ -628,7 +673,8 @@ function getSignalData(item = {}) {
       .filter(([, value]) => Number(value) >= 0.65)
       .map(([key]) => key);
   }
-  return { fired: uniqueList(fired), scores, values };
+  const hasPayload = directFired.length > 0 || Object.keys(scores || {}).length > 0;
+  return { fired: uniqueList(fired), scores, values, hasPayload };
 }
 
 function withNormalizedSignals(item = {}) {
@@ -673,6 +719,11 @@ function uniqueList(values = []) {
 function avg(values = []) {
   const nums = values.map(Number).filter(Number.isFinite);
   return nums.length ? nums.reduce((sum, value) => sum + value, 0) / nums.length : 0;
+}
+
+function avgOrNull(values = []) {
+  const nums = values.map(Number).filter(Number.isFinite);
+  return nums.length ? nums.reduce((sum, value) => sum + value, 0) / nums.length : null;
 }
 
 function roundMoney(value = 0) {
@@ -1021,33 +1072,60 @@ function averagePicksByTicker(rows = [], brain = "") {
         if (!pick?.ticker) return;
         if (Number(pick.confidence || 0) < ACTIONABLE_PICK_FLOOR) return;
         if (!groups.has(pick.ticker)) groups.set(pick.ticker, []);
-        groups.get(pick.ticker).push({ ...pick, strategy: row.strategy, _variant_time: variantTime, _variant_label: variantLabel });
+        groups.get(pick.ticker).push(normalizeVariantPreviewPick({
+          ...pick,
+          strategy: row.strategy,
+          _variant_time: variantTime,
+          _variant_label: variantLabel,
+        }, row));
       });
     });
   return Array.from(groups.entries()).map(([ticker, group]) => {
+    const base = group.find(pick => pick.price != null || pick.company_name || pick.name || pick.signal_scores) || group[0] || {};
     const methods = uniqueList(group.map(p => p.strategy));
     const confidence = Math.round(avg(group.map(p => Number(p.confidence || 0))));
     const move = avg(group.map(p => Number(p.move || 0)));
     const dayChange = avg(group.map(getDisplayDayChangePercent));
+    const signalPayloads = group.map(getSignalData).filter(signal => signal.hasPayload);
+    const signalScores = {};
+    const signalValues = {};
+    const signalKeys = uniqueList(signalPayloads.flatMap(signal => Object.keys(signal.scores || {})));
+    signalKeys.forEach(key => {
+      signalScores[key] = avg(signalPayloads.map(signal => Number(signal.scores?.[key])));
+      const values = signalPayloads.map(signal => Number(signal.values?.[key])).filter(Number.isFinite);
+      if (values.length) signalValues[key] = avg(values);
+    });
+    const contributorLabels = uniqueList(group.map(p => p._variant_label || `${p.strategy}/${p._variant_time}`));
     // qualified_variants: which entry-time variants would trade this pick (glass house)
     const qualifiedVariants = uniqueList(group.map(p => p._variant_time)).sort();
     return mapPickFields({
+      ...base,
       ticker,
       strategy: "All",
       confluence_methods: methods,
       confluence_count: methods.length,
-      signal_fired: uniqueList(group.flatMap(pick => getSignalData(pick).fired)),
+      signal_fired: uniqueList(signalPayloads.flatMap(signal => signal.fired)),
+      signal_scores: signalPayloads.length ? signalScores : undefined,
+      signal_values: signalPayloads.length ? signalValues : undefined,
       long_conf: confidence,
       long_move: move,
-      long_reasoning: `${methods.length} ${brain} strategies currently agree on ${ticker}.`,
+      long_reasoning: `${methods.length} ${brain} setup groups across ${group.length} variant rows currently agree on ${ticker}.`,
       pct_change_prev_close: dayChange,
       day_change_pct: dayChange,
       overnight_gap_pct: avg(group.map(p => Number(p.gap_pct ?? p.overnight_gap_pct ?? 0))),
+      price: avgOrNull(group.map(p => p.price ?? p.current_price ?? p.last_price)),
+      rsi: avgOrNull(group.map(p => p.rsi)),
+      vol_ratio: avgOrNull(group.map(p => p.vol_ratio ?? p.volume_ratio)),
       source_variant_count: group.length,
+      source_strategy_count: methods.length,
       aggregate_confidence: group.length > 1,
-      aggregate_confidence_basis: group.map(p => `${p.strategy}: ${Number(p.confidence || 0)}%`),
+      aggregate_confidence_basis: contributorLabels.map(label => {
+        const matching = group.filter(p => normalizeStrategyName(p._variant_label || `${p.strategy}/${p._variant_time}`) === normalizeStrategyName(label));
+        return `${label}: ${Math.round(avg(matching.map(p => Number(p.confidence || 0))))}%`;
+      }),
       qualified_variants: qualifiedVariants,
       qualified_variant_count: qualifiedVariants.length,
+      source_scan_time: base.source_scan_time || base.scan_time || base.updated_at,
     });
   }).sort((a, b) => (b.lc || 0) - (a.lc || 0));
 }
@@ -1316,9 +1394,11 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
   const visibleMethods = visibleConfluenceMethodTags(confluenceMethods, strategyName);
   const signalData = getSignalData(pick);
   const signalCount = signalData.fired.length;
-  const hasSignalScores = Object.keys(signalData.scores || {}).length > 0;
+  const hasSignalScores = signalData.hasPayload && Object.keys(signalData.scores || {}).length > 0;
+  const signalTagText = hasSignalScores ? `${signalCount}/9` : "?/9";
   const cardKey = cardKeyOverride || (pick.ticker + "_" + (isLong ? "l" : "s"));
   const isAggregateConfidence = Boolean(pick.aggregate_confidence || Number(pick.source_variant_count || 0) > 1);
+  const basisText = dataBasisText(pick);
 
   return (
     <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, overflow: "hidden", cursor: "pointer", borderLeft: `3px solid ${borderColor}` }}
@@ -1354,7 +1434,7 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
           )}
           <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center", flexShrink: 0 }}>{confluenceMethods.length}/{strategyTotal}</span>
-          <span className={expanded && showScoreContext ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: BLUE, letterSpacing: .3, padding: "1px 4px", background: "#0a1020", borderRadius: 3, border: "1px solid #1a2a40", textAlign: "center", flexShrink: 0 }}>{signalCount}/9</span>
+          <span className={expanded && showScoreContext && hasSignalScores ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: hasSignalScores ? BLUE : T3, letterSpacing: .3, padding: "1px 4px", background: hasSignalScores ? "#0a1020" : "#080808", borderRadius: 3, border: `1px solid ${hasSignalScores ? "#1a2a40" : "rgba(255,255,255,0.14)"}`, textAlign: "center", flexShrink: 0 }}>{signalTagText}</span>
         </>}
       />
       {expanded && (
@@ -1372,11 +1452,11 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 12px" }}>
               {[
                 ["Sector", pick.sector],
-                ["Price", `$${pick.price?.toFixed(2)}`],
+                ["Price", formatOptionalCurrency(pick.price)],
                 ["RSI", pick.rsi],
-                ["Volume ratio", `${pick.vol_ratio}x`],
-                ["Gap", `${pick.overnight_gap_pct >= 0 ? "+" : ""}${pick.overnight_gap_pct?.toFixed(1)}%`],
-                ["Day change", `${pick.day_change_pct >= 0 ? "+" : ""}${pick.day_change_pct?.toFixed(1)}%`],
+                ["Volume ratio", formatOptionalRatio(pick.vol_ratio)],
+                ["Gap", formatOptionalPercent(pick.overnight_gap_pct)],
+                ["Day change", formatOptionalPercent(pick.day_change_pct)],
               ].map(([label, value]) => (
                 <div key={label} style={{ display: "flex", justifyContent: "space-between", borderBottom: `1px solid ${CARD_BORDER_LONG}`, paddingBottom: 3 }}>
                   <span style={{ fontSize: 9, color: T3 }}>{label}</span>
@@ -1395,6 +1475,11 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
               {isAggregateConfidence && (
                 <div style={{ marginTop: 5, fontSize: 8, color: T3, fontFamily: "'DM Mono',monospace", lineHeight: 1.4 }}>
                   Aggregate confidence averages actionable contributors only{Array.isArray(pick.aggregate_confidence_basis) && pick.aggregate_confidence_basis.length ? `: ${pick.aggregate_confidence_basis.join(" · ")}` : "."}
+                </div>
+              )}
+              {basisText && (
+                <div style={{ marginTop: 4, fontSize: 8, color: T3, fontFamily: "'DM Mono',monospace", lineHeight: 1.35 }}>
+                  Data basis: {basisText}
                 </div>
               )}
             </div>
@@ -1596,8 +1681,11 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
   const visibleMethods = visibleConfluenceMethodTags(confluenceMethods, strategyName);
   const signalData = getSignalData(trade);
   const signalCount = signalData.fired.length;
+  const hasSignalScores = signalData.hasPayload && Object.keys(signalData.scores || {}).length > 0;
+  const signalTagText = hasSignalScores ? `${signalCount}/9` : "?/9";
   const isAggregateConfidence = Boolean(Number(trade.source_variant_count || 0) > 1);
   const displayDayChange = getDisplayDayChangePercent(trade);
+  const basisText = dataBasisText(trade, "ledger");
 
   const sentiment = getSentimentLabel(pnlPercent, frozenTarget, trade.sentiment_icon, pdtRemaining);
 
@@ -1696,7 +1784,7 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
             <span className={glowing ? "tag-glow" : ""} style={{ fontSize: 7, fontWeight: 800, color: GREEN, letterSpacing: .3, padding: "1px 4px", background: "#0e1a0e", borderRadius: 3, border: "1px solid #1a3a1a", flexShrink: 0 }}>52W</span>
           )}
           <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: "#ddd", letterSpacing: .3, padding: "1px 4px", background: "#000", borderRadius: 3, border: "1px solid rgba(255,255,255,0.2)", textAlign: "center", flexShrink: 0 }}>{confluenceMethods.length}/{strategyTotal}</span>
-          <span className={glowing ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: BLUE, letterSpacing: .3, padding: "1px 4px", background: "#0a1020", borderRadius: 3, border: "1px solid #1a2a40", textAlign: "center", flexShrink: 0 }}>{signalCount}/9</span>
+          <span className={glowing && hasSignalScores ? "tag-glow" : ""} style={{ fontFamily: "'DM Mono',monospace", fontSize: 7, fontWeight: 800, color: hasSignalScores ? BLUE : T3, letterSpacing: .3, padding: "1px 4px", background: hasSignalScores ? "#0a1020" : "#080808", borderRadius: 3, border: `1px solid ${hasSignalScores ? "#1a2a40" : "rgba(255,255,255,0.14)"}`, textAlign: "center", flexShrink: 0 }}>{signalTagText}</span>
           {(sentiment.label === "CUT" || trade.outcome === "sold" || trade.outcome === "force_closed") && (
             <button onClick={(e) => { e.stopPropagation(); onDone && onDone(cardKey); }}
               style={{ background: "#222", border: `1px solid ${CARD_BORDER_LONG === "#1a3a4a" ? BLUE + "66" : "#444"}`, borderRadius: 4, color: "#ccc", fontSize: 9, fontWeight: 700, letterSpacing: 0.5, padding: "2px 8px", cursor: "pointer", flexShrink: 0 }}>
@@ -1735,6 +1823,11 @@ function PositionCard({ trade, isLong = true, expanded, onToggle, isDone, isClos
           {isAggregateConfidence && (
             <div style={{ marginTop: 6, fontSize: 8, color: T3, fontFamily: "'DM Mono',monospace", lineHeight: 1.4 }}>
               Aggregate card: values and confidence are averages across {trade.source_variant_count || 2} open simulations for this ticker.
+            </div>
+          )}
+          {basisText && (
+            <div style={{ marginTop: 4, fontSize: 8, color: T3, fontFamily: "'DM Mono',monospace", lineHeight: 1.35 }}>
+              Data basis: {basisText}
             </div>
           )}
           {(visibleMethods.length > 0 || (trade.broke_52w_high_days_ago != null && trade.broke_52w_high_days_ago <= 7)) && (
@@ -2526,7 +2619,7 @@ export default function App() {
   const [nnPicks, setNnPicks] = useState({ recommended_longs: [], recommended_shorts: [] });
   const [nnStats, setNnStats] = useState(null);
   const [nnPerfHistory, setNnPerfHistory] = useState([]);
-  const [nnPerfTimeframe, setNnPerfTimeframe] = useState("M");
+  const [nnPerfTimeframe, setNnPerfTimeframe] = useState("D");
   const [variantLeaderboard, setVariantLeaderboard] = useState([]);
   const [selectedVariantId, setSelectedVariantId] = useState("swingdesk_vector_0845_all");
   const [novaUniverse, setNovaUniverse] = useState(null);
