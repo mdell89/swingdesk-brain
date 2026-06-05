@@ -847,12 +847,13 @@ function normalizeLedgerEquityHistory({ detail = {}, ledger = {}, today }) {
         ts,
         date: equityPointDate(point),
         virtual: roundMoney(virtual),
+        synthetic: false,
       };
     })
     .filter(Boolean)
     .sort((a, b) => a.ts - b.ts);
   const nowTs = Date.now();
-  const livePoint = { ts: nowTs, date: today, virtual: roundMoney(currentEquity), intraday: true };
+  const livePoint = { ts: nowTs, date: today, virtual: roundMoney(currentEquity), intraday: true, synthetic: true };
   if (!points.length) {
     return [
       { ts: nowTs - 60000, date: today, virtual: roundMoney(startingCash), seed: true },
@@ -890,12 +891,14 @@ function calculateAggregateEquityHistory(rows = [], today) {
       })
       .filter(Boolean);
     if (!values.length) return null;
-    const anchor = values[values.length - 1];
+    const exactAnchorPoints = values.filter(point => point.ts === anchorTs);
+    const anchor = exactAnchorPoints[0] || values[values.length - 1];
     return {
       ts: anchorTs,
       date: anchor.date,
       virtual: roundMoney(avg(values.map(point => Number(point.virtual)))),
       intraday: values.some(point => point.intraday),
+      synthetic: exactAnchorPoints.length > 0 && exactAnchorPoints.every(point => point.synthetic),
       universeCount: values.length,
     };
   }).filter(Boolean);
@@ -1240,7 +1243,11 @@ function filterPerfHistoryForTimeframe(data, timeframe, lastTradingDate) {
   if (!data || !data.length) return [];
   if (timeframe === "D") {
     const sorted = [...data].sort((a, b) => b.ts - a.ts);
-    const latestTradingPoint = sorted.find(p => {
+    const latestRealTradingPoint = sorted.find(p => {
+      const d = new Date(p.ts);
+      return d.getDay() >= 1 && d.getDay() <= 5 && !p.synthetic && !p.seed;
+    });
+    const latestTradingPoint = latestRealTradingPoint || sorted.find(p => {
       const d = new Date(p.ts);
       return d.getDay() >= 1 && d.getDay() <= 5;
     });
