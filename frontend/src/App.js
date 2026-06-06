@@ -2260,7 +2260,7 @@ function SettingsDrawer({ open, onClose, T1, T2, T3, BORDER, BG, CARD, GREEN, BL
         .then(d => { setNotifyOn(d.notify_on_close !== false); setSettings(d); setLoaded(true); })
         .catch(() => setLoaded(true));
     }
-  }, [open]);
+  }, [open, loaded]);
 
   const toggle = async () => {
     const newVal = !notifyOn;
@@ -2402,7 +2402,12 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
   const [errorMsg, setErrorMsg] = React.useState("");
   const pollRef = React.useRef(null);
 
-  const stopPolling = () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
+  const stopPolling = React.useCallback(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
 
   const poll = React.useCallback(async () => {
     try {
@@ -2428,10 +2433,10 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
         stopPolling();
       }
     } catch (_) {}
-  }, [API]);
+  }, [API, stopPolling]);
 
-  React.useEffect(() => { poll(); }, []);
-  React.useEffect(() => () => stopPolling(), []);
+  React.useEffect(() => { poll(); }, [poll]);
+  React.useEffect(() => () => stopPolling(), [stopPolling]);
 
   const trigger = async () => {
     setState("running"); setPhase("starting"); setTotalScanned(0);
@@ -2598,6 +2603,120 @@ function WhyNotPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED })
   );
 }
 
+function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
+  const [open, setOpen] = React.useState(false);
+  const [loading, setLoading] = React.useState(false);
+  const [payload, setPayload] = React.useState(null);
+  const [error, setError] = React.useState("");
+
+  const load = async () => {
+    setOpen(true);
+    setLoading(true);
+    setError("");
+    try {
+      const res = await fetch(`${API}/scoring-v2-shadow`);
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : {};
+      if (!res.ok || data.success === false) throw new Error(data.error || `HTTP ${res.status}`);
+      setPayload(data);
+    } catch (err) {
+      const message = String(err.message || "");
+      setError(message.includes("JSON") ? "Scoring V2 shadow endpoint is not available on this backend yet." : (message || "Failed to load Scoring V2 shadow view"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const variantRows = Array.isArray(payload?.variant_rows) ? payload.variant_rows : [];
+  const fallbackRows = [
+    ...(Array.isArray(payload?.vector_longs) ? payload.vector_longs.map(row => ({ ...row, brain: "Vector", variant_label: "Vector cached picks" })) : []),
+    ...(Array.isArray(payload?.nova_longs) ? payload.nova_longs.map(row => ({ ...row, brain: "Nova", variant_label: "Nova cached picks" })) : []),
+  ];
+  const rows = (variantRows.length ? variantRows : fallbackRows).slice(0, 16);
+  const vectorSummary = payload?.vector_summary || {};
+  const novaSummary = payload?.nova_summary || {};
+
+  return (
+    <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 12px", marginBottom: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontSize: 12, fontWeight: 800, color: T1 }}>Scoring V2 shadow</div>
+          <div style={{ fontSize: 8, color: T3, marginTop: 2 }}>Temporary read-only preview. Live picks still use legacy scoring.</div>
+        </div>
+        <button
+          onClick={open && payload ? () => setOpen(false) : load}
+          disabled={loading}
+          style={{ flexShrink: 0, background: loading ? "transparent" : BLUE, color: loading ? BLUE : "#000", border: `1px solid ${BLUE}`, borderRadius: 7, padding: "6px 9px", fontSize: 9, fontWeight: 900, fontFamily: "'DM Mono',monospace", cursor: loading ? "default" : "pointer" }}
+        >
+          {loading ? "Loading" : open && payload ? "Hide" : "Peek"}
+        </button>
+      </div>
+
+      {open && (
+        <div style={{ marginTop: 10 }}>
+          {error && <div style={{ fontSize: 9, color: RED, lineHeight: 1.4 }}>{error}</div>}
+          {!error && loading && <div style={{ fontSize: 9, color: T3 }}>Loading shadow picks...</div>}
+          {!error && payload && (
+            <>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 8 }}>
+                {[
+                  ["Vector", vectorSummary],
+                  ["Nova", novaSummary],
+                ].map(([label, item]) => (
+                  <div key={label} style={{ background: "#070708", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
+                    <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>{label}</div>
+                    <div style={{ fontSize: 11, color: label === "Nova" ? "#a78bfa" : BLUE, fontFamily: "'DM Mono',monospace", fontWeight: 900 }}>
+                      {Number(item.v2_actionable_count || 0)}/{Number(item.scored_count || 0)} V2
+                    </div>
+                    <div style={{ fontSize: 7, color: T3, marginTop: 2 }}>{Number(item.v2_blocked_count || 0)} blocked</div>
+                  </div>
+                ))}
+              </div>
+
+              {rows.length === 0 ? (
+                <div style={{ fontSize: 9, color: T3, lineHeight: 1.4 }}>No cached shadow rows yet. Run a fresh scan after deploy.</div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                  {rows.map((row, idx) => {
+                    const blocked = Boolean(row.v2_blocked);
+                    const actionable = Boolean(row.v2_actionable);
+                    const color = blocked ? RED : actionable ? GREEN : AMBER;
+                    const capText = (row.v2_caps || []).slice(0, 2).join(", ");
+                    const reasonText = (row.v2_block_reasons || []).slice(0, 1).join(", ");
+                    return (
+                      <div key={`${row.variant_id || row.variant_label || row.brain}-${row.ticker}-${idx}`} style={{ background: "#070708", border: `1px solid ${BORDER}`, borderRadius: 7, padding: "7px 8px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
+                          <div style={{ fontSize: 11, color: T1, fontWeight: 900, fontFamily: "'DM Mono',monospace" }}>{row.ticker || "-"}</div>
+                          <div style={{ fontSize: 10, color, fontFamily: "'DM Mono',monospace", fontWeight: 900 }}>
+                            V2 {row.v2_score == null ? "--" : row.v2_score}
+                          </div>
+                        </div>
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginTop: 2 }}>
+                          <div style={{ minWidth: 0, fontSize: 8, color: T3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                            {row.variant_label || `${row.brain || "Brain"} cached picks`}
+                          </div>
+                          <div style={{ flexShrink: 0, fontSize: 8, color: T3, fontFamily: "'DM Mono',monospace" }}>
+                            old {row.legacy_confidence ?? "--"}
+                          </div>
+                        </div>
+                        {(capText || reasonText) && (
+                          <div style={{ marginTop: 3, fontSize: 7, color: blocked ? RED : T3, lineHeight: 1.35 }}>
+                            {reasonText || capText}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export {
   averagePicksByTicker,
   averageTradesByTicker,
@@ -2725,10 +2844,67 @@ export default function App() {
 
   const [perfTimeframe, setPerfTimeframe] = useState("D");
   const [feeAdjusted, setFeeAdjusted] = useState(true);
-  const feeQuery = feeAdjusted ? "?fees=on" : "?fees=off";
+  const feeQuery = useMemo(() => feeAdjusted ? "?fees=on" : "?fees=off", [feeAdjusted]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [showNetInfo, setShowNetInfo] = useState(false);
   const [showTickerBanner, setShowTickerBanner] = useState(true);
+  const initialLoadStartedRef = React.useRef(false);
+
+  const buildPerfHistory = React.useCallback((perfData, positions) => {
+    const allPoints = perfData || [];
+    const closedHistory = allPoints.filter(p => !p.intraday);
+    const intradayHistory = allPoints.filter(p => p.intraday);
+
+    const baseBalance = closedHistory.filter(p => !p.seed).length > 0
+      ? closedHistory.filter(p => !p.seed)[closedHistory.filter(p => !p.seed).length - 1].virtual
+      : 1000.0;
+
+    const backendSeed = closedHistory.find(p => p.seed);
+    const earliestTs = allPoints.length ? Math.min(...allPoints.map(p => p.ts || Date.now())) : Date.now();
+    const seedTs = backendSeed?.ts || earliestTs;
+    const seedPoint = backendSeed || {
+      date: new Date(seedTs).toISOString().split("T")[0],
+      virtual: 1000.0,
+      ts: seedTs,
+      seed: true,
+    };
+
+    const unrealizedPnl = (positions || []).reduce((total, trade) => total + getTradeOpenPnlDollars(trade, feeAdjusted), 0);
+
+    const todayStr = new Date().toISOString().split("T")[0];
+    const livePoint = (positions || []).some(t => t.outcome === "open") ? [{
+      date: todayStr,
+      virtual: round2(baseBalance + unrealizedPnl),
+      ts: Date.now(),
+      intraday: true,
+      live: true,
+    }] : [];
+
+    const combined = [seedPoint, ...closedHistory.filter(p => !p.seed), ...intradayHistory, ...livePoint];
+    combined.sort((a, b) => a.ts - b.ts);
+    setPerfHistory(combined);
+  }, [feeAdjusted]);
+
+  const recoverMissedOpen = React.useCallback(async () => {
+    if (recoveringOpen) return;
+    setRecoveringOpen(true);
+    try {
+      const result = await apiFetch("/recover-missed-open", { method: "POST" });
+      setOpenExecution(result);
+      const [positions, perfData, statsData] = await Promise.all([
+        apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
+        apiFetch(`/perf-history${feeQuery}`).catch(() => []),
+        apiFetch("/stats").catch(() => null),
+      ]);
+      setOpenPositions(positions);
+      if (statsData?.open_execution) setOpenExecution(statsData.open_execution);
+      if (statsData?.queue) setQueueStatus(statsData.queue);
+      buildPerfHistory(perfData, positions);
+    } catch (error) {
+      setOpenExecution(prev => ({ ...(prev || {}), last_error: error.message }));
+    }
+    setRecoveringOpen(false);
+  }, [buildPerfHistory, feeQuery, recoveringOpen]);
 
 
   const addManualPersonalTrade = async () => {
@@ -2756,37 +2932,18 @@ export default function App() {
     } catch {}
   };
 
-  const recoverMissedOpen = async () => {
-    if (recoveringOpen) return;
-    setRecoveringOpen(true);
-    try {
-      const result = await apiFetch("/recover-missed-open", { method: "POST" });
-      setOpenExecution(result);
-      const [positions, perfData, statsData] = await Promise.all([
-        apiFetch("/open-positions-dynamic").catch(() => apiFetch("/open-positions").catch(() => [])),
-        apiFetch(`/perf-history${feeQuery}`).catch(() => []),
-        apiFetch("/stats").catch(() => null),
-      ]);
-      setOpenPositions(positions);
-      if (statsData?.open_execution) setOpenExecution(statsData.open_execution);
-      if (statsData?.queue) setQueueStatus(statsData.queue);
-      buildPerfHistory(perfData, positions);
-    } catch (error) {
-      setOpenExecution(prev => ({ ...(prev || {}), last_error: error.message }));
-    }
-    setRecoveringOpen(false);
-  };
-
-  const refreshMonitorStatus = async () => {
+  const refreshMonitorStatus = React.useCallback(async () => {
     const status = await apiFetch("/monitor-open-status").catch(() => null);
     if (status) {
       setMonitorRunning(status.status === "running" || status.status === "queued");
     }
     return status;
-  };
+  }, []);
 
   // ── Initial data load ──
   useEffect(() => {
+    if (initialLoadStartedRef.current) return;
+    initialLoadStartedRef.current = true;
     (async () => {
       try {
         setLoadStatus("Waking up the brain..."); setLoadProgress(20);
@@ -2878,47 +3035,7 @@ export default function App() {
       }
       setTimeout(() => setLoaded(true), 300);
     })();
-  }, []);
-
-  // ── Build perf history including unrealized open position gains ──
-  function buildPerfHistory(perfData, positions) {
-    const allPoints = perfData || [];
-    const closedHistory = allPoints.filter(p => !p.intraday);
-    const intradayHistory = allPoints.filter(p => p.intraday);
-
-    // Base settled balance — last closed trade result
-    const baseBalance = closedHistory.filter(p => !p.seed).length > 0
-      ? closedHistory.filter(p => !p.seed)[closedHistory.filter(p => !p.seed).length - 1].virtual
-      : 1000.0;
-
-    const backendSeed = closedHistory.find(p => p.seed);
-    const earliestTs = allPoints.length ? Math.min(...allPoints.map(p => p.ts || Date.now())) : Date.now();
-    const seedTs = backendSeed?.ts || earliestTs;
-    const seedPoint = backendSeed || {
-      date: new Date(seedTs).toISOString().split("T")[0],
-      virtual: 1000.0,
-      ts: seedTs,
-      seed: true,
-    };
-
-    // Live "now" point — always inject if positions exist, even if unrealizedPnl is 0
-    // This ensures today always has at least one data point for chart and Day's P&L
-    const unrealizedPnl = (positions || []).reduce((total, trade) => total + getTradeOpenPnlDollars(trade, feeAdjusted), 0);
-
-    const todayStr = new Date().toISOString().split("T")[0];
-    const livePoint = (positions || []).some(t => t.outcome === "open") ? [{
-      date: todayStr,
-      virtual: round2(baseBalance + unrealizedPnl),
-      ts: Date.now(),
-      intraday: true,
-      live: true,
-    }] : [];
-
-    // Build combined — seed + closed + intraday from backend + live now
-    const combined = [seedPoint, ...closedHistory.filter(p => !p.seed), ...intradayHistory, ...livePoint];
-    combined.sort((a, b) => a.ts - b.ts);
-    setPerfHistory(combined);
-  }
+  }, [buildPerfHistory, feeQuery]);
 
   function round2(n) { return Math.round(n * 100) / 100; }
   const AUDIT_PAGE_SIZE = 2;
@@ -2926,26 +3043,26 @@ export default function App() {
   const VARIANT_COUNTER_PAGE_SIZE = 8;
   const SCAN_HISTORY_PAGE_SIZE = 12;
 
-  async function loadAuditPage(page = auditPage) {
+  const loadAuditPage = React.useCallback(async (page = auditPage) => {
     const offset = page * AUDIT_PAGE_SIZE;
     const data = await apiFetch(`/audit/log?paged=1&limit=${AUDIT_PAGE_SIZE}&offset=${offset}`);
     setAuditLog(data.rows || []);
     setAuditTotal(Number(data.total || 0));
-  }
+  }, [auditPage]);
 
-  async function loadLearningPage(page = learningPage) {
+  const loadLearningPage = React.useCallback(async (page = learningPage) => {
     const offset = page * LEARNING_PAGE_SIZE;
     const data = await apiFetch(`/variant-learning-events?paged=1&limit=${LEARNING_PAGE_SIZE}&offset=${offset}`);
     setLearningEvents(data.rows || []);
     setLearningTotal(Number(data.total || 0));
-  }
+  }, [learningPage]);
 
-  async function loadScanHistoryPage(page = scanHistoryPage) {
+  const loadScanHistoryPage = React.useCallback(async (page = scanHistoryPage) => {
     const offset = page * SCAN_HISTORY_PAGE_SIZE;
     const data = await apiFetch(`/scan-history?paged=1&limit=${SCAN_HISTORY_PAGE_SIZE}&offset=${offset}`);
     setScanHistory(data.rows || []);
     setScanHistoryTotal(Number(data.total || 0));
-  }
+  }, [scanHistoryPage]);
 
   useEffect(() => {
     if (!loaded) return;
@@ -2959,7 +3076,7 @@ export default function App() {
       setDayPnlStatus(dayPnlData);
       buildPerfHistory(perfData, positions);
     })();
-  }, [feeAdjusted, loaded]);
+  }, [buildPerfHistory, feeQuery, loaded]);
 
   // ── Lazy load tab data ──
   useEffect(() => {
@@ -2991,7 +3108,7 @@ export default function App() {
     if (tab === "virtual" && analyticsPage === "scan") {
       loadScanHistoryPage(scanHistoryPage).catch(() => {});
     }
-  }, [tab, loaded, analyticsPage, auditPage, learningPage, scanHistoryPage]);
+  }, [tab, loaded, analyticsPage, auditPage, learningPage, scanHistoryPage, methodStats, predictions.length, virtualTrades.length, loadAuditPage, loadLearningPage, loadScanHistoryPage]);
 
   // ── 5-minute refresh ──
   useEffect(() => {
@@ -3031,7 +3148,7 @@ export default function App() {
       } catch {}
     }, 2.5 * 60 * 1000);
     return () => clearInterval(interval);
-  }, [selectedVariantId]);
+  }, [buildPerfHistory, feeQuery, selectedVariantId]);
 
   // ── Computed values ──
   useEffect(() => {
@@ -3040,7 +3157,7 @@ export default function App() {
       refreshMonitorStatus().catch(() => {});
     }, monitorRunning ? 3000 : 30000);
     return () => clearInterval(interval);
-  }, [loaded, monitorRunning]);
+  }, [loaded, monitorRunning, refreshMonitorStatus]);
 
   useEffect(() => {
     if (!variantLeaderboard.length || portfolioTab === "personal") return;
@@ -4689,6 +4806,7 @@ export default function App() {
 
               <ScanPanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} />
               <WhyNotPanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} />
+              <ScoringV2ShadowPanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} />
           <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
             <div style={{ fontSize: 14, fontWeight: 600, color: T1, marginBottom: 4 }}>Self-audit engine</div>
             <div style={{ fontSize: 10, color: T2, lineHeight: 1.45, marginBottom: 6 }}>Autopilot: daily 7:00 PM Central batch learning, then a read-only LLM recap.</div>

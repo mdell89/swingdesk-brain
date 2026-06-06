@@ -182,6 +182,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
 from glass_proof import build_variant_ledger_proof as build_variant_ledger_proof_core, proof_contract
+from scoring_v2 import score_stock_v2
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -5261,6 +5262,110 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
     return scores, fired, values
 
 
+def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, confluence=None, signal_values=None):
+    """Translate the current scan payload into the Scoring V2 contract for shadow mode."""
+    signal_values = signal_values or {}
+    days_to_earnings = earnings_soon.get(ticker, 99) if isinstance(earnings_soon, dict) else 99
+    rs_values = signal_values.get("relative_strength") if isinstance(signal_values.get("relative_strength"), dict) else {}
+    sector_values = signal_values.get("sector_relative_strength") if isinstance(signal_values.get("sector_relative_strength"), dict) else {}
+    vwap_values = signal_values.get("vwap_reclaim") if isinstance(signal_values.get("vwap_reclaim"), dict) else {}
+
+    relative_strength_delta = None
+    if rs_values.get("stock_5d") is not None and rs_values.get("spy_5d") is not None:
+        relative_strength_delta = float(rs_values["stock_5d"]) - float(rs_values["spy_5d"])
+
+    sector_relative_strength_delta = None
+    if sector_values.get("etf_5d") is not None and sector_values.get("spy_5d") is not None:
+        sector_relative_strength_delta = float(sector_values["etf_5d"]) - float(sector_values["spy_5d"])
+
+    average_volume = stock_data.get("average_volume")
+    average_daily_dollar_volume = None
+    if average_volume is not None and stock_data.get("price"):
+        average_daily_dollar_volume = float(average_volume or 0) * float(stock_data.get("price") or 0)
+
+    confluence_methods = []
+    if isinstance(confluence, dict):
+        confluence_methods = confluence.get("methods") or []
+    elif confluence:
+        confluence_methods = confluence
+
+    return {
+        "ticker": ticker,
+        "direction": "long",
+        "price": stock_data.get("price"),
+        "previous_close": stock_data.get("previous_close"),
+        "open": stock_data.get("open"),
+        "gap_percent": stock_data.get("gap_percent"),
+        "average_daily_dollar_volume": average_daily_dollar_volume,
+        "freshness_status": "fresh",
+        "scan_completed_at": current_time_cst().isoformat(),
+        "provider": stock_data.get("source") or stock_data.get("provider") or "scan",
+        "rsi": rsi,
+        # Time-matched volume is not available yet; daily-average fallback is intentionally capped by V2.
+        "daily_average_relative_volume": stock_data.get("volume_ratio"),
+        "relative_strength_delta": relative_strength_delta,
+        "sector_relative_strength_delta": sector_relative_strength_delta,
+        "sr_analysis": stock_data.get("sr_analysis"),
+        "vwap_delta_pct": vwap_values.get("dist"),
+        "hv_ratio": signal_values.get("volatility_squeeze"),
+        "days_to_earnings": days_to_earnings,
+        "atr_percent": stock_data.get("atr_percent"),
+        "intraday_range_pct": stock_data.get("intraday_range_pct"),
+        "confluence": confluence_methods,
+    }
+
+
+def build_scoring_v2_shadow(ticker, stock_data, rsi, earnings_soon, weights, brain="Vector", confluence=None, signal_values=None):
+    """Run Scoring V2 in non-authoritative shadow mode and return a compact-safe payload."""
+    try:
+        payload = build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, confluence, signal_values)
+        result = score_stock_v2(payload, strategy="SwingDesk", brain=brain, weights=weights)
+        return {
+            **result,
+            "shadow_mode": True,
+            "decision_authority": "legacy_scoring",
+        }
+    except Exception as exc:
+        log.warning(f"Scoring V2 shadow failed for {ticker}: {exc}")
+        return {
+            "ticker": ticker,
+            "strategy": "SwingDesk",
+            "brain": brain,
+            "scoring_engine_version": "scoring_v2",
+            "shadow_mode": True,
+            "decision_authority": "legacy_scoring",
+            "error": str(exc),
+            "score": None,
+            "actionable": False,
+            "blocked": True,
+            "block_reasons": ["scoring_v2_shadow_error"],
+        }
+
+
+def summarize_scoring_v2_shadow(picks):
+    """Summarize non-authoritative V2 comparison status for scan review."""
+    rows = [p.get("scoring_v2_shadow") for p in (picks or []) if isinstance(p.get("scoring_v2_shadow"), dict)]
+    blocked = [r for r in rows if r.get("blocked")]
+    actionable = [r for r in rows if r.get("actionable")]
+    cap_counts = {}
+    block_counts = {}
+    for row in rows:
+        for cap in row.get("caps_applied", []) or []:
+            name = cap.get("name") if isinstance(cap, dict) else str(cap)
+            cap_counts[name] = cap_counts.get(name, 0) + 1
+        for reason in row.get("block_reasons", []) or []:
+            block_counts[reason] = block_counts.get(reason, 0) + 1
+    return {
+        "enabled": True,
+        "decision_authority": "legacy_scoring",
+        "scored_count": len(rows),
+        "v2_actionable_count": len(actionable),
+        "v2_blocked_count": len(blocked),
+        "cap_counts": cap_counts,
+        "block_reason_counts": block_counts,
+    }
+
+
 
 def send_telegram_notification(message):
     """
@@ -5932,6 +6037,16 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         long_signal_scores, long_fired_signals, long_signal_values = compute_signal_scores(
             ticker, price_data, rsi, earnings_soon, weights, "long"
         )
+        scoring_v2_shadow = build_scoring_v2_shadow(
+            ticker,
+            stock_data,
+            rsi,
+            earnings_soon,
+            weights,
+            brain="Vector",
+            confluence=confluence,
+            signal_values=long_signal_values,
+        )
 
         scored_stocks.append({
             "ticker": ticker,
@@ -5969,6 +6084,13 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
                 "values": long_signal_values,
                 "fired": long_fired_signals,
             },
+            "scoring_v2_shadow": scoring_v2_shadow,
+            "scoring_v2_score": scoring_v2_shadow.get("score"),
+            "scoring_v2_actionable": scoring_v2_shadow.get("actionable"),
+            "scoring_v2_blocked": scoring_v2_shadow.get("blocked"),
+            "scoring_v2_score_band": scoring_v2_shadow.get("score_band"),
+            "scoring_v2_block_reasons": scoring_v2_shadow.get("block_reasons", []),
+            "scoring_v2_caps": [cap.get("name") for cap in scoring_v2_shadow.get("caps_applied", [])],
         })
 
     # Check if queue is locked (post 8:25 AM CST)
@@ -6032,6 +6154,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         "scan_type": scan_type,
         "queue_locked": bool(queue_is_locked),
         "execution_locked": bool(queue_is_locked),
+        "scoring_v2_shadow_summary": summarize_scoring_v2_shadow(scored_stocks),
     }
     nn_scan_result = build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soon, scan_type, scan_event_id, queue_is_locked)
     scan_result["nn_picks"] = {
@@ -6607,6 +6730,16 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
             }
 
             nn_conf = nn_score_ticker(synthetic, "long")
+            scoring_v2_shadow = build_scoring_v2_shadow(
+                ticker,
+                stock_data,
+                rsi,
+                earnings_soon,
+                weights,
+                brain="Nova",
+                confluence=base.get("confluence_methods") or [],
+                signal_values=sig_values,
+            )
             nova_pick = {
                 **base,
                 "long_conf": nn_conf,
@@ -6621,6 +6754,13 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
                     "values": sig_values,
                     "fired": fired,
                 },
+                "scoring_v2_shadow": scoring_v2_shadow,
+                "scoring_v2_score": scoring_v2_shadow.get("score"),
+                "scoring_v2_actionable": scoring_v2_shadow.get("actionable"),
+                "scoring_v2_blocked": scoring_v2_shadow.get("blocked"),
+                "scoring_v2_score_band": scoring_v2_shadow.get("score_band"),
+                "scoring_v2_block_reasons": scoring_v2_shadow.get("block_reasons", []),
+                "scoring_v2_caps": [cap.get("name") for cap in scoring_v2_shadow.get("caps_applied", [])],
             }
             nova_pick["nn_executable"] = is_long_pick_eligible(
                 nova_pick,
@@ -6647,6 +6787,7 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
             "source": "shared_comprehensive_scan",
             "observations_logged": observations_logged,
             "message": "No Nova picks qualified above the shared executable gate" if not top_picks else None,
+            "scoring_v2_shadow_summary": summarize_scoring_v2_shadow(scored),
         }
 
         db = get_database()
@@ -8655,6 +8796,95 @@ def api_picks_fresh():
         return jsonify(run_comprehensive_scan(scan_type="manual_fresh"))
     except Exception as error:
         return jsonify({"error": str(error)}), 500
+
+@app.route("/api/scoring-v2-shadow")
+def api_scoring_v2_shadow():
+    """Read-only Scoring V2 shadow comparison from cached Vector/Nova picks."""
+    try:
+        database = get_database()
+        vector_row = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
+        vector_time = database.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
+        nova_row = database.execute("SELECT value FROM app_state WHERE key='cached_nn_picks'").fetchone()
+        nova_time = database.execute("SELECT value FROM app_state WHERE key='cached_nn_picks_time'").fetchone()
+        snapshot, _ = variant_cache_snapshot(database, require_fresh=False)
+        variants = [dict(r) for r in database.execute("""
+            SELECT sv.id, sv.strategy, sv.brain, sv.execution_time, sv.selection_mode, sv.exit_mode, sv.label,
+                   sv.status AS registry_status,
+                   vp.lifecycle_status
+            FROM strategy_variants sv
+            LEFT JOIN variant_portfolios vp ON vp.variant_id=sv.id
+            WHERE sv.status='active'
+            ORDER BY sv.brain, sv.strategy, sv.execution_time, sv.selection_mode
+        """).fetchall()]
+        database.close()
+
+        vector_payload = json.loads(vector_row["value"]) if vector_row else {}
+        nova_payload = json.loads(nova_row["value"]) if nova_row else {}
+
+        def pick_rows(payload, key):
+            rows = payload.get(key) or []
+            output = []
+            for pick in rows[:20]:
+                shadow = pick.get("scoring_v2_shadow") or {}
+                output.append({
+                    "ticker": pick.get("ticker"),
+                    "legacy_confidence": pick.get("long_conf") or pick.get("confidence") or pick.get("nn_score"),
+                    "legacy_expected_move": pick.get("long_move") or pick.get("expected_move"),
+                    "legacy_actionable": True,
+                    "v2_score": shadow.get("score"),
+                    "v2_score_band": shadow.get("score_band"),
+                    "v2_actionable": shadow.get("actionable"),
+                    "v2_blocked": shadow.get("blocked"),
+                    "v2_block_reasons": shadow.get("block_reasons", []),
+                    "v2_caps": [cap.get("name") for cap in shadow.get("caps_applied", []) if isinstance(cap, dict)],
+                    "decision_authority": shadow.get("decision_authority", "legacy_scoring"),
+                })
+            return output
+
+        vector_picks = vector_payload.get("longs") or vector_payload.get("recommended_longs") or []
+        nova_picks = nova_payload.get("recommended_longs") or nova_payload.get("longs") or []
+        variant_rows = []
+        if snapshot:
+            for variant in variants:
+                source = nova_picks if variant.get("brain") == "Nova" else vector_picks
+                if variant.get("brain") == "Nova":
+                    source = [p for p in source if p.get("nn_executable", True)]
+                qualified = filter_variant_strategy_picks(source, variant)
+                selected = select_variant_picks(qualified, variant.get("selection_mode"))
+                for pick in selected[:10]:
+                    shadow = pick.get("scoring_v2_shadow") or {}
+                    variant_rows.append({
+                        "variant_id": variant.get("id"),
+                        "variant_label": variant.get("label") or variant.get("id"),
+                        "brain": variant.get("brain"),
+                        "strategy": variant.get("strategy"),
+                        "execution_time": variant.get("execution_time"),
+                        "selection_mode": variant.get("selection_mode"),
+                        "ticker": pick.get("ticker"),
+                        "legacy_confidence": pick.get("long_conf") or pick.get("confidence") or pick.get("nn_score"),
+                        "legacy_expected_move": pick.get("long_move") or pick.get("expected_move"),
+                        "v2_score": shadow.get("score"),
+                        "v2_score_band": shadow.get("score_band"),
+                        "v2_actionable": shadow.get("actionable"),
+                        "v2_blocked": shadow.get("blocked"),
+                        "v2_block_reasons": shadow.get("block_reasons", []),
+                        "v2_caps": [cap.get("name") for cap in shadow.get("caps_applied", []) if isinstance(cap, dict)],
+                    })
+
+        return jsonify({
+            "success": True,
+            "shadow_mode": True,
+            "decision_authority": "legacy_scoring",
+            "vector_cached_at": vector_time["value"] if vector_time else None,
+            "nova_cached_at": nova_time["value"] if nova_time else None,
+            "vector_summary": vector_payload.get("scoring_v2_shadow_summary") or {},
+            "nova_summary": nova_payload.get("scoring_v2_shadow_summary") or {},
+            "vector_longs": pick_rows(vector_payload, "longs"),
+            "nova_longs": pick_rows(nova_payload, "recommended_longs"),
+            "variant_rows": variant_rows,
+        })
+    except Exception as error:
+        return jsonify({"success": False, "error": str(error)}), 500
 
 @app.route("/api/monitor-open-now", methods=["POST"])
 def api_monitor_open_now():
