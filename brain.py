@@ -5358,6 +5358,41 @@ def build_scoring_v2_shadow(ticker, stock_data, rsi, earnings_soon, weights, bra
         }
 
 
+def build_scoring_v2_shadow_from_cached_pick(pick, weights, brain="Vector"):
+    """Recompute read-only V2 shadow from cached pick fields for preview endpoints."""
+    signal_values = (
+        pick.get("signal_values_for_observation")
+        or (pick.get("signal_scores") or {}).get("values")
+        or {}
+    )
+    days_to_earnings = pick.get("days_to_earnings")
+    if days_to_earnings is None:
+        days_to_earnings = 1 if pick.get("earnings_soon") else 99
+
+    stock_data = {
+        "price": pick.get("price"),
+        "previous_close": pick.get("previous_close") or pick.get("prev_close"),
+        "open": pick.get("open") or pick.get("open_price"),
+        "gap_percent": pick.get("gap_percent") or pick.get("overnight_gap_pct"),
+        "average_volume": pick.get("average_volume") or pick.get("avg_volume"),
+        "volume_ratio": pick.get("volume_ratio") or pick.get("vol_ratio"),
+        "source": pick.get("data_source") or pick.get("source") or pick.get("provider"),
+        "sr_analysis": pick.get("sr_analysis"),
+        "atr_percent": pick.get("atr_percent"),
+        "intraday_range_pct": pick.get("intraday_range_pct"),
+    }
+    return build_scoring_v2_shadow(
+        pick.get("ticker"),
+        stock_data,
+        pick.get("rsi"),
+        {pick.get("ticker"): days_to_earnings},
+        weights,
+        brain=brain,
+        confluence=pick.get("confluence_methods") or [],
+        signal_values=signal_values,
+    )
+
+
 def summarize_scoring_v2_shadow(picks):
     """Summarize non-authoritative V2 comparison status for scan review."""
     rows = [p.get("scoring_v2_shadow") for p in (picks or []) if isinstance(p.get("scoring_v2_shadow"), dict)]
@@ -8836,9 +8871,17 @@ def api_scoring_v2_shadow():
 
         vector_payload = json.loads(vector_row["value"]) if vector_row else {}
         nova_payload = json.loads(nova_row["value"]) if nova_row else {}
+        weights = get_signal_weights()
 
-        def pick_rows(payload, key):
-            rows = payload.get(key) or []
+        def shadow_for_pick(pick, brain):
+            return build_scoring_v2_shadow_from_cached_pick(pick, weights, brain=brain)
+
+        vector_picks = vector_payload.get("longs") or vector_payload.get("recommended_longs") or []
+        nova_picks = nova_payload.get("recommended_longs") or nova_payload.get("longs") or []
+        vector_shadow_rows = [{**pick, "scoring_v2_shadow": shadow_for_pick(pick, "Vector")} for pick in vector_picks]
+        nova_shadow_rows = [{**pick, "scoring_v2_shadow": shadow_for_pick(pick, "Nova")} for pick in nova_picks]
+
+        def pick_rows(rows):
             output = []
             for pick in rows[:20]:
                 shadow = pick.get("scoring_v2_shadow") or {}
@@ -8857,12 +8900,10 @@ def api_scoring_v2_shadow():
                 })
             return output
 
-        vector_picks = vector_payload.get("longs") or vector_payload.get("recommended_longs") or []
-        nova_picks = nova_payload.get("recommended_longs") or nova_payload.get("longs") or []
         variant_rows = []
         if snapshot:
             for variant in variants:
-                source = nova_picks if variant.get("brain") == "Nova" else vector_picks
+                source = nova_shadow_rows if variant.get("brain") == "Nova" else vector_shadow_rows
                 if variant.get("brain") == "Nova":
                     source = [p for p in source if p.get("nn_executable", True)]
                 qualified = filter_variant_strategy_picks(source, variant)
@@ -8893,10 +8934,10 @@ def api_scoring_v2_shadow():
             "decision_authority": "legacy_scoring",
             "vector_cached_at": vector_time["value"] if vector_time else None,
             "nova_cached_at": nova_time["value"] if nova_time else None,
-            "vector_summary": vector_payload.get("scoring_v2_shadow_summary") or {},
-            "nova_summary": nova_payload.get("scoring_v2_shadow_summary") or {},
-            "vector_longs": pick_rows(vector_payload, "longs"),
-            "nova_longs": pick_rows(nova_payload, "recommended_longs"),
+            "vector_summary": summarize_scoring_v2_shadow(vector_shadow_rows),
+            "nova_summary": summarize_scoring_v2_shadow(nova_shadow_rows),
+            "vector_longs": pick_rows(vector_shadow_rows),
+            "nova_longs": pick_rows(nova_shadow_rows),
             "variant_rows": variant_rows,
         })
     except Exception as error:
