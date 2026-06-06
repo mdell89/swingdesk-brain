@@ -64,6 +64,40 @@ Every strategy must define gates. Common gates:
 - enough required signals exist
 - ticker is not already open unless scale-in is explicitly allowed
 
+Gate terms must be concrete in code:
+
+```text
+fresh data
+  scan completed inside the strategy's allowed freshness window
+  default: <= 45 minutes old during active scan windows
+  strict entry execution default: latest completed full scan before the entry slot
+
+valid price
+  finite positive price
+  timestamp present or inherited from a fresh completed scan
+  price source recorded
+  not zero, null, NaN, stale, split-broken, or wildly inconsistent with nearby bars
+
+valid previous close/open
+  finite positive previous close when gap/day-change is used
+  finite positive session open when intraday move is used
+  unavailable values must block or downgrade strategy logic that depends on them
+
+acceptable liquidity
+  default prototype floor: price >= $2 and average daily dollar volume >= $5M
+  strategy may raise the floor
+  low-liquidity names may be context-only until we define penny/small-cap rules
+
+valid direction
+  long strategy must have a long thesis
+  short strategies are disabled until explicitly designed
+  reversal logic must be explicitly owned by a reversal strategy
+
+enough required signals
+  every core signal for the strategy has either valid data or an explicit fallback rule
+  missing core data cannot silently become neutral confidence
+```
+
 Example SwingDesk long rejection:
 
 ```text
@@ -109,7 +143,7 @@ Time-matched relative volume is the primary volume signal during active market w
 time_matched_relative_volume =
   today's cumulative volume through current time
   /
-  median cumulative volume through same time over last N comparable sessions
+  median cumulative volume through same time over last 20 comparable sessions
 ```
 
 Premarket uses a separate premarket baseline.
@@ -118,10 +152,24 @@ Premarket uses a separate premarket baseline.
 premarket_relative_volume =
   today's premarket cumulative volume through current time
   /
-  median premarket cumulative volume through same time over last N comparable sessions
+  median premarket cumulative volume through same time over last 20 comparable sessions
 ```
 
 After close, full-day volume can be compared to full-day average or median.
+
+Volume baseline details:
+
+- Default lookback: 20 comparable sessions.
+- Minimum usable lookback: 10 comparable sessions.
+- Comparable sessions should exclude holidays, half-days when possible, and sessions with obviously broken volume data.
+- Use median rather than mean by default, because one extreme news day can distort volume averages.
+- Regular-session time-matched volume should use exchange time, 9:30 AM to 4:00 PM Eastern.
+- Premarket time-matched volume should use a separate exchange-time window, 4:00 AM to 9:30 AM Eastern.
+- Premarket needs separate logic because premarket liquidity, participation, spreads, and volume curves are structurally different from regular-session trading.
+- The calculation should be cumulative through the current time bucket, not a standalone hourly block.
+- Preferred bucket: 5-minute bars when provider limits allow it.
+- Acceptable fallback bucket: 15-minute bars.
+- Hourly buckets are too coarse for primary scoring, but may be used for a compact educational display if needed.
 
 Daily-average volume fallback:
 
@@ -185,6 +233,8 @@ RSI 38 · reset
 ```
 
 For SwingDesk momentum, moderate strength can be constructive. For mean reversion, lower RSI may be constructive. For Gap & Go, RSI may be context-only.
+
+`reset` means RSI cooled off from an overextended condition into a healthier range without fully breaking the setup. It is potentially constructive for continuation strategies only when price/volume structure remains intact.
 
 ## Sector Relative Strength Context
 
@@ -286,4 +336,3 @@ Minimum test cases:
 - time-matched volume can strongly affect score
 - All view aggregates only valid actionable contributors
 - Context explanation matches backend score payload
-

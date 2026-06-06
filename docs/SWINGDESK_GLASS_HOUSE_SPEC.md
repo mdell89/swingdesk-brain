@@ -4,7 +4,7 @@ This document is the durable product and engineering memory for SwingDesk. It sh
 
 ## Mission
 
-SwingDesk Stocks is the first trustworthy working prototype. It is the architecture base for SwingDesk Crypto, later Commodities and Forex.
+SwingDesk Stocks is the first trustworthy working prototype. It is the architecture base for SwingDesk Crypto, SwingDesk Commodities, and SwingDesk Forex.
 
 The priority order is:
 
@@ -132,6 +132,12 @@ Required scan telemetry:
 - data freshness
 - current ticker names while scanning
 
+Open-position monitoring:
+
+- Simulated open-position monitoring should default to a 3-minute regular-session cadence unless testing proves a faster interval materially improves decisions.
+- Extended-hours monitoring may stay slower, around 5 minutes.
+- Real broker-connected trading should use a separate real-time or near-real-time path later; it should not inherit the simulated monitor cadence blindly.
+
 Decision eligibility:
 
 - Full scans must be checkpointed and resumable.
@@ -215,4 +221,3 @@ Operations to document:
 ## Deprecated Systems
 
 The legacy `virtual_trades` and `nn_virtual_trades` active trading systems are retired. Vector/Nova variant universes are the live source of truth. Open legacy rows should be archived into `retired_legacy_trades`, not allowed to open, monitor, force-close, alert, or affect active portfolio truth.
-
