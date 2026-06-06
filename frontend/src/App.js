@@ -2603,22 +2603,43 @@ function WhyNotPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED })
   );
 }
 
-function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
+function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED, themeKey = "black", pdtRemaining = 3 }) {
   const [open, setOpen] = React.useState(false);
   const [loading, setLoading] = React.useState(false);
   const [payload, setPayload] = React.useState(null);
+  const [spotlightDetails, setSpotlightDetails] = React.useState({});
+  const [expandedSpotlight, setExpandedSpotlight] = React.useState({});
   const [error, setError] = React.useState("");
+
+  const spotlightVariants = [
+    { id: "swingdesk_vector_0845_all", label: "SwingDesk / Vector / 8:45", brain: "Vector", color: BLUE },
+    { id: "swingdesk_nova_0845_all", label: "SwingDesk / Nova / 8:45", brain: "Nova", color: "#a78bfa" },
+  ];
+  const spotlightVariantIds = new Set(spotlightVariants.map(item => item.id));
+
+  const fetchJson = async (url) => {
+    const res = await fetch(url);
+    const text = await res.text();
+    const data = text ? JSON.parse(text) : {};
+    if (!res.ok || data.success === false) throw new Error(data.error || `HTTP ${res.status}`);
+    return data;
+  };
 
   const load = async () => {
     setOpen(true);
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(`${API}/scoring-v2-shadow`);
-      const text = await res.text();
-      const data = text ? JSON.parse(text) : {};
-      if (!res.ok || data.success === false) throw new Error(data.error || `HTTP ${res.status}`);
+      const [data, vectorDetail, novaDetail] = await Promise.all([
+        fetchJson(`${API}/scoring-v2-shadow`),
+        fetchJson(`${API}/variant/swingdesk_vector_0845_all`).catch(() => null),
+        fetchJson(`${API}/variant/swingdesk_nova_0845_all`).catch(() => null),
+      ]);
       setPayload(data);
+      setSpotlightDetails({
+        swingdesk_vector_0845_all: vectorDetail,
+        swingdesk_nova_0845_all: novaDetail,
+      });
     } catch (err) {
       const message = String(err.message || "");
       setError(message.includes("JSON") ? "Scoring V2 shadow endpoint is not available on this backend yet." : (message || "Failed to load Scoring V2 shadow view"));
@@ -2632,9 +2653,101 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
     ...(Array.isArray(payload?.vector_longs) ? payload.vector_longs.map(row => ({ ...row, brain: "Vector", variant_label: "Vector cached picks" })) : []),
     ...(Array.isArray(payload?.nova_longs) ? payload.nova_longs.map(row => ({ ...row, brain: "Nova", variant_label: "Nova cached picks" })) : []),
   ];
-  const rows = (variantRows.length ? variantRows : fallbackRows).slice(0, 16);
+  const allRows = variantRows.length ? variantRows : fallbackRows;
+  const rows = allRows.filter(row => !spotlightVariantIds.has(row.variant_id)).slice(0, 16);
   const vectorSummary = payload?.vector_summary || {};
   const novaSummary = payload?.nova_summary || {};
+
+  const toggleSpotlightCard = key => {
+    setExpandedSpotlight(prev => ({ ...prev, [key]: !prev[key] }));
+  };
+
+  const renderShadowStrip = (row, color) => {
+    const capText = (row.v2_caps || []).slice(0, 2).join(", ");
+    const reasonText = (row.v2_block_reasons || []).slice(0, 1).join(", ");
+    const status = row.v2_actionable ? "actionable" : row.v2_blocked ? "blocked" : (row.v2_score_band || "shadow");
+    return (
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center", margin: "5px 1px 4px" }}>
+        <div style={{ minWidth: 0, fontSize: 8, color: T3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+          V2 {row.v2_score == null ? "--" : row.v2_score} / {status}{reasonText || capText ? ` / ${reasonText || capText}` : ""}
+        </div>
+        <div style={{ flexShrink: 0, fontSize: 8, color, fontFamily: "'DM Mono',monospace", fontWeight: 900 }}>
+          old {row.legacy_confidence ?? "--"}
+        </div>
+      </div>
+    );
+  };
+
+  const renderSpotlight = (config) => {
+    const picks = allRows.filter(row => row.variant_id === config.id);
+    const detail = spotlightDetails[config.id] || {};
+    const openTrades = (Array.isArray(detail.trades) ? detail.trades : []).filter(trade => trade.outcome === "open");
+    return (
+      <div key={config.id} style={{ marginBottom: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, marginBottom: 6 }}>
+          <div style={{ fontSize: 10, color: T1, fontWeight: 900 }}>{config.label}</div>
+          <div style={{ fontSize: 8, color: config.color, fontFamily: "'DM Mono',monospace", fontWeight: 900 }}>
+            {picks.length} picks / {openTrades.length} open
+          </div>
+        </div>
+        {picks.length > 0 ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {picks.map((row, idx) => {
+              const key = `v2_pick_${config.id}_${row.ticker}_${idx}`;
+              const pick = mapPickFields({
+                ...row,
+                long_conf: row.v2_score ?? row.long_conf ?? 0,
+                long_move: row.long_move ?? row.legacy_expected_move ?? 0,
+                long_reasoning: row.v2_explanation || row.long_reasoning,
+                source_scan_time: row.source_scan_time || (config.brain === "Nova" ? payload?.nova_cached_at : payload?.vector_cached_at),
+                price_provider: row.price_provider || "cached shadow",
+              });
+              return (
+                <div key={key}>
+                  {renderShadowStrip(row, config.color)}
+                  <PickCard
+                    pick={pick}
+                    isLong={true}
+                    themeKey={themeKey}
+                    strategyName="SwingDesk"
+                    strategyTotal={10}
+                    brainTags={[config.brain]}
+                    expanded={expandedSpotlight[key]}
+                    cardKeyOverride={key}
+                    onToggle={toggleSpotlightCard}
+                  />
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div style={{ fontSize: 9, color: T3, lineHeight: 1.4, padding: "6px 1px" }}>No V2 shadow picks for this 8:45 variant yet.</div>
+        )}
+        {openTrades.length > 0 && (
+          <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ fontSize: 8, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .5 }}>Open positions</div>
+            {openTrades.map(trade => {
+              const key = `v2_pos_${config.id}_${trade.id || trade.ticker}`;
+              return (
+                <PositionCard
+                  key={key}
+                  trade={trade}
+                  isLong={(trade.direction || "long") !== "short"}
+                  expanded={expandedSpotlight[key]}
+                  onToggle={() => toggleSpotlightCard(key)}
+                  pdtRemaining={pdtRemaining}
+                  themeKey={themeKey}
+                  strategyName="SwingDesk"
+                  strategyTotal={10}
+                  brainTags={[config.brain]}
+                />
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 12px", marginBottom: 16 }}>
@@ -2673,10 +2786,13 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
                 ))}
               </div>
 
+              {spotlightVariants.map(renderSpotlight)}
+
               {rows.length === 0 ? (
                 <div style={{ fontSize: 9, color: T3, lineHeight: 1.4 }}>No cached shadow rows yet. Run a fresh scan after deploy.</div>
               ) : (
                 <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                  <div style={{ fontSize: 8, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .5, marginTop: 2 }}>Other variants</div>
                   {rows.map((row, idx) => {
                     const blocked = Boolean(row.v2_blocked);
                     const actionable = Boolean(row.v2_actionable);
@@ -4806,7 +4922,7 @@ export default function App() {
 
               <ScanPanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} />
               <WhyNotPanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} />
-              <ScoringV2ShadowPanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} />
+              <ScoringV2ShadowPanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} themeKey={themeKey} pdtRemaining={pdtRemaining} />
           <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
             <div style={{ fontSize: 14, fontWeight: 600, color: T1, marginBottom: 4 }}>Self-audit engine</div>
             <div style={{ fontSize: 10, color: T2, lineHeight: 1.45, marginBottom: 6 }}>Autopilot: daily 7:00 PM Central batch learning, then a read-only LLM recap.</div>

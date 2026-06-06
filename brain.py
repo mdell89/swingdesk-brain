@@ -9157,6 +9157,35 @@ def api_scoring_v2_shadow():
                 })
             return output
 
+        def shadow_card_row(variant, pick):
+            shadow = pick.get("scoring_v2_shadow") or {}
+            legacy_confidence = pick.get("long_conf") or pick.get("confidence") or pick.get("nn_score")
+            legacy_expected_move = pick.get("long_move") or pick.get("expected_move")
+            v2_score = shadow.get("score")
+            return {
+                **pick,
+                "variant_id": variant.get("id"),
+                "variant_label": variant.get("label") or variant.get("id"),
+                "brain": variant.get("brain"),
+                "strategy": variant.get("strategy"),
+                "execution_time": variant.get("execution_time"),
+                "selection_mode": variant.get("selection_mode"),
+                "ticker": pick.get("ticker"),
+                "legacy_confidence": legacy_confidence,
+                "legacy_expected_move": legacy_expected_move,
+                "long_conf": v2_score if v2_score is not None else 0,
+                "long_move": legacy_expected_move,
+                "long_reasoning": shadow.get("explanation") or pick.get("long_reasoning"),
+                "v2_score": v2_score,
+                "v2_score_band": shadow.get("score_band"),
+                "v2_actionable": shadow.get("actionable"),
+                "v2_blocked": shadow.get("blocked"),
+                "v2_block_reasons": shadow.get("block_reasons", []),
+                "v2_caps": [cap.get("name") for cap in shadow.get("caps_applied", []) if isinstance(cap, dict)],
+                "v2_explanation": shadow.get("explanation"),
+                "decision_authority": shadow.get("decision_authority", "legacy_scoring"),
+            }
+
         variant_rows = []
         if snapshot:
             for variant in variants:
@@ -9166,24 +9195,7 @@ def api_scoring_v2_shadow():
                 qualified = filter_variant_strategy_picks(source, variant)
                 selected = select_variant_picks(qualified, variant.get("selection_mode"))
                 for pick in selected[:10]:
-                    shadow = pick.get("scoring_v2_shadow") or {}
-                    variant_rows.append({
-                        "variant_id": variant.get("id"),
-                        "variant_label": variant.get("label") or variant.get("id"),
-                        "brain": variant.get("brain"),
-                        "strategy": variant.get("strategy"),
-                        "execution_time": variant.get("execution_time"),
-                        "selection_mode": variant.get("selection_mode"),
-                        "ticker": pick.get("ticker"),
-                        "legacy_confidence": pick.get("long_conf") or pick.get("confidence") or pick.get("nn_score"),
-                        "legacy_expected_move": pick.get("long_move") or pick.get("expected_move"),
-                        "v2_score": shadow.get("score"),
-                        "v2_score_band": shadow.get("score_band"),
-                        "v2_actionable": shadow.get("actionable"),
-                        "v2_blocked": shadow.get("blocked"),
-                        "v2_block_reasons": shadow.get("block_reasons", []),
-                        "v2_caps": [cap.get("name") for cap in shadow.get("caps_applied", []) if isinstance(cap, dict)],
-                    })
+                    variant_rows.append(shadow_card_row(variant, pick))
 
         return jsonify({
             "success": True,
