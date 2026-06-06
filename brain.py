@@ -1831,7 +1831,10 @@ def mark_stalled_scan_events(max_age_minutes=45, zero_progress_minutes=20):
             live_status = {}
     live_scan_has_progress = (
         live_status.get("status") == "running" and
-        int(live_status.get("total_scanned") or 0) > 0 and
+        (
+            int(live_status.get("total_scanned") or 0) > 0 or
+            live_status.get("phase") in {"fetching_prices", "scoring"}
+        ) and
         str(live_status.get("updated_at") or "") >= zero_cutoff
     )
     if not live_scan_has_progress:
