@@ -146,6 +146,17 @@ time_matched_relative_volume =
   median cumulative volume through same time over last 20 comparable sessions
 ```
 
+This metric answers: "Is this ticker trading more volume than it normally has by this same point in the same market window?"
+
+Comparable sessions:
+
+- Same ticker.
+- Same market window: premarket compares only to prior premarket windows; regular session compares only to prior regular sessions.
+- Most recent 20 usable sessions by default.
+- Minimum usable baseline: 10 sessions. Below 10, volume is context-only and cannot strongly boost confidence.
+- Exclude holidays, half-days, halted sessions, split-broken sessions, and provider-corrupted volume when detectable.
+- Prefer the median baseline instead of the mean because one extreme news day can distort averages.
+
 Premarket uses a separate premarket baseline.
 
 ```text
@@ -155,14 +166,14 @@ premarket_relative_volume =
   median premarket cumulative volume through same time over last 20 comparable sessions
 ```
 
+Example: at 8:15 AM Central, premarket relative volume compares today's cumulative premarket volume from 4:00 AM Eastern through 9:15 AM Eastern against the median cumulative premarket volume from 4:00 AM Eastern through 9:15 AM Eastern across the prior 20 usable sessions.
+
+Regular-session example: at 11:00 AM Eastern, regular-session relative volume compares today's cumulative regular-session volume from 9:30 AM Eastern through 11:00 AM Eastern against the median cumulative regular-session volume from 9:30 AM Eastern through 11:00 AM Eastern across the prior 20 usable sessions.
+
 After close, full-day volume can be compared to full-day average or median.
 
 Volume baseline details:
 
-- Default lookback: 20 comparable sessions.
-- Minimum usable lookback: 10 comparable sessions.
-- Comparable sessions should exclude holidays, half-days when possible, and sessions with obviously broken volume data.
-- Use median rather than mean by default, because one extreme news day can distort volume averages.
 - Regular-session time-matched volume should use exchange time, 9:30 AM to 4:00 PM Eastern.
 - Premarket time-matched volume should use a separate exchange-time window, 4:00 AM to 9:30 AM Eastern.
 - Premarket needs separate logic because premarket liquidity, participation, spreads, and volume curves are structurally different from regular-session trading.
@@ -171,12 +182,30 @@ Volume baseline details:
 - Acceptable fallback bucket: 15-minute bars.
 - Hourly buckets are too coarse for primary scoring, but may be used for a compact educational display if needed.
 
+Recent-block volume acceleration:
+
+```text
+recent_block_volume_acceleration =
+  today's volume in the most recent completed 15-minute block
+  /
+  median volume for the same 15-minute clock block over the prior 20 usable sessions
+```
+
+This metric answers: "Is volume accelerating right now compared with this exact part of the day?"
+
+- Use completed 15-minute blocks by default.
+- Fallback to 30-minute blocks when provider limits or missing bars make 15-minute blocks unreliable.
+- Do not use 60-minute blocks for primary scoring; they are too slow to detect actionable intraday volume changes.
+- Recent-block acceleration may confirm or strengthen a setup, but should not override a failed strategy gate by itself.
+- For premarket, compare only against prior premarket blocks with the same clock time.
+
 Daily-average volume fallback:
 
 - May carry limited context weight when time-matched volume is unavailable.
 - During active market hours, its authority should be no more than one-third of time-matched volume authority.
 - It must not be the deciding boost by itself.
 - It should be labeled clearly as `daily avg`.
+- If both cumulative time-matched volume and recent-block acceleration are available, daily-average volume should be display/context only.
 
 Display examples:
 
