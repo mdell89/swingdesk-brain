@@ -2679,7 +2679,9 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
   };
 
   const renderSpotlight = (config) => {
-    const picks = allRows.filter(row => row.variant_id === config.id);
+    const variantShadowRows = allRows.filter(row => row.variant_id === config.id);
+    const picks = variantShadowRows.filter(row => row.v2_actionable);
+    const blockedCount = variantShadowRows.length - picks.length;
     const detail = spotlightDetails[config.id] || {};
     const openTrades = (Array.isArray(detail.trades) ? detail.trades : []).filter(trade => trade.outcome === "open");
     return (
@@ -2687,7 +2689,7 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, marginBottom: 6 }}>
           <div style={{ fontSize: 10, color: T1, fontWeight: 900 }}>{config.label}</div>
           <div style={{ fontSize: 8, color: config.color, fontFamily: "'DM Mono',monospace", fontWeight: 900 }}>
-            {picks.length} picks / {openTrades.length} open
+            {picks.length} V2 picks / {openTrades.length} open
           </div>
         </div>
         {picks.length > 0 ? (
@@ -2721,7 +2723,9 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
             })}
           </div>
         ) : (
-          <div style={{ fontSize: 9, color: T3, lineHeight: 1.4, padding: "6px 1px" }}>No V2 shadow picks for this 8:45 variant yet.</div>
+          <div style={{ fontSize: 9, color: T3, lineHeight: 1.4, padding: "6px 1px" }}>
+            No V2-actionable picks for this 8:45 variant yet{blockedCount > 0 ? ` (${blockedCount} blocked/skip rows hidden from pick cards).` : "."}
+          </div>
         )}
         {openTrades.length > 0 && (
           <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>

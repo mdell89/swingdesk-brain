@@ -208,6 +208,8 @@ MIN_EXPECTED_MOVE    = 5.0       # Minimum predicted overnight move (%)
 MAX_LONG_PICKS       = 20        # Maximum long recommendations per scan
 MAX_SHORT_PICKS      = 10        # Maximum short recommendations per scan
 MIN_VOLUME_RATIO     = 1.2       # Minimum volume activity to confirm a real setup
+MAX_LONG_GAP_DOWN_PCT = -3.0     # Bullish longs cannot start from a major gap-down.
+MAX_LONG_RED_DAY_PCT  = -3.0     # Bullish longs cannot be deep red versus prior close.
 MAX_ALL_VARIANT_OPEN_POSITIONS = 50
 SCAN_EVENT_RETENTION_DAYS = 30   # Raw operational scan telemetry retention
 ARCHIVED_VARIANT_OUTCOMES = ("archived_excess_open",)
@@ -3297,6 +3299,26 @@ def select_variant_picks(picks, selection_mode):
         return picks[:3]
     return picks
 
+def numeric_pick_value(pick, *keys):
+    for key in keys:
+        try:
+            if pick.get(key) is not None:
+                return float(pick.get(key))
+        except Exception:
+            pass
+    return None
+
+def bullish_price_action_block_reasons(pick):
+    """Hard long-side price-action blocks for broad bullish SwingDesk picks."""
+    gap = numeric_pick_value(pick, "overnight_gap_pct", "gap_percent", "gap_pct")
+    day_change = numeric_pick_value(pick, "pct_change_prev_close", "day_change_pct", "day_change_percent")
+    reasons = []
+    if gap is not None and gap <= MAX_LONG_GAP_DOWN_PCT:
+        reasons.append(f"gap {gap:.1f}% is below the bullish floor of {MAX_LONG_GAP_DOWN_PCT:.1f}%")
+    if day_change is not None and day_change <= MAX_LONG_RED_DAY_PCT:
+        reasons.append(f"day change {day_change:.1f}% is below the bullish floor of {MAX_LONG_RED_DAY_PCT:.1f}%")
+    return reasons
+
 def cache_age_minutes(timestamp):
     parsed = _parse_iso(timestamp)
     if not parsed:
@@ -3333,6 +3355,8 @@ def variant_cache_snapshot(database, require_fresh=True, max_age_minutes=180):
 
     vector_payload = json.loads(vector_cached["value"]) if vector_cached else {}
     nova_payload = json.loads(nova_cached["value"]) if nova_cached else {}
+    vector_payload = sanitize_cached_pick_payload(vector_payload)
+    nova_payload = sanitize_cached_pick_payload(nova_payload, confidence_floor=NN_CONFIDENCE_FLOOR)
     vector_time = vector_time_row["value"] if vector_time_row else vector_payload.get("generated_at")
     nova_time = nova_time_row["value"] if nova_time_row else nova_payload.get("scan_time")
     vector_age = cache_age_minutes(vector_time)
@@ -3415,6 +3439,9 @@ def explain_variant_strategy_match(strategy, pick):
 
     if strategy in ("nr7", "opening range hold"):
         return result(False, [f"{strategy} is retired from SwingDesk Stocks"])
+    global_reasons = bullish_price_action_block_reasons(pick)
+    if global_reasons:
+        return result(False, global_reasons)
     if strategy == "swingdesk":
         reasons = []
         if confidence < 65:
@@ -3544,6 +3571,8 @@ def is_long_pick_eligible(pick, open_tickers=None, confidence_floor=CONFIDENCE_F
         return False
     if open_tickers and pick.get("ticker") in open_tickers:
         return False
+    if bullish_price_action_block_reasons(pick):
+        return False
     confidence, expected_move = pick_confidence_and_move(pick)
     volume = float(pick.get("vol_ratio") or pick.get("volume_ratio") or 1)
     price = float(pick.get("open_price") or pick.get("price") or pick.get("buy_price") or 0)
@@ -3592,6 +3621,11 @@ def explain_long_pick_gate(row, open_tickers=None, confidence_floor=CONFIDENCE_F
         reasons.append(f"Expected move {expected_move:.1f}% is below the {MIN_EXPECTED_MOVE:.1f}% minimum.")
     else:
         passes.append(f"Expected move {expected_move:.1f}% clears the minimum.")
+    price_action_reasons = bullish_price_action_block_reasons(row)
+    if price_action_reasons:
+        reasons.extend(price_action_reasons)
+    else:
+        passes.append("Bullish price-action floor passed.")
     if volume >= MIN_VOLUME_RATIO:
         passes.append(f"Volume ratio {volume:.2f}x clears the minimum.")
     else:
@@ -5414,8 +5448,10 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
     # Gap
     gap_percent = ticker_data.get("gap_percent", 0)
     gap_percent = gap_percent if gap_percent == gap_percent else 0.0
-    gap_score = min(abs(gap_percent) / 10.0, 1.0)
-    if direction == "short":
+    if direction == "long":
+        gap_score = min(max(gap_percent, 0.0) / 10.0, 1.0)
+    else:
+        gap_score = min(abs(gap_percent) / 10.0, 1.0)
         gap_score = gap_score if gap_percent < 0 else gap_score * 0.5
 
     # Earnings
@@ -5568,6 +5604,7 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
         "previous_close": stock_data.get("previous_close"),
         "open": stock_data.get("open"),
         "gap_percent": stock_data.get("gap_percent"),
+        "day_change_percent": stock_data.get("day_change_percent") or stock_data.get("day_change_pct"),
         "average_daily_dollar_volume": average_daily_dollar_volume,
         "freshness_status": "fresh",
         "scan_completed_at": current_time_cst().isoformat(),
@@ -5630,6 +5667,7 @@ def build_scoring_v2_shadow_from_cached_pick(pick, weights, brain="Vector"):
         "previous_close": pick.get("previous_close") or pick.get("prev_close"),
         "open": pick.get("open") or pick.get("open_price"),
         "gap_percent": pick.get("gap_percent") or pick.get("overnight_gap_pct"),
+        "day_change_percent": pick.get("day_change_percent") or pick.get("day_change_pct") or pick.get("pct_change_prev_close"),
         "average_volume": pick.get("average_volume") or pick.get("avg_volume"),
         "volume_ratio": pick.get("volume_ratio") or pick.get("vol_ratio"),
         "source": pick.get("data_source") or pick.get("source") or pick.get("provider"),
@@ -6043,8 +6081,12 @@ def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, 
     # 3. Overnight Gap
     gap_percent = ticker_data.get("gap_percent", 0)
     gap_percent = gap_percent if gap_percent == gap_percent else 0.0
-    gap_score = min(abs(gap_percent) / 10.0, 1.0)
-    if direction == "short":
+    if direction == "long":
+        if gap_percent <= MAX_LONG_GAP_DOWN_PCT:
+            return 0
+        gap_score = min(max(gap_percent, 0.0) / 10.0, 1.0)
+    else:
+        gap_score = min(abs(gap_percent) / 10.0, 1.0)
         gap_score = gap_score if gap_percent < 0 else gap_score * 0.5
 
     # 4. Earnings Catalyst — hard disqualify if earnings tonight or tomorrow
@@ -6109,7 +6151,7 @@ def estimate_overnight_move(price_data, confidence, has_earnings):
     base_move = 4 + (confidence - 60) * 0.25
     volume_bonus = (volume_ratio - 1) * 1.5
     earnings_bonus = 3 if has_earnings else 0
-    gap_boost = min(abs(gap_percent) * 0.3, 3)
+    gap_boost = min(max(gap_percent, 0.0) * 0.3, 3)
     return round(min(base_move + volume_bonus + earnings_bonus + gap_boost, 25), 1)
 
 def predict_sell_time_window(confidence):
@@ -6566,11 +6608,31 @@ def get_cached_picks():
     cache_time = database.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
     database.close()
     if cached:
-        result = json.loads(cached["value"])
+        result = sanitize_cached_pick_payload(json.loads(cached["value"]))
         result["cached"] = True
         result["cache_time"] = cache_time["value"] if cache_time else None
         return result
     return None
+
+def sanitize_cached_pick_payload(payload, confidence_floor=CONFIDENCE_FLOOR):
+    """Remove cached long picks that no longer pass the shared bullish gate."""
+    if not isinstance(payload, dict):
+        return payload
+    sanitized = dict(payload)
+    filtered_total = 0
+    for key in ("longs", "recommended_longs"):
+        rows = payload.get(key)
+        if isinstance(rows, list):
+            kept = [row for row in rows if is_long_pick_eligible(row, confidence_floor=confidence_floor)]
+            filtered_total += len(rows) - len(kept)
+            sanitized[key] = kept
+    if filtered_total:
+        sanitized["bullish_filtered_count"] = int(sanitized.get("bullish_filtered_count") or 0) + filtered_total
+        sanitized["bullish_filter"] = {
+            "max_gap_down_pct": MAX_LONG_GAP_DOWN_PCT,
+            "max_red_day_pct": MAX_LONG_RED_DAY_PCT,
+        }
+    return sanitized
 
 # ── NEURAL NETWORK SCAN ──────────────────────────────────────────────────────
 def run_variant_universes_from_cache(trigger="manual", buy_time=None, require_fresh=True):
@@ -7337,7 +7399,7 @@ def _execute_opening_positions_legacy():
 
     # Shorts are disabled — only execute long picks.
     # Virtual short execution requires short-specific signals to be meaningful.
-    all_picks = picks.get("longs", [])[:MAX_LONG_PICKS]
+    all_picks = [pick for pick in picks.get("longs", []) if is_long_pick_eligible(pick)][:MAX_LONG_PICKS]
 
     # Fetch current prices at execution time (8:45 AM) — pin to 8:45 candle for accuracy
     tickers = [pick["ticker"] for pick in all_picks]
@@ -7351,6 +7413,10 @@ def _execute_opening_positions_legacy():
     for original_index, pick in indexed_picks:
         direction = "long" if original_index < MAX_LONG_PICKS else "short"
         ticker = pick["ticker"]
+        block_reasons = bullish_price_action_block_reasons(pick)
+        if block_reasons:
+            log.warning(f"Skipping {ticker} at legacy open: {'; '.join(block_reasons)}")
+            continue
         raw_price = current_prices.get(ticker)
         buy_price = (raw_price["price"] if isinstance(raw_price, dict) else raw_price) or pick.get("open_price", pick["price"])
         confidence = pick["long_conf"] if direction == "long" else pick["short_conf"]
@@ -7494,7 +7560,7 @@ def execute_opening_positions(trigger="scheduled", buy_time="08:45:00"):
 
         picks = json.loads(cached["value"])
         cached_longs = picks.get("longs") or picks.get("recommended_longs") or []
-        all_picks = cached_longs[:MAX_LONG_PICKS]
+        all_picks = [pick for pick in cached_longs if is_long_pick_eligible(pick)][:MAX_LONG_PICKS]
         status["cached_pick_count"] = len(all_picks)
 
         if not all_picks:
@@ -7519,6 +7585,11 @@ def execute_opening_positions(trigger="scheduled", buy_time="08:45:00"):
             if not ticker:
                 status["skipped_count"] += 1
                 status["skipped"].append({"ticker": None, "reason": "missing ticker"})
+                continue
+            block_reasons = bullish_price_action_block_reasons(pick)
+            if block_reasons:
+                status["skipped_count"] += 1
+                status["skipped"].append({"ticker": ticker, "reason": "bullish_price_action_block", "details": block_reasons})
                 continue
 
             trade_id = f"{ticker}_{today}_{direction}_vt"
@@ -9060,8 +9131,9 @@ def api_last_known():
         "SELECT SUM(current_value) as total FROM virtual_trades WHERE outcome='open'"
     ).fetchone()
     database.close()
+    picks_payload = sanitize_cached_pick_payload(json.loads(cached["value"]) if cached else {})
     return jsonify({
-        "picks": json.loads(cached["value"]) if cached else {},
+        "picks": picks_payload,
         "cache_time": cache_time["value"] if cache_time else None,
         "open_position_value": round(float(portfolio_snapshot["total"] or 0), 2),
         "stale": True,
@@ -9126,8 +9198,8 @@ def api_scoring_v2_shadow():
         """).fetchall()]
         database.close()
 
-        vector_payload = json.loads(vector_row["value"]) if vector_row else {}
-        nova_payload = json.loads(nova_row["value"]) if nova_row else {}
+        vector_payload = sanitize_cached_pick_payload(json.loads(vector_row["value"]) if vector_row else {})
+        nova_payload = sanitize_cached_pick_payload(json.loads(nova_row["value"]) if nova_row else {}, confidence_floor=NN_CONFIDENCE_FLOOR)
         weights = get_signal_weights()
 
         def shadow_for_pick(pick, brain):

@@ -181,6 +181,7 @@ def evaluate_gates(data: dict[str, Any], strategy: str, direction: str, open_tic
     price = first_number(data, "price", "current_price", "last_price", "close")
     previous_close = first_number(data, "previous_close", "prev_close")
     gap_percent = first_number(data, "gap_percent", "gap_pct", "overnight_gap_pct")
+    day_change_percent = first_number(data, "day_change_percent", "day_change_pct", "pct_change_prev_close")
     avg_dollar_volume = average_daily_dollar_volume(data)
     ticker = str(data.get("ticker") or "").upper()
     open_tickers = open_tickers or set()
@@ -222,6 +223,9 @@ def evaluate_gates(data: dict[str, Any], strategy: str, direction: str, open_tic
 
     gap_passed = not (gap_percent is not None and gap_percent <= -3.0)
     gates.append(gate_row("no_strategy_disqualifying_pattern", gap_passed, "no major gap-down long rejection" if gap_passed else "gap down of 3% or worse blocks broad long momentum"))
+
+    red_day_passed = not (day_change_percent is not None and day_change_percent <= -3.0)
+    gates.append(gate_row("bullish_day_change_floor", red_day_passed, "no major red-day long rejection" if red_day_passed else "red day of 3% or worse blocks broad long momentum"))
 
     days_to_earnings = first_number(data, "days_to_earnings", "earnings_days")
     earnings_day = bool(data.get("earnings_day")) or days_to_earnings == 0

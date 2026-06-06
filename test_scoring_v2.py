@@ -54,6 +54,14 @@ class ScoringV2Test(unittest.TestCase):
         self.assertIsNone(result["score"])
         self.assertIn("gap down of 3% or worse", " ".join(result["block_reasons"]))
 
+    def test_major_red_day_long_is_blocked(self):
+        result = score_stock_v2(clean_setup(gap_percent=0.5, day_change_percent=-3.0))
+
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["actionable"])
+        self.assertIsNone(result["score"])
+        self.assertIn("red day of 3% or worse", " ".join(result["block_reasons"]))
+
     def test_missing_previous_close_blocks_gap_dependent_strategy(self):
         result = score_stock_v2(clean_setup(previous_close=None))
 
