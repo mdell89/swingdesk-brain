@@ -5296,7 +5296,7 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
 
     average_volume = stock_data.get("average_volume")
     average_daily_dollar_volume = None
-    if average_volume is not None and stock_data.get("price"):
+    if average_volume is not None and float(average_volume or 0) > 1 and stock_data.get("price"):
         average_daily_dollar_volume = float(average_volume or 0) * float(stock_data.get("price") or 0)
 
     confluence_methods = []

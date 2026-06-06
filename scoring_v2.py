@@ -67,6 +67,25 @@ def confidence_band(score: int | None) -> str:
     return "elite"
 
 
+def average_daily_dollar_volume(data: dict[str, Any]) -> float | None:
+    explicit = first_number(
+        data,
+        "average_daily_dollar_volume",
+        "avg_daily_dollar_volume",
+        "median_daily_dollar_volume",
+    )
+    if explicit is not None:
+        return explicit
+
+    average_volume = first_number(data, "average_volume", "avg_volume", "median_daily_volume")
+    price = first_number(data, "price", "current_price", "last_price", "close")
+    if average_volume is None or price is None:
+        return None
+    if average_volume <= 1:
+        return None
+    return average_volume * price
+
+
 def normalize_signal_weights(strategy: str = "SwingDesk", weights: dict[str, Any] | None = None) -> dict[str, float]:
     profile = STRATEGY_PROFILES[strategy]
     raw = {}
@@ -162,12 +181,7 @@ def evaluate_gates(data: dict[str, Any], strategy: str, direction: str, open_tic
     price = first_number(data, "price", "current_price", "last_price", "close")
     previous_close = first_number(data, "previous_close", "prev_close")
     gap_percent = first_number(data, "gap_percent", "gap_pct", "overnight_gap_pct")
-    average_daily_dollar_volume = first_number(
-        data,
-        "average_daily_dollar_volume",
-        "avg_daily_dollar_volume",
-        "median_daily_dollar_volume",
-    )
+    avg_dollar_volume = average_daily_dollar_volume(data)
     ticker = str(data.get("ticker") or "").upper()
     open_tickers = open_tickers or set()
 
@@ -184,13 +198,19 @@ def evaluate_gates(data: dict[str, Any], strategy: str, direction: str, open_tic
     liquidity_passed = bool(
         price is not None
         and price >= 2.0
-        and average_daily_dollar_volume is not None
-        and average_daily_dollar_volume >= 5_000_000
+        and (avg_dollar_volume is None or avg_dollar_volume >= 5_000_000)
+    )
+    liquidity_reason = (
+        "price and average daily dollar volume pass prototype floor"
+        if liquidity_passed and avg_dollar_volume is not None
+        else "liquidity proof missing; score capped until ADV is available"
+        if liquidity_passed
+        else "price or average daily dollar volume below required floor"
     )
     gates.append(gate_row(
         "acceptable_liquidity",
         liquidity_passed,
-        "price and average daily dollar volume pass prototype floor" if liquidity_passed else "price or average daily dollar volume below required floor",
+        liquidity_reason,
     ))
 
     direction_passed = direction == "long"
@@ -495,6 +515,8 @@ def score_stock_v2(
     freshness = data_freshness(data)
     if freshness["freshness_status"] == "stale":
         caps.append(cap_row("stale_scan", 64, "stale scan cannot be actionable"))
+    if average_daily_dollar_volume(data) is None:
+        caps.append(cap_row("liquidity_unknown", 64, "average daily dollar volume is missing; review only"))
 
     raw_score = BASE_SCORE + sum(row["points"] for row in signals)
     cap_limit = min([cap["max_score"] for cap in caps], default=100)

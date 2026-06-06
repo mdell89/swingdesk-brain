@@ -79,6 +79,22 @@ class ScoringV2Test(unittest.TestCase):
         self.assertEqual(result["score_band"], "valid")
         self.assertIn("daily_average_volume_only", {cap["name"] for cap in result["caps_applied"]})
 
+    def test_missing_liquidity_proof_caps_but_does_not_hard_block(self):
+        result = score_stock_v2(clean_setup(average_daily_dollar_volume=None))
+
+        self.assertFalse(result["blocked"])
+        self.assertFalse(result["actionable"])
+        self.assertLessEqual(result["score"], 64)
+        self.assertIn("liquidity_unknown", {cap["name"] for cap in result["caps_applied"]})
+        self.assertNotIn("price or average daily dollar volume below required floor", result["block_reasons"])
+
+    def test_known_low_liquidity_still_blocks(self):
+        result = score_stock_v2(clean_setup(average_daily_dollar_volume=1_000_000))
+
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["actionable"])
+        self.assertIn("price or average daily dollar volume below required floor", result["block_reasons"])
+
     def test_volume_authority_tiers(self):
         full = score_stock_v2(clean_setup(volume_baseline_sessions=20))
         provisional = score_stock_v2(clean_setup(volume_baseline_sessions=12))
