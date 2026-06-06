@@ -106,6 +106,12 @@ Rejected: major gap down without reversal confirmation
 
 That ticker should not receive a long-pick confidence score under SwingDesk momentum logic.
 
+For broad bullish SwingDesk long picks, "major gap down" means the stock opened down 3% or more from the prior close. In numeric form this is `gap_percent <= -3.0`, which includes `-3%`, `-5%`, and `-12%`. It does not mean "less negative than 3%"; it means the red gap is at least three percentage points deep.
+
+Broad bullish SwingDesk long picks also reject a major red day versus prior close. "Major red day" means the stock is trading down 3% or more from the prior close. In numeric form this is `day_change_percent <= -3.0`, which includes `-3%`, `-8.6%`, and `-30.5%`.
+
+These blocks apply to bullish momentum/continuation picks only. A future reversal strategy may define different rules, but it must own that logic explicitly and label it as reversal behavior.
+
 ## Strategy Signal Profiles
 
 Every strategy must own its own signal profile. No strategy should blindly inherit the full canonical signal list unless that is truly part of the strategy design.
@@ -357,6 +363,7 @@ Safe reset sequence:
 Minimum test cases:
 
 - major gap-down long under SwingDesk fails eligibility
+- major red-day long under SwingDesk fails eligibility
 - valid gap-up momentum can pass
 - missing RS/sector data does not inflate confidence
 - disabled signals cannot affect score

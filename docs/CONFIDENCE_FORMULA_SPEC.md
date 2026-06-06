@@ -668,6 +668,11 @@ Suggested default:
 ```text
 gap_percent <= -3.0 blocks Gap & Go and broad long momentum unless reversal support exists
   note: this means a gap down of 3% or worse, such as -3%, -5%, or -12%.
+  plain English: the stock opened at least three percentage points below the prior close.
+  this does not mean "no more than 3% negative"; it means the red gap is 3% deep or deeper.
+day_change_percent <= -3.0 blocks broad bullish long momentum unless reversal support exists
+  note: this means the stock is trading down 3% or worse versus the prior close, such as -3%, -8.6%, or -30.5%.
+  plain English: a bullish continuation app should not treat a deeply red stock as a normal long pick.
 gap_up > +15% applies extension cap unless volume/catalyst/context is elite
 ```
 

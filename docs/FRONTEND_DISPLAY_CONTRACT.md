@@ -200,6 +200,7 @@ RSI | 58 | constructive reset | cooled without breaking trend
 Volume | 1.8x | strong | time-matched
 Burst | 2.4x | active | last 15m block
 Gap | -12.6% | rejected | gap-down fails long momentum gate
+Day change | -8.6% | rejected | down 3% or more versus prior close fails broad bullish long gate
 ```
 
 The tray should show:
