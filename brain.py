@@ -779,10 +779,164 @@ SECTOR_MAP = {
     "GE":"Industrial","HON":"Industrial","RTX":"Defense","NOC":"Defense",
 }
 
+ETF_PROFILES = {
+    "SPY": ("SPDR S&P 500 ETF Trust", "Tracks the S&P 500 large-cap U.S. equity index.", "ETF", "Exchange Traded Fund"),
+    "QQQ": ("Invesco QQQ Trust", "Tracks the Nasdaq-100 index of large non-financial growth stocks.", "ETF", "Exchange Traded Fund"),
+    "IWM": ("iShares Russell 2000 ETF", "Tracks small-cap U.S. equities through the Russell 2000 index.", "ETF", "Exchange Traded Fund"),
+    "DIA": ("SPDR Dow Jones Industrial Average ETF Trust", "Tracks the Dow Jones Industrial Average.", "ETF", "Exchange Traded Fund"),
+    "ARKK": ("ARK Innovation ETF", "Actively managed ETF focused on disruptive innovation companies.", "ETF", "Exchange Traded Fund"),
+    "ARKG": ("ARK Genomic Revolution ETF", "Actively managed ETF focused on genomics and biotech innovation.", "ETF", "Exchange Traded Fund"),
+    "ARKF": ("ARK Fintech Innovation ETF", "Actively managed ETF focused on financial technology innovation.", "ETF", "Exchange Traded Fund"),
+    "ARKW": ("ARK Next Generation Internet ETF", "Actively managed ETF focused on internet and platform innovation.", "ETF", "Exchange Traded Fund"),
+    "XLF": ("Financial Select Sector SPDR Fund", "Tracks large U.S. financial-sector companies.", "ETF", "Exchange Traded Fund"),
+    "XLK": ("Technology Select Sector SPDR Fund", "Tracks large U.S. technology-sector companies.", "ETF", "Exchange Traded Fund"),
+    "XLE": ("Energy Select Sector SPDR Fund", "Tracks large U.S. energy-sector companies.", "ETF", "Exchange Traded Fund"),
+    "XLV": ("Health Care Select Sector SPDR Fund", "Tracks large U.S. health-care-sector companies.", "ETF", "Exchange Traded Fund"),
+    "XLI": ("Industrial Select Sector SPDR Fund", "Tracks large U.S. industrial-sector companies.", "ETF", "Exchange Traded Fund"),
+    "XLP": ("Consumer Staples Select Sector SPDR Fund", "Tracks large U.S. consumer-staples companies.", "ETF", "Exchange Traded Fund"),
+    "XLY": ("Consumer Discretionary Select Sector SPDR Fund", "Tracks large U.S. consumer-discretionary companies.", "ETF", "Exchange Traded Fund"),
+    "XLB": ("Materials Select Sector SPDR Fund", "Tracks large U.S. materials-sector companies.", "ETF", "Exchange Traded Fund"),
+    "XLRE": ("Real Estate Select Sector SPDR Fund", "Tracks large U.S. real-estate-sector companies.", "ETF", "Exchange Traded Fund"),
+    "XLC": ("Communication Services Select Sector SPDR Fund", "Tracks large U.S. communication-services companies.", "ETF", "Exchange Traded Fund"),
+    "XLU": ("Utilities Select Sector SPDR Fund", "Tracks large U.S. utilities-sector companies.", "ETF", "Exchange Traded Fund"),
+    "SOXL": ("Direxion Daily Semiconductor Bull 3X Shares", "Leveraged ETF seeking 3x daily exposure to semiconductor stocks.", "ETF", "Exchange Traded Fund"),
+    "TQQQ": ("ProShares UltraPro QQQ", "Leveraged ETF seeking 3x daily exposure to the Nasdaq-100.", "ETF", "Exchange Traded Fund"),
+    "SQQQ": ("ProShares UltraPro Short QQQ", "Inverse leveraged ETF seeking -3x daily exposure to the Nasdaq-100.", "ETF", "Exchange Traded Fund"),
+    "UVXY": ("ProShares Ultra VIX Short-Term Futures ETF", "Leveraged ETF tied to short-term VIX futures exposure.", "ETF", "Exchange Traded Fund"),
+}
+
+def cached_ticker_profile(ticker):
+    ticker = str(ticker or "").upper().strip()
+    if not ticker:
+        return {}
+    try:
+        db = get_database()
+        row = db.execute("SELECT * FROM ticker_profiles WHERE ticker=?", [ticker]).fetchone()
+        db.close()
+        return dict(row) if row else {}
+    except Exception:
+        return {}
+
+def profile_from_static(ticker):
+    ticker = str(ticker or "").upper().strip()
+    if ticker in ETF_PROFILES:
+        name, description, sector, industry = ETF_PROFILES[ticker]
+        return {
+            "ticker": ticker,
+            "company_name": name,
+            "company_description": description,
+            "sector": sector,
+            "industry": industry,
+            "exchange": "ETF",
+            "source": "static_etf",
+        }
+    return {}
+
+def compact_company_description(text, max_len=180):
+    text = " ".join(str(text or "").split())
+    if not text:
+        return ""
+    if len(text) <= max_len:
+        return text
+    return text[:max_len].rsplit(" ", 1)[0].rstrip(".,;") + "."
+
+def save_ticker_profile(profile):
+    ticker = str((profile or {}).get("ticker") or "").upper().strip()
+    if not ticker:
+        return {}
+    now = current_time_cst().isoformat()
+    row = {
+        "ticker": ticker,
+        "company_name": profile.get("company_name") or ticker,
+        "company_description": compact_company_description(profile.get("company_description")),
+        "sector": profile.get("sector") or get_sector(ticker),
+        "industry": profile.get("industry"),
+        "exchange": profile.get("exchange"),
+        "source": profile.get("source") or "unknown",
+        "updated_at": now,
+    }
+    db = get_database()
+    db.execute("""
+        INSERT OR REPLACE INTO ticker_profiles
+        (ticker, company_name, company_description, sector, industry, exchange, source, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, [row[k] for k in ("ticker", "company_name", "company_description", "sector", "industry", "exchange", "source", "updated_at")])
+    db.commit()
+    db.close()
+    return row
+
+def fetch_and_cache_ticker_profile(ticker):
+    ticker = str(ticker or "").upper().strip()
+    if not ticker:
+        return {}
+    static = profile_from_static(ticker)
+    if static:
+        return save_ticker_profile(static)
+
+    profile = {"ticker": ticker}
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).get_info() or {}
+        profile.update({
+            "company_name": info.get("longName") or info.get("shortName") or ticker,
+            "company_description": info.get("longBusinessSummary") or info.get("description") or "",
+            "sector": info.get("sector") or SECTOR_MAP.get(ticker, "Other"),
+            "industry": info.get("industry"),
+            "exchange": info.get("exchange") or info.get("fullExchangeName"),
+            "source": "yfinance",
+        })
+    except Exception as e:
+        log.debug(f"yfinance profile fetch failed for {ticker}: {e}")
+
+    if (not profile.get("company_name") or profile.get("company_name") == ticker) and FINNHUB_KEY:
+        try:
+            import urllib.request
+            url = f"{FINNHUB_BASE}/stock/profile2?symbol={ticker}&token={FINNHUB_KEY}"
+            with urllib.request.urlopen(url, timeout=8) as resp:
+                data = json.loads(resp.read())
+            profile.update({
+                "company_name": data.get("name") or profile.get("company_name") or ticker,
+                "sector": profile.get("sector") or data.get("finnhubIndustry") or SECTOR_MAP.get(ticker, "Other"),
+                "industry": profile.get("industry") or data.get("finnhubIndustry"),
+                "exchange": profile.get("exchange") or data.get("exchange"),
+                "source": profile.get("source") or "finnhub",
+            })
+        except Exception as e:
+            log.debug(f"Finnhub profile fetch failed for {ticker}: {e}")
+
+    profile.setdefault("company_name", ticker)
+    profile.setdefault("company_description", "")
+    profile.setdefault("sector", SECTOR_MAP.get(ticker, "Other"))
+    return save_ticker_profile(profile)
+
+def profile_missing(profile):
+    return not (profile.get("company_name") and profile.get("company_name") != profile.get("ticker")) or not profile.get("company_description")
+
+def attach_ticker_profile(row):
+    if not isinstance(row, dict):
+        return row
+    ticker = str(row.get("ticker") or "").upper()
+    profile = cached_ticker_profile(ticker)
+    if not profile:
+        profile = profile_from_static(ticker)
+    if profile:
+        row.setdefault("company_name", profile.get("company_name"))
+        row.setdefault("company_description", profile.get("company_description"))
+        row.setdefault("industry", profile.get("industry"))
+        if not row.get("sector") or row.get("sector") == "Other":
+            row["sector"] = profile.get("sector") or row.get("sector")
+        if row.get("name") == ticker or not row.get("name"):
+            row["name"] = profile.get("company_name") or ticker
+    return row
+
 def get_sector(ticker):
     """Return sector for ticker. Checks DB cache first, then SECTOR_MAP, then 'Other'."""
     try:
         db = get_database()
+        profile = db.execute("SELECT sector FROM ticker_profiles WHERE ticker=?", [ticker]).fetchone()
+        if profile and profile["sector"] and profile["sector"] != "Other":
+            db.close()
+            return profile["sector"]
         row = db.execute("SELECT value FROM app_state WHERE key=?",
             [f"sector_{ticker}"]).fetchone()
         db.close()
@@ -968,6 +1122,17 @@ def initialize_database():
             hit_count INTEGER,
             miss_count INTEGER,
             win_rate REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS ticker_profiles (
+            ticker TEXT PRIMARY KEY,
+            company_name TEXT,
+            company_description TEXT,
+            sector TEXT,
+            industry TEXT,
+            exchange TEXT,
+            source TEXT,
+            updated_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS weights_history (
@@ -6099,7 +6264,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
             signal_values=long_signal_values,
         )
 
-        scored_stocks.append({
+        scored_row = {
             "ticker": ticker,
             "name": ticker,
             "sector": get_sector(ticker),
@@ -6142,7 +6307,8 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
             "scoring_v2_score_band": scoring_v2_shadow.get("score_band"),
             "scoring_v2_block_reasons": scoring_v2_shadow.get("block_reasons", []),
             "scoring_v2_caps": [cap.get("name") for cap in scoring_v2_shadow.get("caps_applied", [])],
-        })
+        }
+        scored_stocks.append(attach_ticker_profile(scored_row))
 
     # Check if queue is locked (post 8:25 AM CST)
     # If locked, scan still runs for monitoring purposes but no new picks enter the queue
@@ -11296,6 +11462,82 @@ def api_backfill_sectors():
     return jsonify({"success": True, "message": "Sector backfill running in background. Check logs."})
 
 # ── BACKFILL TAGS ─────────────────────────────────────────────────────────────
+@app.route("/api/ticker-profiles/missing")
+def api_ticker_profiles_missing():
+    """Report universe tickers missing a company name or short description."""
+    try:
+        universe = build_ticker_universe()
+        db = get_database()
+        rows = {
+            r["ticker"]: dict(r)
+            for r in db.execute("SELECT * FROM ticker_profiles").fetchall()
+        }
+        db.close()
+        missing = []
+        complete = 0
+        for ticker in universe:
+            profile = rows.get(ticker) or profile_from_static(ticker)
+            if profile and not profile_missing({**profile, "ticker": ticker}):
+                complete += 1
+                continue
+            missing.append({
+                "ticker": ticker,
+                "has_name": bool(profile.get("company_name") and profile.get("company_name") != ticker) if profile else False,
+                "has_description": bool(profile.get("company_description")) if profile else False,
+            })
+        return jsonify({
+            "success": True,
+            "universe_count": len(universe),
+            "complete_count": complete,
+            "missing_count": len(missing),
+            "missing": missing,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/backfill-ticker-profiles", methods=["POST"])
+def api_backfill_ticker_profiles():
+    """Background-fill cached company names and short descriptions for universe tickers."""
+    try:
+        body = request.get_json(silent=True) or {}
+        limit = int(body.get("limit") or 80)
+    except Exception:
+        limit = 80
+
+    def _run():
+        started = current_time_cst().isoformat()
+        universe = build_ticker_universe()
+        updated = 0
+        skipped = 0
+        errors = []
+        for ticker in universe:
+            if updated >= limit:
+                break
+            try:
+                existing = cached_ticker_profile(ticker) or profile_from_static(ticker)
+                if existing and not profile_missing({**existing, "ticker": ticker}):
+                    skipped += 1
+                    continue
+                profile = fetch_and_cache_ticker_profile(ticker)
+                if profile:
+                    updated += 1
+                time.sleep(0.25)
+            except Exception as e:
+                errors.append({"ticker": ticker, "error": str(e)[:180]})
+                log.debug(f"Ticker profile backfill skip {ticker}: {e}")
+        set_app_state("ticker_profile_backfill_status", json.dumps({
+            "started_at": started,
+            "finished_at": current_time_cst().isoformat(),
+            "updated": updated,
+            "skipped": skipped,
+            "limit": limit,
+            "errors": errors[:20],
+        }))
+        log.info(f"Ticker profile backfill complete: {updated} updated, {skipped} skipped")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"success": True, "background": True, "limit": limit, "status_key": "ticker_profile_backfill_status"})
+
 @app.route("/api/reprice-open-entries", methods=["POST"])
 def api_reprice_open_entries():
     """
