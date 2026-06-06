@@ -1822,16 +1822,29 @@ def mark_stalled_scan_events(max_age_minutes=45, zero_progress_minutes=20):
             error=COALESCE(error, 'watchdog marked event stalled')
         WHERE status='running' AND started_at < ?
     """, [current_time_cst().isoformat(), cutoff])
-    database.execute("""
-        UPDATE scan_events
-        SET status='stalled',
-            finished_at=COALESCE(finished_at, ?),
-            error=COALESCE(error, 'watchdog marked zero-progress event stalled')
-        WHERE status='running'
-          AND job_type='comprehensive'
-          AND COALESCE(tickers_updated, 0)=0
-          AND started_at < ?
-    """, [current_time_cst().isoformat(), zero_cutoff])
+    status_row = database.execute("SELECT value FROM app_state WHERE key=?", [NN_SCAN_STATUS_KEY]).fetchone()
+    live_status = {}
+    if status_row:
+        try:
+            live_status = json.loads(status_row["value"] or "{}")
+        except Exception:
+            live_status = {}
+    live_scan_has_progress = (
+        live_status.get("status") == "running" and
+        int(live_status.get("total_scanned") or 0) > 0 and
+        str(live_status.get("updated_at") or "") >= zero_cutoff
+    )
+    if not live_scan_has_progress:
+        database.execute("""
+            UPDATE scan_events
+            SET status='stalled',
+                finished_at=COALESCE(finished_at, ?),
+                error=COALESCE(error, 'watchdog marked zero-progress event stalled')
+            WHERE status='running'
+              AND job_type='comprehensive'
+              AND COALESCE(tickers_updated, 0)=0
+              AND started_at < ?
+        """, [current_time_cst().isoformat(), zero_cutoff])
     changed = database.total_changes
     database.commit()
     database.close()
