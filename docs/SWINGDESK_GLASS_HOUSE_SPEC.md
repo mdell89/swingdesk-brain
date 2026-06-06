@@ -15,6 +15,17 @@ The priority order is:
 
 SwingDesk should be useful for personal trading decisions only when the displayed data is fresh, reconciled, and explainable.
 
+## Spec Suite
+
+This document is the top-level product and engineering memory. Detailed contracts live in:
+
+- `SCORING_V2_SPEC.md`: confidence scoring, gates, signals, confluence, volume, and explainability.
+- `LEDGER_MATH_SPEC.md`: account value, realized P&L, open P&L, session P&L, chart math, and net/gross display.
+- `STRATEGY_TAXONOMY_SPEC.md`: brain, strategy, variant, signal, confluence, and brain-agreement definitions.
+- `SCHEDULER_AND_SCANS_SPEC.md`: scheduled jobs, scan freshness, provider behavior, monitoring, stalls, and retention.
+- `LEARNING_AND_AUDIT_SPEC.md`: daily ML learning, read-only audit recap, LLM provider fallback, and learning ledger rules.
+- `FRONTEND_DISPLAY_CONTRACT.md`: UI labels, card display, chart behavior, tags, context tray, and settings expectations.
+
 ## Brain Roles
 
 Vector and Nova are equal-tier ML/algorithm workers.

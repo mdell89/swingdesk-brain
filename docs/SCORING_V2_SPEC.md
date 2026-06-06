@@ -212,9 +212,9 @@ Daily-average volume fallback:
 Display examples:
 
 ```text
-Volume 1.8x · time-matched
-Volume 0.9x · daily avg
-Volume unknown · no baseline
+Volume 1.8x - time-matched
+Volume 0.9x - daily avg
+Volume unknown - no baseline
 ```
 
 ## Context Display V2
@@ -225,16 +225,16 @@ Preferred structure:
 
 ```text
 Eligibility
-  Data fresh · 8:30 AM scan
-  Direction valid · long
+  Data fresh - 8:30 AM scan
+  Direction valid - long
   Gap quality passed
 
 Signal Read
-  RSI 62 · momentum
-  Volume 1.8x · time-matched
-  Gap +4.2% · constructive
-  Sector RS weak · drag
-  VWAP reclaim · confirmed
+  RSI 62 - momentum
+  Volume 1.8x - time-matched
+  Gap +4.2% - constructive
+  Sector RS weak - drag
+  VWAP reclaim - confirmed
 
 Confluence
   Darvas agrees
@@ -257,10 +257,10 @@ RSI should be interpreted through the strategy profile.
 Examples:
 
 ```text
-RSI 52 · neutral
-RSI 62 · momentum
-RSI 71 · extended
-RSI 38 · reset
+RSI 52 - neutral
+RSI 62 - momentum
+RSI 71 - extended
+RSI 38 - reset
 ```
 
 For SwingDesk momentum, moderate strength can be constructive. For mean reversion, lower RSI may be constructive. For Gap & Go, RSI may be context-only.
@@ -274,10 +274,10 @@ Sector RS compares the stock's sector tailwind to the broader market.
 Display examples:
 
 ```text
-Sector RS strong · tailwind
-Sector RS weak · drag
-Sector RS neutral · no edge
-Sector RS unknown · missing data
+Sector RS strong - tailwind
+Sector RS weak - drag
+Sector RS neutral - no edge
+Sector RS unknown - missing data
 ```
 
 The exact calculation must be documented in code when implemented. A good default is sector ETF return over the selected lookback minus SPY return over the same lookback.
