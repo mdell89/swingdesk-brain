@@ -2912,6 +2912,90 @@ def normalize_signal_weights(weights):
     total = sum(max(v, 0.03) for v in merged.values())
     return {k: round(max(v, 0.03) / total, 4) for k, v in merged.items()}
 
+LEARNING_RATE = 0.02
+
+LEARNING_SIGNAL_GUARDRAILS = {
+    "rsi_momentum": {"role": "active", "learnable": True, "daily_delta_cap": 0.02, "floor": 0.03, "ceiling": 0.25},
+    "volume_surge": {"role": "active", "learnable": True, "daily_delta_cap": 0.02, "floor": 0.03, "ceiling": 0.25},
+    "overnight_gap_probability": {"role": "active", "learnable": True, "daily_delta_cap": 0.02, "floor": 0.03, "ceiling": 0.25},
+    "support_resistance": {"role": "active", "learnable": True, "daily_delta_cap": 0.02, "floor": 0.03, "ceiling": 0.25},
+    "relative_strength": {"role": "active", "learnable": True, "daily_delta_cap": 0.02, "floor": 0.03, "ceiling": 0.25},
+    "sector_relative_strength": {"role": "active", "learnable": True, "daily_delta_cap": 0.02, "floor": 0.03, "ceiling": 0.25},
+    "vwap_reclaim": {"role": "active", "learnable": True, "daily_delta_cap": 0.02, "floor": 0.03, "ceiling": 0.25},
+    "earnings_catalyst": {"role": "secondary", "learnable": True, "daily_delta_cap": 0.01, "floor": 0.02, "ceiling": 0.16},
+    "volatility_squeeze": {"role": "secondary", "learnable": True, "daily_delta_cap": 0.01, "floor": 0.02, "ceiling": 0.12},
+}
+
+def _bounded_normalize_weights(weights, bounds):
+    keys = list(canonical_signal_weights())
+    values = {
+        key: max(bounds[key]["floor"], min(bounds[key]["ceiling"], float((weights or {}).get(key, canonical_signal_weights()[key]) or 0)))
+        for key in keys
+    }
+    for _ in range(12):
+        total = sum(values.values())
+        diff = 1.0 - total
+        if abs(diff) <= 0.000001:
+            break
+        if diff > 0:
+            capacity = {key: bounds[key]["ceiling"] - values[key] for key in keys if values[key] < bounds[key]["ceiling"] - 0.000001}
+        else:
+            capacity = {key: values[key] - bounds[key]["floor"] for key in keys if values[key] > bounds[key]["floor"] + 0.000001}
+        capacity_total = sum(capacity.values())
+        if capacity_total <= 0:
+            break
+        for key, cap in capacity.items():
+            values[key] += diff * (cap / capacity_total)
+            values[key] = max(bounds[key]["floor"], min(bounds[key]["ceiling"], values[key]))
+    total = sum(values.values()) or 1.0
+    return {key: round(values[key] / total, 6) for key in keys}
+
+def daily_learning_anchor_weights(database, variant_id, fallback):
+    today_prefix = current_time_cst().strftime("%Y-%m-%d")
+    if not database or not variant_id:
+        return normalize_signal_weights(fallback)
+    try:
+        row = database.execute("""
+            SELECT weights_before
+            FROM variant_learning_events
+            WHERE variant_id=? AND timestamp LIKE ?
+            ORDER BY timestamp ASC
+            LIMIT 1
+        """, [variant_id, f"{today_prefix}%"]).fetchone()
+        if row:
+            return normalize_signal_weights(json.loads(row["weights_before"] or "{}"))
+    except Exception:
+        pass
+    return normalize_signal_weights(fallback)
+
+def apply_learning_guardrails(before, proposed, database=None, variant_id=None):
+    before = normalize_signal_weights(before)
+    proposed = normalize_signal_weights(proposed)
+    anchor = daily_learning_anchor_weights(database, variant_id, before)
+    bounds = {}
+    notes = []
+    for key, baseline in canonical_signal_weights().items():
+        rule = LEARNING_SIGNAL_GUARDRAILS.get(key, {"learnable": False, "daily_delta_cap": 0, "floor": baseline, "ceiling": baseline})
+        if not rule.get("learnable"):
+            bounds[key] = {"floor": before[key], "ceiling": before[key]}
+            continue
+        daily_cap = float(rule.get("daily_delta_cap") or 0)
+        floor = max(float(rule.get("floor", 0)), anchor.get(key, before[key]) - daily_cap)
+        ceiling = min(float(rule.get("ceiling", 1)), anchor.get(key, before[key]) + daily_cap)
+        if floor > ceiling:
+            floor = ceiling = before[key]
+        bounds[key] = {"floor": floor, "ceiling": ceiling}
+    guarded = _bounded_normalize_weights(proposed, bounds)
+    for key in canonical_signal_weights():
+        wanted = proposed.get(key, before[key])
+        final = guarded.get(key, before[key])
+        if abs(wanted - final) >= 0.0005:
+            notes.append(f"{key} guardrailed from {wanted:.3f} to {final:.3f}")
+    return guarded, notes
+
+def weights_materially_changed(before, after, threshold=0.0001):
+    return any(abs(float((after or {}).get(key, 0)) - float((before or {}).get(key, 0))) >= threshold for key in canonical_signal_weights())
+
 def get_variant_signal_weights(database, variant_id):
     row = database.execute("SELECT weights_json FROM variant_signal_weights WHERE variant_id=?", [variant_id]).fetchone()
     if not row:
@@ -2985,7 +3069,7 @@ def learn_variant_from_closed_trade(database, trade_row, outcome, actual_move):
     if not isinstance(scores, dict):
         scores = scores_blob if isinstance(scores_blob, dict) else {}
     scores = extract_signal_score_map(scores)
-    after = dict(before)
+    proposed = dict(before)
     reasoning = []
     status = "updated"
     if scores:
@@ -2998,15 +3082,22 @@ def learn_variant_from_closed_trade(database, trade_row, outcome, actual_move):
         strength = min(abs(float(actual_move or 0)) / 10.0, 1.0)
         for key in canonical_signal_weights():
             signal_score = float(scores.get(key, 0.5) or 0.5)
-            delta = direction * strength * (signal_score - 0.5) * 0.02
+            rule = LEARNING_SIGNAL_GUARDRAILS.get(key, {})
+            if not rule.get("learnable", False):
+                continue
+            delta = direction * strength * (signal_score - 0.5) * LEARNING_RATE
+            daily_cap = float(rule.get("daily_delta_cap") or 0.0)
+            delta = max(-daily_cap, min(daily_cap, delta))
             if abs(delta) >= 0.0001:
-                after[key] = after.get(key, before[key]) + delta
+                proposed[key] = proposed.get(key, before[key]) + delta
                 reasoning.append(f"{key} {'rewarded' if delta > 0 else 'penalized'} from {outcome} trade")
-        after = normalize_signal_weights(after)
-        if not reasoning:
+        after, guardrail_notes = apply_learning_guardrails(before, proposed, database=database, variant_id=variant_id)
+        reasoning.extend(guardrail_notes)
+        if not reasoning or not weights_materially_changed(before, after):
             status = "unchanged"
             reasoning.append("signal scores were neutral; weights unchanged")
     else:
+        after = dict(before)
         status = "missing_signal_scores"
         reasoning.append("closed trade had no signal score payload; weights unchanged")
     ts = current_time_cst().isoformat()
