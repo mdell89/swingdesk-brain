@@ -152,8 +152,9 @@ Comparable sessions:
 
 - Same ticker.
 - Same market window: premarket compares only to prior premarket windows; regular session compares only to prior regular sessions.
-- Most recent 20 usable sessions by default.
-- Minimum usable baseline: 10 sessions. Below 10, volume is context-only and cannot strongly boost confidence.
+- Full-strength baseline: exactly the most recent 20 usable sessions.
+- Provisional baseline: 10-19 usable sessions. This may support context or reduced-authority scoring, but must be labeled as provisional.
+- Insufficient baseline: fewer than 10 usable sessions. Volume is context-only and cannot boost confidence.
 - Exclude holidays, half-days, halted sessions, split-broken sessions, and provider-corrupted volume when detectable.
 - Prefer the median baseline instead of the mean because one extreme news day can distort averages.
 
@@ -178,23 +179,24 @@ Volume baseline details:
 - Premarket time-matched volume should use a separate exchange-time window, 4:00 AM to 9:30 AM Eastern.
 - Premarket needs separate logic because premarket liquidity, participation, spreads, and volume curves are structurally different from regular-session trading.
 - The calculation should be cumulative through the current time bucket, not a standalone hourly block.
-- Preferred bucket: 5-minute bars when provider limits allow it.
-- Acceptable fallback bucket: 15-minute bars.
-- Hourly buckets are too coarse for primary scoring, but may be used for a compact educational display if needed.
+- Preferred source bars: 5-minute bars when provider limits allow it.
+- Acceptable fallback source bars: 15-minute bars.
+- Hourly source bars are too coarse for primary scoring, but may be used for a compact educational display if needed.
 
 Recent-block volume acceleration:
 
 ```text
 recent_block_volume_acceleration =
-  today's volume in the most recent completed 15-minute block
+  today's volume in the most recent completed comparison block
   /
-  median volume for the same 15-minute clock block over the prior 20 usable sessions
+  median volume for the same clock block over the prior 20 usable sessions
 ```
 
 This metric answers: "Is volume accelerating right now compared with this exact part of the day?"
 
-- Use completed 15-minute blocks by default.
-- Fallback to 30-minute blocks when provider limits or missing bars make 15-minute blocks unreliable.
+- Premarket comparison block: 30 minutes by default, aligned with the full-scan cadence.
+- Regular-session comparison block: 15 minutes by default when data is available.
+- Regular-session fallback block: 30 minutes when provider limits or missing bars make 15-minute blocks unreliable.
 - Do not use 60-minute blocks for primary scoring; they are too slow to detect actionable intraday volume changes.
 - Recent-block acceleration may confirm or strengthen a setup, but should not override a failed strategy gate by itself.
 - For premarket, compare only against prior premarket blocks with the same clock time.
