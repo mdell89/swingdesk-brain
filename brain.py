@@ -1815,13 +1815,6 @@ def mark_stalled_scan_events(max_age_minutes=45, zero_progress_minutes=20):
     cutoff = (current_time_cst() - timedelta(minutes=max_age_minutes)).isoformat()
     zero_cutoff = (current_time_cst() - timedelta(minutes=zero_progress_minutes)).isoformat()
     database = get_database()
-    database.execute("""
-        UPDATE scan_events
-        SET status='stalled',
-            finished_at=COALESCE(finished_at, ?),
-            error=COALESCE(error, 'watchdog marked event stalled')
-        WHERE status='running' AND started_at < ?
-    """, [current_time_cst().isoformat(), cutoff])
     status_row = database.execute("SELECT value FROM app_state WHERE key=?", [NN_SCAN_STATUS_KEY]).fetchone()
     live_status = {}
     if status_row:
@@ -1838,6 +1831,13 @@ def mark_stalled_scan_events(max_age_minutes=45, zero_progress_minutes=20):
         str(live_status.get("updated_at") or "") >= zero_cutoff
     )
     if not live_scan_has_progress:
+        database.execute("""
+            UPDATE scan_events
+            SET status='stalled',
+                finished_at=COALESCE(finished_at, ?),
+                error=COALESCE(error, 'watchdog marked event stalled')
+            WHERE status='running' AND started_at < ?
+        """, [current_time_cst().isoformat(), cutoff])
         database.execute("""
             UPDATE scan_events
             SET status='stalled',
