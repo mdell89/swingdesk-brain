@@ -4960,7 +4960,7 @@ def enrich_price_data_with_history(tickers, price_data):
         data = price_data.get(ticker, {}) or {}
         return max(abs(float(data.get("gap_percent") or 0)), abs(float(data.get("day_change_percent") or 0)))
 
-    max_history_fetch = int(os.getenv("SCAN_HISTORY_REFRESH_LIMIT", "40"))
+    max_history_fetch = int(os.getenv("SCAN_HISTORY_REFRESH_LIMIT", "80"))
     selected = sorted(missing, key=history_priority, reverse=True)[:max_history_fetch]
     log.info(f"Fetching history for {len(selected)}/{len(missing)} tickers missing daily_history...")
     supplemental = fetch_twelve_data_batch(selected, interval="1day", outputsize=60)
@@ -4968,6 +4968,9 @@ def enrich_price_data_with_history(tickers, price_data):
         if ticker in supplemental and "daily_history" in supplemental[ticker]:
             price_data[ticker]["daily_history"] = supplemental[ticker]["daily_history"]
             repair_quote_baselines_from_history(price_data[ticker], price_data[ticker]["daily_history"])
+            price_data[ticker]["average_volume"] = supplemental[ticker].get("average_volume") or derive_average_volume_from_scan(price_data[ticker])
+            price_data[ticker]["volume"] = supplemental[ticker].get("volume", price_data[ticker].get("volume"))
+            price_data[ticker]["volume_ratio"] = supplemental[ticker].get("volume_ratio", price_data[ticker].get("volume_ratio", 1.0))
 
 def run_darvas_silent_collection(price_data, scored_stocks):
     """
@@ -6489,6 +6492,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
 
     # During pre/post market hours, override stale daily closes with live prices
     enrich_with_live_prices(universe_with_spy, price_data)
+    enrich_price_data_with_history(universe_with_spy, price_data)
 
     # Filter out tickers where yfinance returned weekend/holiday stale data.
     # If the latest price date is more than 3 days old, the data is stale.
