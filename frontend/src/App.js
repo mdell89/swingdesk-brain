@@ -2657,8 +2657,8 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
   const rows = allRows.filter(row => !spotlightVariantIds.has(row.variant_id)).slice(0, 16);
   const vectorSummary = payload?.vector_summary || {};
   const novaSummary = payload?.nova_summary || {};
-  const vectorWatchlist = Array.isArray(payload?.vector_watchlist) ? payload.vector_watchlist.slice(0, 20) : [];
-  const novaWatchlist = Array.isArray(payload?.nova_watchlist) ? payload.nova_watchlist.slice(0, 20) : [];
+  const vectorWatchlist = Array.isArray(payload?.vector_watchlist) ? payload.vector_watchlist.slice(0, 10) : [];
+  const novaWatchlist = Array.isArray(payload?.nova_watchlist) ? payload.nova_watchlist.slice(0, 10) : [];
   const sourceLabel = payload?.candidate_source === "full_scan_v2" ? "Full-scan V2 universe" : "Cached candidate rescore";
 
   const toggleSpotlightCard = key => {
@@ -2666,7 +2666,7 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
   };
 
   const renderShadowStrip = (row, color) => {
-    const capText = (row.v2_caps || []).slice(0, 2).join(", ");
+    const capText = (row.v2_caps || []).slice(0, 3).join(", ");
     const reasonText = (row.v2_block_reasons || []).slice(0, 1).join(", ");
     const status = row.v2_actionable ? "actionable" : row.v2_blocked ? "blocked" : (row.v2_score_band || "shadow");
     return (
@@ -2762,11 +2762,11 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
       <div style={{ marginTop: 10 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, marginBottom: 5 }}>
           <div style={{ fontSize: 9, color: T1, fontWeight: 900 }}>{label} watchlist</div>
-          <div style={{ fontSize: 8, color, fontFamily: "'DM Mono',monospace", fontWeight: 900 }}>{items.length}/20</div>
+          <div style={{ fontSize: 8, color, fontFamily: "'DM Mono',monospace", fontWeight: 900 }}>{items.length}/10</div>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
           {items.map((row, idx) => {
-            const capText = (row.v2_caps || []).slice(0, 2).join(", ");
+            const capText = (row.v2_caps || []).slice(0, 3).join(", ");
             return (
               <div key={`${label}_watch_${row.ticker}_${idx}`} style={{ background: "#070708", border: `1px solid ${BORDER}`, borderRadius: 7, padding: "7px 8px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
@@ -2785,7 +2785,7 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
                     old {row.legacy_confidence ?? "--"}
                   </div>
                 </div>
-                {capText && <div style={{ marginTop: 3, fontSize: 7, color: T3, lineHeight: 1.35 }}>{capText}</div>}
+                {capText && <div style={{ marginTop: 3, fontSize: 7, color: T3, lineHeight: 1.35 }}>Needs: {capText}</div>}
               </div>
             );
           })}
@@ -2854,7 +2854,7 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
                     const blocked = Boolean(row.v2_blocked);
                     const actionable = Boolean(row.v2_actionable);
                     const color = blocked ? RED : actionable ? GREEN : AMBER;
-                    const capText = (row.v2_caps || []).slice(0, 2).join(", ");
+                    const capText = (row.v2_caps || []).slice(0, 3).join(", ");
                     const reasonText = (row.v2_block_reasons || []).slice(0, 1).join(", ");
                     return (
                       <div key={`${row.variant_id || row.variant_label || row.brain}-${row.ticker}-${idx}`} style={{ background: "#070708", border: `1px solid ${BORDER}`, borderRadius: 7, padding: "7px 8px" }}>

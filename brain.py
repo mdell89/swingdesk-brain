@@ -5571,6 +5571,121 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
     return scores, fired, values
 
 
+def _finite_scan_number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _first_scan_number(data, *keys):
+    for key in keys:
+        number = _finite_scan_number((data or {}).get(key))
+        if number is not None:
+            return number
+    return None
+
+
+def derive_average_volume_from_scan(stock_data):
+    explicit = _first_scan_number(stock_data, "average_volume", "avg_volume", "median_daily_volume")
+    if explicit is not None and explicit > 1:
+        return explicit
+
+    history = (stock_data or {}).get("daily_history") or []
+    volumes = []
+    for candle in history[-30:]:
+        if not isinstance(candle, dict):
+            continue
+        volume = _finite_scan_number(candle.get("volume"))
+        if volume is not None and volume > 0:
+            volumes.append(volume)
+    if not volumes:
+        return None
+    return sum(volumes) / len(volumes)
+
+
+def derive_average_daily_dollar_volume_from_scan(stock_data):
+    explicit = _first_scan_number(
+        stock_data,
+        "average_daily_dollar_volume",
+        "avg_daily_dollar_volume",
+        "median_daily_dollar_volume",
+    )
+    if explicit is not None:
+        return explicit
+
+    average_volume = derive_average_volume_from_scan(stock_data)
+    price = _first_scan_number(stock_data, "price", "current_price", "last_price", "close")
+    if average_volume is None or price is None or average_volume <= 1 or price <= 0:
+        return None
+    return average_volume * price
+
+
+def derive_vwap_delta_pct_from_scan(stock_data):
+    explicit = _first_scan_number(stock_data, "vwap_delta_pct", "vwap_dist", "vwap_distance_pct")
+    if explicit is not None:
+        return explicit
+
+    price = _first_scan_number(stock_data, "price", "current_price", "last_price", "close")
+    open_price = _first_scan_number(stock_data, "open", "open_price", "regular_open")
+    if price is None or open_price is None or open_price <= 0:
+        return None
+    return ((price - open_price) / open_price) * 100
+
+
+def derive_hv_ratio_from_scan(stock_data):
+    explicit = _first_scan_number(stock_data, "hv_ratio", "volatility_squeeze_ratio")
+    if explicit is not None:
+        return explicit
+
+    history = (stock_data or {}).get("daily_history") or []
+    closes = []
+    for candle in history:
+        if not isinstance(candle, dict):
+            continue
+        close = _finite_scan_number(candle.get("close"))
+        if close is not None and close > 0:
+            closes.append(close)
+    if len(closes) < 21:
+        return None
+
+    log_returns = []
+    for prev, current in zip(closes, closes[1:]):
+        if prev > 0 and current > 0:
+            log_returns.append(math.log(current / prev))
+    if len(log_returns) < 20:
+        return None
+
+    def hv(values):
+        if not values:
+            return 0
+        mean = sum(values) / len(values)
+        variance = sum((value - mean) ** 2 for value in values) / len(values)
+        return math.sqrt(variance)
+
+    hv5 = hv(log_returns[-5:])
+    hv20 = hv(log_returns[-20:])
+    if hv20 <= 0:
+        return None
+    return round(hv5 / hv20, 3)
+
+
+def derive_intraday_range_pct_from_scan(stock_data):
+    explicit = _first_scan_number(stock_data, "intraday_range_pct")
+    if explicit is not None:
+        return explicit
+
+    high = _first_scan_number(stock_data, "high", "day_high")
+    low = _first_scan_number(stock_data, "low", "day_low")
+    price = _first_scan_number(stock_data, "price", "current_price", "last_price", "close")
+    if high is None or low is None or price is None or price <= 0 or high < low:
+        return None
+    return ((high - low) / price) * 100
+
+
 def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, confluence=None, signal_values=None):
     """Translate the current scan payload into the Scoring V2 contract for shadow mode."""
     signal_values = signal_values or {}
@@ -5587,10 +5702,14 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
     if sector_values.get("etf_5d") is not None and sector_values.get("spy_5d") is not None:
         sector_relative_strength_delta = float(sector_values["etf_5d"]) - float(sector_values["spy_5d"])
 
-    average_volume = stock_data.get("average_volume")
-    average_daily_dollar_volume = None
-    if average_volume is not None and float(average_volume or 0) > 1 and stock_data.get("price"):
-        average_daily_dollar_volume = float(average_volume or 0) * float(stock_data.get("price") or 0)
+    average_volume = derive_average_volume_from_scan(stock_data)
+    average_daily_dollar_volume = derive_average_daily_dollar_volume_from_scan(stock_data)
+    vwap_delta_pct = vwap_values.get("dist")
+    if vwap_delta_pct is None:
+        vwap_delta_pct = derive_vwap_delta_pct_from_scan(stock_data)
+    hv_ratio = signal_values.get("volatility_squeeze")
+    if hv_ratio is None:
+        hv_ratio = derive_hv_ratio_from_scan(stock_data)
 
     confluence_methods = []
     if isinstance(confluence, dict):
@@ -5606,6 +5725,7 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
         "open": stock_data.get("open"),
         "gap_percent": stock_data.get("gap_percent"),
         "day_change_percent": stock_data.get("day_change_percent") or stock_data.get("day_change_pct"),
+        "average_volume": average_volume,
         "average_daily_dollar_volume": average_daily_dollar_volume,
         "freshness_status": "fresh",
         "scan_completed_at": current_time_cst().isoformat(),
@@ -5616,11 +5736,11 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
         "relative_strength_delta": relative_strength_delta,
         "sector_relative_strength_delta": sector_relative_strength_delta,
         "sr_analysis": stock_data.get("sr_analysis"),
-        "vwap_delta_pct": vwap_values.get("dist"),
-        "hv_ratio": signal_values.get("volatility_squeeze"),
+        "vwap_delta_pct": vwap_delta_pct,
+        "hv_ratio": hv_ratio,
         "days_to_earnings": days_to_earnings,
         "atr_percent": stock_data.get("atr_percent"),
-        "intraday_range_pct": stock_data.get("intraday_range_pct"),
+        "intraday_range_pct": stock_data.get("intraday_range_pct") or derive_intraday_range_pct_from_scan(stock_data),
         "confluence": confluence_methods,
     }
 
@@ -5670,6 +5790,7 @@ def build_scoring_v2_shadow_from_cached_pick(pick, weights, brain="Vector"):
         "gap_percent": pick.get("gap_percent") or pick.get("overnight_gap_pct"),
         "day_change_percent": pick.get("day_change_percent") or pick.get("day_change_pct") or pick.get("pct_change_prev_close"),
         "average_volume": pick.get("average_volume") or pick.get("avg_volume"),
+        "average_daily_dollar_volume": pick.get("average_daily_dollar_volume") or pick.get("avg_daily_dollar_volume"),
         "volume_ratio": pick.get("volume_ratio") or pick.get("vol_ratio"),
         "source": pick.get("data_source") or pick.get("source") or pick.get("provider"),
         "sr_analysis": pick.get("sr_analysis"),
@@ -5733,6 +5854,8 @@ def scoring_v2_card_row(pick, brain="Vector", variant=None, source_scan_time=Non
         "prev_close": pick.get("prev_close") or pick.get("previous_close"),
         "rsi": pick.get("rsi"),
         "vol_ratio": pick.get("vol_ratio") or pick.get("volume_ratio"),
+        "average_volume": pick.get("average_volume") or pick.get("avg_volume"),
+        "average_daily_dollar_volume": pick.get("average_daily_dollar_volume") or pick.get("avg_daily_dollar_volume"),
         "overnight_gap_pct": pick.get("overnight_gap_pct") if pick.get("overnight_gap_pct") is not None else pick.get("gap_percent"),
         "day_change_pct": (
             pick.get("day_change_pct")
@@ -6459,6 +6582,9 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
             confluence=confluence,
             signal_values=long_signal_values,
         )
+        average_volume = derive_average_volume_from_scan(stock_data)
+        average_daily_dollar_volume = derive_average_daily_dollar_volume_from_scan(stock_data)
+        intraday_range_pct = stock_data.get("intraday_range_pct") or derive_intraday_range_pct_from_scan(stock_data)
 
         scored_row = {
             "ticker": ticker,
@@ -6469,6 +6595,8 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
             "prev_close": stock_data.get("previous_close", stock_data["price"]),
             "rsi": round(rsi, 1),
             "vol_ratio": round(stock_data.get("volume_ratio", 1), 2),
+            "average_volume": average_volume,
+            "average_daily_dollar_volume": average_daily_dollar_volume,
             "overnight_gap_pct": round(stock_data.get("gap_percent", 0), 2),
             "day_change_pct": round(stock_data.get("day_change_percent", 0), 2),
             "pct_change_prev_close": round(pct_from_baseline(stock_data["price"], stock_data.get("previous_close")) or 0, 2),
@@ -6496,6 +6624,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
                 "values": long_signal_values,
                 "fired": long_fired_signals,
             },
+            "intraday_range_pct": intraday_range_pct,
             "scoring_v2_shadow": scoring_v2_shadow,
             "scoring_v2_score": scoring_v2_shadow.get("score"),
             "scoring_v2_actionable": scoring_v2_shadow.get("actionable"),
@@ -9311,7 +9440,7 @@ def api_scoring_v2_shadow():
                 })
             return output
 
-        def watchlist_rows(rows, limit=20):
+        def watchlist_rows(rows, limit=10):
             candidates = [
                 row for row in rows
                 if not row.get("v2_actionable") and not row.get("v2_blocked") and row.get("v2_score") is not None
