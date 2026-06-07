@@ -2657,6 +2657,7 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
   const rows = allRows.filter(row => !spotlightVariantIds.has(row.variant_id)).slice(0, 16);
   const vectorSummary = payload?.vector_summary || {};
   const novaSummary = payload?.nova_summary || {};
+  const sourceLabel = payload?.candidate_source === "full_scan_v2" ? "Full-scan V2 universe" : "Cached candidate rescore";
 
   const toggleSpotlightCard = key => {
     setExpandedSpotlight(prev => ({ ...prev, [key]: !prev[key] }));
@@ -2758,7 +2759,7 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
         <div style={{ minWidth: 0 }}>
           <div style={{ fontSize: 12, fontWeight: 800, color: T1 }}>Scoring V2 shadow</div>
-          <div style={{ fontSize: 8, color: T3, marginTop: 2 }}>Temporary read-only preview. Live picks still use legacy scoring.</div>
+          <div style={{ fontSize: 8, color: T3, marginTop: 2 }}>{sourceLabel}. Temporary read-only preview; live picks still use legacy scoring.</div>
         </div>
         <button
           onClick={open && payload ? () => setOpen(false) : load}
@@ -2783,9 +2784,9 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
                   <div key={label} style={{ background: "#070708", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 8px" }}>
                     <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>{label}</div>
                     <div style={{ fontSize: 11, color: label === "Nova" ? "#a78bfa" : BLUE, fontFamily: "'DM Mono',monospace", fontWeight: 900 }}>
-                      {Number(item.v2_actionable_count || 0)}/{Number(item.scored_count || 0)} V2
+                      {Number(item.v2_actionable_count || 0)}/{Number(item.scored_count || 0)} actionable
                     </div>
-                    <div style={{ fontSize: 7, color: T3, marginTop: 2 }}>{Number(item.v2_blocked_count || 0)} blocked</div>
+                    <div style={{ fontSize: 7, color: T3, marginTop: 2 }}>{Number(item.v2_skip_count || 0)} skip / {Number(item.v2_blocked_count || 0)} blocked</div>
                   </div>
                 ))}
               </div>

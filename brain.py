@@ -269,6 +269,7 @@ NN_DROPOUT     = 0.3
 NN_CONFIDENCE_FLOOR = 65  # Same floor as crude algo
 NN_MODEL_KEY   = "nn_model_weights"  # app_state key for persisted weights
 NN_SCAN_STATUS_KEY = "nn_scan_status"
+SCORING_V2_SCAN_CACHE_KEY = "cached_scoring_v2_scan"
 _nn_scan_thread_lock = threading.Lock()
 
 class SwingDeskNet(nn.Module):
@@ -5692,6 +5693,7 @@ def summarize_scoring_v2_shadow(picks):
     rows = [p.get("scoring_v2_shadow") for p in (picks or []) if isinstance(p.get("scoring_v2_shadow"), dict)]
     blocked = [r for r in rows if r.get("blocked")]
     actionable = [r for r in rows if r.get("actionable")]
+    skipped = [r for r in rows if not r.get("blocked") and not r.get("actionable")]
     cap_counts = {}
     block_counts = {}
     for row in rows:
@@ -5706,8 +5708,69 @@ def summarize_scoring_v2_shadow(picks):
         "scored_count": len(rows),
         "v2_actionable_count": len(actionable),
         "v2_blocked_count": len(blocked),
+        "v2_skip_count": len(skipped),
         "cap_counts": cap_counts,
         "block_reason_counts": block_counts,
+    }
+
+
+def scoring_v2_card_row(pick, brain="Vector", variant=None, source_scan_time=None):
+    """Serialize one full-scan V2 row into the compact card/diagnostic shape."""
+    shadow = pick.get("scoring_v2_shadow") or {}
+    legacy_confidence = pick.get("long_conf") or pick.get("confidence") or pick.get("nn_score")
+    legacy_expected_move = pick.get("long_move") or pick.get("expected_move")
+    v2_score = shadow.get("score")
+    v2_expected_move = shadow.get("expected_move")
+    return {
+        "ticker": pick.get("ticker"),
+        "name": pick.get("name"),
+        "company_name": pick.get("company_name"),
+        "company_description": pick.get("company_description"),
+        "industry": pick.get("industry"),
+        "sector": pick.get("sector"),
+        "price": pick.get("price"),
+        "open_price": pick.get("open_price") or pick.get("open"),
+        "prev_close": pick.get("prev_close") or pick.get("previous_close"),
+        "rsi": pick.get("rsi"),
+        "vol_ratio": pick.get("vol_ratio") or pick.get("volume_ratio"),
+        "overnight_gap_pct": pick.get("overnight_gap_pct") if pick.get("overnight_gap_pct") is not None else pick.get("gap_percent"),
+        "day_change_pct": (
+            pick.get("day_change_pct")
+            if pick.get("day_change_pct") is not None
+            else pick.get("day_change_percent")
+        ),
+        "pct_change_prev_close": pick.get("pct_change_prev_close"),
+        "pct_change_regular_open": pick.get("pct_change_regular_open"),
+        "earnings_soon": pick.get("earnings_soon"),
+        "broke_52w_high_days_ago": pick.get("broke_52w_high_days_ago"),
+        "confluence_count": pick.get("confluence_count"),
+        "confluence_methods": pick.get("confluence_methods") or [],
+        "signal_scores_for_observation": pick.get("signal_scores_for_observation"),
+        "signal_values_for_observation": pick.get("signal_values_for_observation"),
+        "fired_signals_for_observation": pick.get("fired_signals_for_observation"),
+        "signal_scores": pick.get("signal_scores"),
+        "source_scan_time": source_scan_time or pick.get("source_scan_time") or pick.get("scan_time") or pick.get("generated_at"),
+        "price_provider": pick.get("price_provider") or pick.get("data_source") or pick.get("source") or pick.get("provider") or "full_scan_v2",
+        "candidate_source": "full_scan_v2",
+        "decision_authority": shadow.get("decision_authority", "legacy_scoring"),
+        "brain": brain,
+        "strategy": (variant or {}).get("strategy") or pick.get("strategy") or "SwingDesk",
+        "variant_id": (variant or {}).get("id"),
+        "variant_label": (variant or {}).get("label") or (variant or {}).get("id"),
+        "execution_time": (variant or {}).get("execution_time"),
+        "selection_mode": (variant or {}).get("selection_mode"),
+        "legacy_confidence": legacy_confidence,
+        "legacy_expected_move": legacy_expected_move,
+        "long_conf": v2_score if v2_score is not None else 0,
+        "long_move": v2_expected_move if v2_expected_move is not None else (legacy_expected_move or 0),
+        "long_reasoning": shadow.get("explanation") or pick.get("long_reasoning"),
+        "v2_score": v2_score,
+        "v2_score_band": shadow.get("score_band"),
+        "v2_actionable": shadow.get("actionable"),
+        "v2_blocked": shadow.get("blocked"),
+        "v2_block_reasons": shadow.get("block_reasons", []),
+        "v2_caps": [cap.get("name") for cap in shadow.get("caps_applied", []) if isinstance(cap, dict)],
+        "v2_explanation": shadow.get("explanation"),
     }
 
 
@@ -6517,11 +6580,27 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         "vector": vector_observations,
         "nova": nn_scan_result.get("observations_logged", 0),
     }
+    scoring_v2_scan_time = current_time_cst().isoformat()
+    scoring_v2_scan_cache = {
+        "success": True,
+        "shadow_mode": True,
+        "candidate_source": "full_scan_v2",
+        "decision_authority": "legacy_scoring",
+        "scan_type": scan_type,
+        "scan_time": scoring_v2_scan_time,
+        "vector_cached_at": scoring_v2_scan_time,
+        "nova_cached_at": nn_scan_result.get("scan_time") or scoring_v2_scan_time,
+        "vector_rows": [scoring_v2_card_row(row, "Vector", source_scan_time=scoring_v2_scan_time) for row in scored_stocks],
+        "nova_rows": nn_scan_result.get("scoring_v2_rows") or [],
+        "vector_summary": summarize_scoring_v2_shadow(scored_stocks),
+        "nova_summary": nn_scan_result.get("scoring_v2_shadow_summary") or summarize_scoring_v2_shadow([]),
+    }
 
     # Cache picks and log scan
     database = get_database()
     database.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_picks',?)", [json.dumps(scan_result)])
     database.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_picks_time',?)", [current_time_cst().isoformat()])
+    database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)", [SCORING_V2_SCAN_CACHE_KEY, json.dumps(scoring_v2_scan_cache)])
     database.execute(
         "INSERT INTO scan_cache (scan_time, scan_type, ticker_count, picks_json) VALUES (?,?,?,?)",
         [current_time_cst().isoformat(), scan_type, len(scored_stocks), json.dumps(scan_result)]
@@ -7158,10 +7237,13 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
             "observations_logged": observations_logged,
             "message": "No Nova picks qualified above the shared executable gate" if not top_picks else None,
             "scoring_v2_shadow_summary": summarize_scoring_v2_shadow(scored),
+            "scoring_v2_rows": [scoring_v2_card_row(row, "Nova", source_scan_time=current_time_cst().isoformat()) for row in scored],
         }
 
         db = get_database()
-        db.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_nn_picks',?)", [json.dumps(result)])
+        cached_result = dict(result)
+        cached_result.pop("scoring_v2_rows", None)
+        db.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_nn_picks',?)", [json.dumps(cached_result)])
         db.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_nn_picks_time',?)", [current_time_cst().isoformat()])
         db.commit()
         db.close()
@@ -9179,9 +9261,10 @@ def api_picks_fresh():
 
 @app.route("/api/scoring-v2-shadow")
 def api_scoring_v2_shadow():
-    """Read-only Scoring V2 shadow comparison from cached Vector/Nova picks."""
+    """Read-only Scoring V2 shadow view from the latest full scan universe."""
     try:
         database = get_database()
+        v2_cache_row = database.execute("SELECT value FROM app_state WHERE key=?", [SCORING_V2_SCAN_CACHE_KEY]).fetchone()
         vector_row = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
         vector_time = database.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
         nova_row = database.execute("SELECT value FROM app_state WHERE key='cached_nn_picks'").fetchone()
@@ -9197,6 +9280,66 @@ def api_scoring_v2_shadow():
             ORDER BY sv.brain, sv.strategy, sv.execution_time, sv.selection_mode
         """).fetchall()]
         database.close()
+
+        def apply_variant(row, variant):
+            return {
+                **row,
+                "variant_id": variant.get("id"),
+                "variant_label": variant.get("label") or variant.get("id"),
+                "brain": variant.get("brain"),
+                "strategy": variant.get("strategy"),
+                "execution_time": variant.get("execution_time"),
+                "selection_mode": variant.get("selection_mode"),
+            }
+
+        def compact_rows(rows, limit=20):
+            output = []
+            for row in rows[:limit]:
+                output.append({
+                    "ticker": row.get("ticker"),
+                    "legacy_confidence": row.get("legacy_confidence"),
+                    "legacy_expected_move": row.get("legacy_expected_move"),
+                    "legacy_actionable": row.get("legacy_actionable", True),
+                    "v2_score": row.get("v2_score"),
+                    "v2_score_band": row.get("v2_score_band"),
+                    "v2_actionable": row.get("v2_actionable"),
+                    "v2_blocked": row.get("v2_blocked"),
+                    "v2_block_reasons": row.get("v2_block_reasons", []),
+                    "v2_caps": row.get("v2_caps", []),
+                    "decision_authority": row.get("decision_authority", "legacy_scoring"),
+                    "candidate_source": row.get("candidate_source"),
+                })
+            return output
+
+        if v2_cache_row:
+            v2_cache = json.loads(v2_cache_row["value"] or "{}")
+            vector_v2_rows = v2_cache.get("vector_rows") or []
+            nova_v2_rows = v2_cache.get("nova_rows") or []
+            if vector_v2_rows or nova_v2_rows:
+                variant_rows = []
+                for variant in variants:
+                    source = nova_v2_rows if variant.get("brain") == "Nova" else vector_v2_rows
+                    qualified = [
+                        row for row in filter_variant_strategy_picks(source, variant)
+                        if row.get("v2_actionable")
+                    ]
+                    selected = select_variant_picks(qualified, variant.get("selection_mode"))
+                    for row in selected[:10]:
+                        variant_rows.append(apply_variant(row, variant))
+
+                return jsonify({
+                    "success": True,
+                    "shadow_mode": True,
+                    "candidate_source": "full_scan_v2",
+                    "decision_authority": "legacy_scoring",
+                    "vector_cached_at": v2_cache.get("vector_cached_at") or v2_cache.get("scan_time"),
+                    "nova_cached_at": v2_cache.get("nova_cached_at") or v2_cache.get("scan_time"),
+                    "vector_summary": v2_cache.get("vector_summary") or summarize_scoring_v2_shadow([]),
+                    "nova_summary": v2_cache.get("nova_summary") or summarize_scoring_v2_shadow([]),
+                    "vector_longs": compact_rows([row for row in vector_v2_rows if row.get("v2_actionable")]),
+                    "nova_longs": compact_rows([row for row in nova_v2_rows if row.get("v2_actionable")]),
+                    "variant_rows": variant_rows,
+                })
 
         vector_payload = sanitize_cached_pick_payload(json.loads(vector_row["value"]) if vector_row else {})
         nova_payload = sanitize_cached_pick_payload(json.loads(nova_row["value"]) if nova_row else {}, confidence_floor=NN_CONFIDENCE_FLOOR)
@@ -9272,6 +9415,7 @@ def api_scoring_v2_shadow():
         return jsonify({
             "success": True,
             "shadow_mode": True,
+            "candidate_source": "cached_candidate_rescore",
             "decision_authority": "legacy_scoring",
             "vector_cached_at": vector_time["value"] if vector_time else None,
             "nova_cached_at": nova_time["value"] if nova_time else None,
