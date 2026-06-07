@@ -4064,6 +4064,188 @@ def fetch_finnhub_candles(ticker, days=60):
         log.debug(f"Finnhub candles error {ticker}: {e}")
         return []
 
+def _history_from_massive(ticker, days=60):
+    """Daily OHLCV history from Massive/Polygon aggregates. Canonical shape, oldest-first, or []."""
+    if not MASSIVE_API_KEY:
+        return []
+    try:
+        import urllib.parse, urllib.request
+        now_utc = datetime.now(ZoneInfo("UTC"))
+        to_ms = int(now_utc.timestamp() * 1000)
+        from_ms = int((now_utc - timedelta(days=days + 10)).timestamp() * 1000)
+        encoded_ticker = urllib.parse.quote(ticker.upper())
+        params = urllib.parse.urlencode({
+            "adjusted": "true",
+            "sort": "asc",
+            "limit": 5000,
+            "apiKey": MASSIVE_API_KEY,
+        })
+        url = (
+            f"{MASSIVE_BASE}/v2/aggs/ticker/{encoded_ticker}/range/"
+            f"1/day/{from_ms}/{to_ms}?{params}"
+        )
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+        status_text = str(data.get("status") or data.get("error") or "").lower()
+        if data.get("error") or status_text in ("error", "auth_failed"):
+            log.debug(f"Massive history error {ticker}: {data.get('error') or data.get('message') or data.get('status')}")
+            return []
+        bars = data.get("results") or []
+        history = []
+        for bar in bars:
+            close = bar.get("c")
+            if close is None:
+                continue
+            ms = int(bar.get("t") or 0) or None
+            sec = int(ms / 1000) if ms else None
+            history.append({
+                "close": float(close),
+                "open": float(bar.get("o")) if bar.get("o") is not None else float(close),
+                "high": float(bar.get("h")) if bar.get("h") is not None else float(close),
+                "low": float(bar.get("l")) if bar.get("l") is not None else float(close),
+                "volume": float(bar.get("v")) if bar.get("v") is not None else 0,
+                "timestamp": sec,
+                "date": datetime.fromtimestamp(sec).strftime("%Y-%m-%d") if sec else None,
+            })
+        return history[-days:] if history else []
+    except Exception as e:
+        log.debug(f"Massive history exception {ticker}: {e}")
+        return []
+
+
+def _history_from_twelve_data(ticker, days=60):
+    """Daily OHLCV history from Twelve Data time_series. Canonical shape, oldest-first, or []."""
+    if not TWELVE_DATA_KEY:
+        return []
+    try:
+        import urllib.parse, urllib.request
+        params = urllib.parse.urlencode({
+            "symbol": ticker,
+            "interval": "1day",
+            "outputsize": max(int(days), 30),
+            "apikey": TWELVE_DATA_KEY,
+        })
+        with urllib.request.urlopen(f"{TWELVE_DATA_BASE}/time_series?{params}", timeout=12) as resp:
+            data = json.loads(resp.read())
+        if data.get("status") == "error" or not data.get("values"):
+            return []
+        history = []
+        for row in reversed(data.get("values") or []):  # Twelve Data returns newest-first
+            try:
+                close = float(row.get("close"))
+            except (TypeError, ValueError):
+                continue
+            date_str = row.get("datetime")
+            sec = None
+            if date_str:
+                try:
+                    sec = int(datetime.strptime(date_str[:10], "%Y-%m-%d").timestamp())
+                except Exception:
+                    sec = None
+
+            def _td_num(key, fallback):
+                try:
+                    return float(row.get(key))
+                except (TypeError, ValueError):
+                    return fallback
+
+            history.append({
+                "close": close,
+                "open": _td_num("open", close),
+                "high": _td_num("high", close),
+                "low": _td_num("low", close),
+                "volume": _td_num("volume", 0),
+                "timestamp": sec,
+                "date": date_str[:10] if date_str else None,
+            })
+        return history
+    except Exception as e:
+        log.debug(f"Twelve Data history exception {ticker}: {e}")
+        return []
+
+
+def _history_from_yfinance(ticker, days=60):
+    """Daily OHLCV history from yfinance. Canonical shape, oldest-first, or []."""
+    try:
+        import yfinance as yf
+        period = "3mo" if days <= 90 else ("6mo" if days <= 180 else "1y")
+        frame = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=False)
+        if frame is None or frame.empty:
+            return []
+        history = []
+        for index, row in frame.iterrows():
+            def _yf_num(col, fallback):
+                value = row.get(col)
+                try:
+                    number = float(value)
+                    return number if number == number else fallback  # number != number means NaN
+                except (TypeError, ValueError):
+                    return fallback
+            close = _yf_num("Close", None)
+            if close is None:
+                continue
+            try:
+                sec = int(index.timestamp())
+                date_str = index.strftime("%Y-%m-%d")
+            except Exception:
+                sec, date_str = None, None
+            history.append({
+                "close": close,
+                "open": _yf_num("Open", close),
+                "high": _yf_num("High", close),
+                "low": _yf_num("Low", close),
+                "volume": _yf_num("Volume", 0),
+                "timestamp": sec,
+                "date": date_str,
+            })
+        return history[-days:] if history else []
+    except Exception as e:
+        log.debug(f"yfinance history exception {ticker}: {e}")
+        return []
+
+
+# Daily candle history fallback chain, most reliable first. Mirrors the quote
+# PROVIDER_CHAIN so a single provider's empty return / rate-limit no longer leaves
+# a ticker without volume history (which would liquidity-cap it in Scoring V2).
+# Alpha Vantage is intentionally excluded: its free-tier daily quota is too small
+# to serve a full scan universe.
+HISTORY_PROVIDER_CHAIN = [p.strip() for p in os.getenv(
+    "HISTORY_PROVIDER_CHAIN",
+    "massive,twelve_data,yfinance,finnhub"
+).split(",") if p.strip()]
+
+_HISTORY_PROVIDERS = {
+    "massive": _history_from_massive,
+    "polygon": _history_from_massive,
+    "twelve_data": _history_from_twelve_data,
+    "finnhub": fetch_finnhub_candles,
+    "yfinance": _history_from_yfinance,
+}
+
+
+def fetch_daily_history(ticker, days=60):
+    """Daily OHLCV history with provider fallback (most reliable first).
+
+    Walks HISTORY_PROVIDER_CHAIN and returns the first non-empty result in the
+    canonical shape {close, open, high, low, volume, timestamp, date}, oldest-first.
+    Returns [] only when every provider fails or returns nothing. This is the single
+    source of daily history for the scan; callers should not assume one provider.
+    """
+    for name in HISTORY_PROVIDER_CHAIN:
+        fetcher = _HISTORY_PROVIDERS.get(name.lower())
+        if fetcher is None:
+            continue
+        try:
+            history = fetcher(ticker, days=days)
+        except Exception as e:
+            log.debug(f"history provider {name} failed for {ticker}: {e}")
+            history = []
+        if history:
+            return history
+    log.debug(f"No daily history for {ticker} after providers {HISTORY_PROVIDER_CHAIN}")
+    return []
+
+
 def fetch_massive_price_at_cst(ticker, target_dt_cst, multiplier=5, timespan="minute"):
     """
     Fetch the aggregate-bar open nearest to a Central-time execution slot.
@@ -4346,7 +4528,7 @@ def fetch_twelve_data_batch(tickers, interval="1day", outputsize=60):
 
         # Then get candle history for RSI + confluence
         time.sleep(RATE_LIMIT_DELAY)
-        history = fetch_finnhub_candles(ticker, days=outputsize)
+        history = fetch_daily_history(ticker, days=outputsize)
         quote["daily_history"] = history
 
         # Compute average volume from history
@@ -4491,7 +4673,7 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
                 results[ticker] = quote
                 refreshed_tickers.append(ticker)
                 # Fetch candle history for fresh tickers
-                history = fetch_finnhub_candles(ticker, days=60)
+                history = fetch_daily_history(ticker, days=60)
                 if history:
                     results[ticker]["daily_history"] = history
                     repair_quote_baselines_from_history(results[ticker], history)
