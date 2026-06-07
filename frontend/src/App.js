@@ -2794,7 +2794,11 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
               {spotlightVariants.map(renderSpotlight)}
 
               {rows.length === 0 ? (
-                <div style={{ fontSize: 9, color: T3, lineHeight: 1.4 }}>No cached shadow rows yet. Run a fresh scan after deploy.</div>
+                <div style={{ fontSize: 9, color: T3, lineHeight: 1.4 }}>
+                  {payload?.candidate_source === "full_scan_v2"
+                    ? "No V2-actionable variant rows in the latest full scan."
+                    : "No cached shadow rows yet. Run a fresh scan after deploy."}
+                </div>
               ) : (
                 <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
                   <div style={{ fontSize: 8, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .5, marginTop: 2 }}>Other variants</div>
