@@ -9311,6 +9311,14 @@ def api_scoring_v2_shadow():
                 })
             return output
 
+        def watchlist_rows(rows, limit=20):
+            candidates = [
+                row for row in rows
+                if not row.get("v2_actionable") and not row.get("v2_blocked") and row.get("v2_score") is not None
+            ]
+            candidates.sort(key=lambda row: (float(row.get("v2_score") or 0), float(row.get("legacy_confidence") or 0)), reverse=True)
+            return candidates[:limit]
+
         if v2_cache_row:
             v2_cache = json.loads(v2_cache_row["value"] or "{}")
             vector_v2_rows = v2_cache.get("vector_rows") or []
@@ -9338,6 +9346,8 @@ def api_scoring_v2_shadow():
                     "nova_summary": v2_cache.get("nova_summary") or summarize_scoring_v2_shadow([]),
                     "vector_longs": compact_rows([row for row in vector_v2_rows if row.get("v2_actionable")]),
                     "nova_longs": compact_rows([row for row in nova_v2_rows if row.get("v2_actionable")]),
+                    "vector_watchlist": watchlist_rows(vector_v2_rows),
+                    "nova_watchlist": watchlist_rows(nova_v2_rows),
                     "variant_rows": variant_rows,
                 })
 

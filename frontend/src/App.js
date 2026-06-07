@@ -2657,6 +2657,8 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
   const rows = allRows.filter(row => !spotlightVariantIds.has(row.variant_id)).slice(0, 16);
   const vectorSummary = payload?.vector_summary || {};
   const novaSummary = payload?.nova_summary || {};
+  const vectorWatchlist = Array.isArray(payload?.vector_watchlist) ? payload.vector_watchlist.slice(0, 20) : [];
+  const novaWatchlist = Array.isArray(payload?.nova_watchlist) ? payload.nova_watchlist.slice(0, 20) : [];
   const sourceLabel = payload?.candidate_source === "full_scan_v2" ? "Full-scan V2 universe" : "Cached candidate rescore";
 
   const toggleSpotlightCard = key => {
@@ -2754,6 +2756,44 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
     );
   };
 
+  const renderWatchlist = (label, items, color) => {
+    if (!items.length) return null;
+    return (
+      <div style={{ marginTop: 10 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, marginBottom: 5 }}>
+          <div style={{ fontSize: 9, color: T1, fontWeight: 900 }}>{label} watchlist</div>
+          <div style={{ fontSize: 8, color, fontFamily: "'DM Mono',monospace", fontWeight: 900 }}>{items.length}/20</div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+          {items.map((row, idx) => {
+            const capText = (row.v2_caps || []).slice(0, 2).join(", ");
+            return (
+              <div key={`${label}_watch_${row.ticker}_${idx}`} style={{ background: "#070708", border: `1px solid ${BORDER}`, borderRadius: 7, padding: "7px 8px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
+                  <div style={{ minWidth: 0, fontSize: 11, color: T1, fontWeight: 900, fontFamily: "'DM Mono',monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {row.ticker || "-"}
+                  </div>
+                  <div style={{ flexShrink: 0, fontSize: 10, color: AMBER, fontFamily: "'DM Mono',monospace", fontWeight: 900 }}>
+                    V2 {row.v2_score == null ? "--" : row.v2_score}
+                  </div>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginTop: 2 }}>
+                  <div style={{ minWidth: 0, fontSize: 8, color: T3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {row.v2_explanation || row.v2_score_band || "skip"}
+                  </div>
+                  <div style={{ flexShrink: 0, fontSize: 8, color: T3, fontFamily: "'DM Mono',monospace" }}>
+                    old {row.legacy_confidence ?? "--"}
+                  </div>
+                </div>
+                {capText && <div style={{ marginTop: 3, fontSize: 7, color: T3, lineHeight: 1.35 }}>{capText}</div>}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 12px", marginBottom: 16 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
@@ -2792,6 +2832,14 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
               </div>
 
               {spotlightVariants.map(renderSpotlight)}
+
+              {(vectorWatchlist.length > 0 || novaWatchlist.length > 0) && (
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ fontSize: 8, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .5, marginBottom: 4 }}>V2 Watchlist</div>
+                  {renderWatchlist("Vector", vectorWatchlist, BLUE)}
+                  {renderWatchlist("Nova", novaWatchlist, "#a78bfa")}
+                </div>
+              )}
 
               {rows.length === 0 ? (
                 <div style={{ fontSize: 9, color: T3, lineHeight: 1.4 }}>
