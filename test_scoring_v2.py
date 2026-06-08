@@ -87,6 +87,21 @@ class ScoringV2Test(unittest.TestCase):
         self.assertEqual(result["score_band"], "valid")
         self.assertIn("daily_average_volume_only", {cap["name"] for cap in result["caps_applied"]})
 
+    def test_completed_session_volume_is_not_daily_average_only(self):
+        result = score_stock_v2(clean_setup(
+            time_matched_relative_volume=None,
+            premarket_relative_volume=None,
+            completed_session_relative_volume=2.2,
+            daily_average_relative_volume=2.2,
+            volume_baseline_sessions=20,
+        ))
+
+        volume_row = next(row for row in result["signals"] if row["signal_id"] == "volume_surge")
+        self.assertNotIn("daily_average_volume_only", {cap["name"] for cap in result["caps_applied"]})
+        self.assertEqual(volume_row["status"], "completed session")
+        self.assertEqual(volume_row["authority"], 1.0)
+        self.assertGreaterEqual(result["score"], 65)
+
     def test_missing_liquidity_proof_caps_but_does_not_hard_block(self):
         result = score_stock_v2(clean_setup(average_daily_dollar_volume=None))
 

@@ -131,6 +131,26 @@ class MatchedVolumeTest(unittest.TestCase):
         self.assertEqual(payload["premarket_baseline_median_volume"], 50_000)
         self.assertEqual(payload["regular_baseline_median_volume"], 40_000)
 
+    def test_last_session_volume_becomes_completed_session_v2_input(self):
+        payload = build_scoring_v2_shadow_input(
+            "MS",
+            {
+                "price": 120,
+                "previous_close": 118,
+                "open": 119,
+                "gap_percent": 2,
+                "day_change_percent": 1,
+                "volume_ratio": 2.4,
+                "volume_source": "last_session",
+                "volume_baseline_sessions": 20,
+            },
+            60,
+            {},
+        )
+
+        self.assertEqual(payload["completed_session_relative_volume"], 2.4)
+        self.assertEqual(payload["daily_average_relative_volume"], 2.4)
+
 
 if __name__ == "__main__":
     unittest.main()

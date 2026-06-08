@@ -260,7 +260,13 @@ def rsi_signal(data: dict[str, Any]) -> dict[str, Any]:
 def volume_signal(data: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     caps = []
     sessions = int(first_number(data, "volume_baseline_sessions", "usable_volume_sessions") or 0)
-    time_matched = first_number(data, "time_matched_relative_volume", "premarket_relative_volume")
+    time_matched = first_number(
+        data,
+        "time_matched_relative_volume",
+        "premarket_relative_volume",
+        "completed_session_relative_volume",
+        "last_session_relative_volume",
+    )
     burst = first_number(data, "recent_block_volume_acceleration", "burst_volume_ratio")
     daily_average = first_number(data, "daily_average_relative_volume", "volume_ratio", "vol_ratio")
 
@@ -274,7 +280,7 @@ def volume_signal(data: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, 
 
     if sessions >= 20:
         authority = 1.0
-        status = "full baseline"
+        status = "completed session" if first_number(data, "completed_session_relative_volume", "last_session_relative_volume") is not None else "full baseline"
     elif sessions >= 10:
         authority = 0.5
         status = "provisional"
@@ -303,7 +309,12 @@ def volume_signal(data: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, 
         elif burst < 0.8:
             quality -= 0.1
     quality = clamp(quality * authority, -1.0, 1.0)
-    return signal_row("volume_surge", "active", quality, time_matched, status, "time-matched relative volume with baseline authority", authority=authority), caps
+    detail = (
+        "completed-session relative volume with baseline authority"
+        if first_number(data, "completed_session_relative_volume", "last_session_relative_volume") is not None
+        else "time-matched relative volume with baseline authority"
+    )
+    return signal_row("volume_surge", "active", quality, time_matched, status, detail, authority=authority), caps
 
 
 def gap_signal(data: dict[str, Any]) -> dict[str, Any]:

@@ -6302,6 +6302,9 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
         confluence_methods = confluence.get("methods") or []
     elif confluence:
         confluence_methods = confluence
+    completed_session_relative_volume = None
+    if stock_data.get("volume_source") == "last_session":
+        completed_session_relative_volume = stock_data.get("volume_ratio")
 
     return {
         "ticker": ticker,
@@ -6319,6 +6322,7 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
         "rsi": rsi,
         "time_matched_relative_volume": stock_data.get("time_matched_relative_volume"),
         "premarket_relative_volume": stock_data.get("premarket_relative_volume"),
+        "completed_session_relative_volume": completed_session_relative_volume,
         "recent_block_volume_acceleration": stock_data.get("recent_block_volume_acceleration"),
         "daily_average_relative_volume": stock_data.get("volume_ratio"),
         "volume_source": stock_data.get("volume_source"),
