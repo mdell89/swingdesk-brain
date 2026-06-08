@@ -2890,6 +2890,177 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
   );
 }
 
+function ScoringDivergencePanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
+  const PAGE_SIZE = 25;
+  const [open, setOpen] = React.useState(false);
+  const [rows, setRows] = React.useState([]);
+  const [summary, setSummary] = React.useState({});
+  const [total, setTotal] = React.useState(0);
+  const [page, setPage] = React.useState(0);
+  const [category, setCategory] = React.useState("splits");
+  const [brain, setBrain] = React.useState("");
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState("");
+
+  const load = React.useCallback(async () => {
+    if (!open) return;
+    setLoading(true);
+    setError("");
+    try {
+      const params = new URLSearchParams({
+        limit: String(PAGE_SIZE),
+        offset: String(page * PAGE_SIZE),
+      });
+      if (category && category !== "all") params.set("category", category);
+      if (brain) params.set("brain", brain);
+      const res = await fetch(`${API}/scoring-divergence-log?${params.toString()}`);
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || "Divergence log unavailable");
+      setRows(data.rows || []);
+      setSummary(data.summary || {});
+      setTotal(Number(data.total || 0));
+    } catch (err) {
+      setError(err.message || "Divergence log unavailable");
+      setRows([]);
+      setTotal(0);
+    } finally {
+      setLoading(false);
+    }
+  }, [API, brain, category, open, page]);
+
+  React.useEffect(() => {
+    load();
+  }, [load]);
+
+  const setFilter = (nextCategory) => {
+    setCategory(nextCategory);
+    setPage(0);
+  };
+  const setBrainFilter = (nextBrain) => {
+    setBrain(nextBrain);
+    setPage(0);
+  };
+  const counts = Object.fromEntries((summary.category_counts || []).map(row => [row.agreement_category, row.count]));
+  const maxPage = Math.max(0, Math.ceil(total / PAGE_SIZE) - 1);
+  const categoryMeta = {
+    both_picked: ["Both", GREEN],
+    legacy_only: ["Legacy", AMBER],
+    v2_only: ["V2", BLUE],
+    both_rejected: ["Neither", T3],
+  };
+  const activeStyle = (active, color = BLUE) => ({
+    background: active ? color : "transparent",
+    border: `1px solid ${color}`,
+    borderRadius: 6,
+    color: active ? "#000" : color,
+    fontSize: 8,
+    fontWeight: 900,
+    padding: "4px 7px",
+    fontFamily: "'DM Mono',monospace",
+  });
+
+  return (
+    <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "10px 12px", marginBottom: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontSize: 12, fontWeight: 800, color: T1 }}>V2 divergence log</div>
+          <div style={{ fontSize: 8, color: T3, marginTop: 2 }}>
+            {summary.latest_scan_id ? `Latest scan ${summary.latest_scan_id}` : "No rows yet"}
+          </div>
+        </div>
+        <button
+          onClick={() => setOpen(prev => !prev)}
+          style={{ flexShrink: 0, background: open ? "transparent" : BLUE, color: open ? BLUE : "#000", border: `1px solid ${BLUE}`, borderRadius: 7, padding: "6px 9px", fontSize: 9, fontWeight: 900, fontFamily: "'DM Mono',monospace", cursor: "pointer" }}
+        >
+          {open ? "Hide" : "Open"}
+        </button>
+      </div>
+
+      {open && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 5, marginBottom: 8 }}>
+            {[
+              ["Legacy", counts.legacy_only || 0, AMBER],
+              ["V2", counts.v2_only || 0, BLUE],
+              ["Both", counts.both_picked || 0, GREEN],
+              ["Neither", counts.both_rejected || 0, T3],
+            ].map(([label, value, color]) => (
+              <div key={label} style={{ background: "#070708", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 7px" }}>
+                <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>{label}</div>
+                <div style={{ fontSize: 12, color, fontFamily: "'DM Mono',monospace", fontWeight: 900 }}>{value}</div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 8 }}>
+            {[
+              ["splits", "Splits"],
+              ["legacy_only", "Legacy"],
+              ["v2_only", "V2"],
+              ["all", "All"],
+            ].map(([value, label]) => (
+              <button key={value} onClick={() => setFilter(value)} style={activeStyle(category === value, value === "legacy_only" ? AMBER : value === "v2_only" ? BLUE : T2)}>
+                {label}
+              </button>
+            ))}
+            {[
+              ["", "Both brains"],
+              ["Vector", "Vector"],
+              ["Nova", "Nova"],
+            ].map(([value, label]) => (
+              <button key={label} onClick={() => setBrainFilter(value)} style={activeStyle(brain === value, value === "Nova" ? "#a78bfa" : BLUE)}>
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {error && <div style={{ fontSize: 9, color: RED }}>{error}</div>}
+          {loading && <div style={{ fontSize: 9, color: T3 }}>Loading...</div>}
+          {!loading && !error && rows.length === 0 && <div style={{ fontSize: 9, color: T3 }}>No divergence rows for this filter yet.</div>}
+          {!loading && !error && rows.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+              {rows.map(row => {
+                const [catLabel, catColor] = categoryMeta[row.agreement_category] || [row.agreement_category || "-", T2];
+                const caps = (row.v2_caps_applied || []).map(cap => cap.name || cap.reason || String(cap)).slice(0, 2).join(", ");
+                const reasons = (row.legacy_reasons || []).slice(0, 1).join(", ");
+                const ts = row.scan_timestamp ? new Date(row.scan_timestamp).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "-";
+                return (
+                  <div key={row.id} style={{ background: "#070708", border: `1px solid ${BORDER}`, borderRadius: 7, padding: "7px 8px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
+                      <div style={{ minWidth: 0, display: "flex", alignItems: "baseline", gap: 6 }}>
+                        <span style={{ fontSize: 11, color: T1, fontWeight: 900, fontFamily: "'DM Mono',monospace" }}>{row.ticker}</span>
+                        <span style={{ fontSize: 8, color: row.brain === "Nova" ? "#a78bfa" : BLUE, fontWeight: 800 }}>{row.brain}</span>
+                      </div>
+                      <div style={{ flexShrink: 0, fontSize: 8, color: catColor, fontFamily: "'DM Mono',monospace", fontWeight: 900 }}>{catLabel}</div>
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 5, marginTop: 5 }}>
+                      <div style={{ fontSize: 8, color: T3 }}>old <span style={{ color: T2, fontFamily: "'DM Mono',monospace" }}>{row.legacy_confidence ?? "--"}</span></div>
+                      <div style={{ fontSize: 8, color: T3 }}>v2 <span style={{ color: catColor, fontFamily: "'DM Mono',monospace" }}>{row.v2_score ?? "--"}</span></div>
+                      <div style={{ fontSize: 8, color: T3, textAlign: "right" }}>{ts}</div>
+                    </div>
+                    <div style={{ marginTop: 4, fontSize: 8, color: T3, lineHeight: 1.35 }}>
+                      {row.split_cause || caps || reasons || row.v2_explanation || "No split cause recorded."}
+                    </div>
+                    {caps && <div style={{ marginTop: 2, fontSize: 7, color: T3 }}>caps: {caps}</div>}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8 }}>
+            <span style={{ fontSize: 8, color: T3 }}>Page {page + 1} of {Math.max(1, maxPage + 1)} - {total} rows</span>
+            <div style={{ display: "flex", gap: 6 }}>
+              <button onClick={() => setPage(p => Math.max(0, p - 1))} disabled={page === 0} style={{ fontSize: 8, color: page === 0 ? T3 : BLUE, background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 5, padding: "3px 7px" }}>Prev</button>
+              <button onClick={() => setPage(p => Math.min(maxPage, p + 1))} disabled={page >= maxPage} style={{ fontSize: 8, color: page >= maxPage ? T3 : BLUE, background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 5, padding: "3px 7px" }}>Next</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export {
   averagePicksByTicker,
   averageTradesByTicker,
@@ -4980,6 +5151,7 @@ export default function App() {
               <ScanPanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} />
               <WhyNotPanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} />
               <ScoringV2ShadowPanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} themeKey={themeKey} pdtRemaining={pdtRemaining} />
+              <ScoringDivergencePanel API={API} T1={T1} T2={T2} T3={T3} BORDER={BORDER} CARD={CARD} GREEN={GREEN} BLUE={BLUE} AMBER={AMBER} RED={RED} />
           <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
             <div style={{ fontSize: 14, fontWeight: 600, color: T1, marginBottom: 4 }}>Self-audit engine</div>
             <div style={{ fontSize: 10, color: T2, lineHeight: 1.45, marginBottom: 6 }}>Autopilot: daily 7:00 PM Central batch learning, then a read-only LLM recap.</div>

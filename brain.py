@@ -1229,6 +1229,73 @@ def initialize_database():
             resolved_at TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS scoring_divergence_log (
+            id TEXT PRIMARY KEY,
+            scan_id INTEGER,
+            scan_timestamp TEXT NOT NULL,
+            scan_type TEXT,
+            brain TEXT NOT NULL,
+            strategy TEXT DEFAULT 'SwingDesk',
+            variant TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            direction TEXT DEFAULT 'long',
+            price REAL,
+            previous_close REAL,
+            session_open REAL,
+            gap_percent REAL,
+            day_change_percent REAL,
+            volume_ratio REAL,
+            time_matched_relative_volume REAL,
+            volume_baseline_sessions INTEGER,
+            volume_source TEXT,
+            rsi REAL,
+            relative_strength_delta REAL,
+            sector_relative_strength_delta REAL,
+            vwap_delta_pct REAL,
+            atr_percent REAL,
+            support_resistance_state TEXT,
+            days_to_earnings INTEGER,
+            average_daily_dollar_volume REAL,
+            freshness_status TEXT,
+            provider TEXT,
+            scan_completed_at TEXT,
+            legacy_actionable INTEGER DEFAULT 0,
+            legacy_selected INTEGER DEFAULT 0,
+            legacy_rank INTEGER,
+            legacy_confidence INTEGER,
+            legacy_expected_move REAL,
+            legacy_eligible INTEGER DEFAULT 0,
+            legacy_reasons TEXT DEFAULT '[]',
+            v2_score INTEGER,
+            v2_band TEXT,
+            v2_actionable INTEGER DEFAULT 0,
+            v2_blocked INTEGER DEFAULT 0,
+            v2_block_reasons TEXT DEFAULT '[]',
+            v2_caps_applied TEXT DEFAULT '[]',
+            v2_signals TEXT DEFAULT '[]',
+            v2_expected_move REAL,
+            v2_expected_move_components TEXT DEFAULT '{}',
+            v2_explanation TEXT,
+            agreement_category TEXT NOT NULL,
+            score_delta REAL,
+            more_selective TEXT,
+            split_cause TEXT,
+            scoring_engine_version TEXT,
+            strategy_profile_version TEXT,
+            formula_version TEXT,
+            weight_snapshot TEXT DEFAULT '{}',
+            legacy_opened INTEGER,
+            v2_opened INTEGER,
+            entry_price REAL,
+            exit_price REAL,
+            realized_net_pnl REAL,
+            realized_gross_pnl REAL,
+            hold_duration TEXT,
+            close_reason TEXT,
+            outcome_backfilled_at TEXT,
+            created_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS variant_portfolios (
             variant_id TEXT PRIMARY KEY,
             starting_cash REAL DEFAULT 1000.0,
@@ -1540,6 +1607,9 @@ def initialize_database():
         CREATE INDEX IF NOT EXISTS idx_signal_observations_variant ON signal_observations(strategy, variant_id, scan_time);
         CREATE INDEX IF NOT EXISTS idx_signal_observations_ticker ON signal_observations(ticker, scan_time);
         CREATE INDEX IF NOT EXISTS idx_signal_observations_confidence ON signal_observations(confidence_bin, outcome);
+        CREATE INDEX IF NOT EXISTS idx_scoring_divergence_scan ON scoring_divergence_log(scan_id, brain);
+        CREATE INDEX IF NOT EXISTS idx_scoring_divergence_category ON scoring_divergence_log(agreement_category, scan_timestamp);
+        CREATE INDEX IF NOT EXISTS idx_scoring_divergence_ticker ON scoring_divergence_log(ticker, scan_timestamp);
         CREATE INDEX IF NOT EXISTS idx_variant_trades_variant ON variant_virtual_trades(variant_id, outcome);
         CREATE INDEX IF NOT EXISTS idx_variant_trades_ticker ON variant_virtual_trades(ticker, buy_date);
         CREATE INDEX IF NOT EXISTS idx_variant_equity_variant ON variant_equity_points(variant_id, timestamp);
@@ -5959,6 +6029,7 @@ def build_scoring_v2_shadow(ticker, stock_data, rsi, earnings_soon, weights, bra
         result = score_stock_v2(payload, strategy="SwingDesk", brain=brain, weights=weights)
         return {
             **result,
+            "input_snapshot": payload,
             "shadow_mode": True,
             "decision_authority": "legacy_scoring",
         }
@@ -5976,6 +6047,7 @@ def build_scoring_v2_shadow(ticker, stock_data, rsi, earnings_soon, weights, bra
             "actionable": False,
             "blocked": True,
             "block_reasons": ["scoring_v2_shadow_error"],
+            "input_snapshot": {},
         }
 
 
@@ -6102,6 +6174,370 @@ def scoring_v2_card_row(pick, brain="Vector", variant=None, source_scan_time=Non
         "v2_caps": [cap.get("name") for cap in shadow.get("caps_applied", []) if isinstance(cap, dict)],
         "v2_explanation": shadow.get("explanation"),
     }
+
+
+def _json_field(value, fallback=None):
+    if value is None:
+        value = [] if fallback == "list" else {} if fallback == "dict" else fallback
+    return json.dumps(value, default=str)
+
+
+def _json_parse_field(value, fallback=None):
+    if value is None:
+        return [] if fallback == "list" else {} if fallback == "dict" else fallback
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return [] if fallback == "list" else {} if fallback == "dict" else fallback
+
+
+def _first_present(*values):
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _divergence_float(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _divergence_int(value):
+    number = _divergence_float(value)
+    if number is None:
+        return None
+    return int(round(number))
+
+
+def _signal_values_from_pick(pick):
+    values = (
+        pick.get("signal_values_for_observation")
+        or (pick.get("signal_scores") or {}).get("values")
+        or pick.get("signal_values")
+        or {}
+    )
+    return _json_parse_field(values, fallback="dict") or {}
+
+
+def _signal_scores_from_pick(pick):
+    scores = (
+        pick.get("signal_scores_for_observation")
+        or (pick.get("signal_scores") or {}).get("scores")
+        or pick.get("signal_scores")
+        or {}
+    )
+    return _json_parse_field(scores, fallback="dict") or {}
+
+
+def _fired_signals_from_pick(pick):
+    fired = (
+        pick.get("fired_signals_for_observation")
+        or (pick.get("signal_scores") or {}).get("fired")
+        or pick.get("fired_signals")
+        or []
+    )
+    return _json_parse_field(fired, fallback="list") or []
+
+
+def _delta_from_signal_values(values, group_key, left_key, right_key):
+    group = values.get(group_key) if isinstance(values.get(group_key), dict) else {}
+    left = _divergence_float(group.get(left_key))
+    right = _divergence_float(group.get(right_key))
+    if left is None or right is None:
+        return None
+    return left - right
+
+
+def _support_resistance_state(input_snapshot, signal_values):
+    sr = input_snapshot.get("sr_analysis") if isinstance(input_snapshot.get("sr_analysis"), dict) else {}
+    if sr.get("signal"):
+        return sr.get("signal")
+    values = signal_values.get("support_resistance") if isinstance(signal_values.get("support_resistance"), dict) else {}
+    return values.get("signal")
+
+
+def _divergence_legacy_row(pick):
+    values = _signal_values_from_pick(pick)
+    scores = _signal_scores_from_pick(pick)
+    return {
+        **(pick or {}),
+        "confidence": pick.get("long_conf") or pick.get("confidence") or pick.get("nn_score"),
+        "expected_move": pick.get("long_move") or pick.get("expected_move"),
+        "signal_values": values,
+        "signal_scores": scores,
+        "fired_signals": _fired_signals_from_pick(pick),
+    }
+
+
+def _divergence_category(legacy_actionable, v2_actionable):
+    if legacy_actionable and v2_actionable:
+        return "both_picked"
+    if legacy_actionable and not v2_actionable:
+        return "legacy_only"
+    if v2_actionable and not legacy_actionable:
+        return "v2_only"
+    return "both_rejected"
+
+
+def _first_v2_cap(caps):
+    for cap in caps or []:
+        if isinstance(cap, dict):
+            return cap.get("reason") or cap.get("name")
+        if cap:
+            return str(cap)
+    return None
+
+
+def _divergence_split_cause(category, legacy_reasons, v2_block_reasons, v2_caps, v2_explanation):
+    if category == "legacy_only":
+        return (v2_block_reasons or [None])[0] or _first_v2_cap(v2_caps) or v2_explanation or "v2_score_below_floor"
+    if category == "v2_only":
+        return (legacy_reasons or [None])[0] or "legacy_gate_or_rank"
+    if category == "both_rejected":
+        return (v2_block_reasons or [None])[0] or _first_v2_cap(v2_caps) or (legacy_reasons or [None])[0] or "both_rejected"
+    return "agreement"
+
+
+def build_scoring_divergence_row(
+    scan_event_id,
+    scan_timestamp,
+    scan_type,
+    pick,
+    brain,
+    variant_id,
+    price_data=None,
+    selected_tickers=None,
+    executable_tickers=None,
+    open_tickers=None,
+):
+    ticker = str((pick or {}).get("ticker") or "").upper()
+    if not ticker:
+        return None
+    price_data = price_data or {}
+    stock_data = price_data.get(ticker, {}) if isinstance(price_data, dict) else {}
+    signal_values = _signal_values_from_pick(pick)
+    shadow = (pick or {}).get("scoring_v2_shadow") or {}
+    input_snapshot = shadow.get("input_snapshot") if isinstance(shadow.get("input_snapshot"), dict) else {}
+    legacy_row = _divergence_legacy_row(pick)
+    confidence_floor = NN_CONFIDENCE_FLOOR if brain == "Nova" else CONFIDENCE_FLOOR
+    gate = explain_long_pick_gate(legacy_row, open_tickers or set(), confidence_floor)
+
+    selected_tickers = set(selected_tickers or [])
+    executable_tickers = set(executable_tickers or [])
+    legacy_selected = ticker in selected_tickers
+    legacy_eligible = bool(gate.get("eligible"))
+    legacy_actionable = ticker in executable_tickers if executable_tickers else legacy_eligible
+
+    v2_score = shadow.get("score")
+    legacy_confidence = gate.get("confidence")
+    score_delta = None
+    if v2_score is not None and legacy_confidence is not None:
+        v2_score_number = _divergence_float(v2_score)
+        legacy_score_number = _divergence_float(legacy_confidence)
+        if v2_score_number is not None and legacy_score_number is not None:
+            score_delta = v2_score_number - legacy_score_number
+
+    v2_block_reasons = shadow.get("block_reasons") or []
+    v2_caps = shadow.get("caps_applied") or []
+    v2_actionable = bool(shadow.get("actionable"))
+    category = _divergence_category(bool(legacy_actionable), v2_actionable)
+    more_selective = (
+        "v2" if category == "legacy_only"
+        else "legacy" if category == "v2_only"
+        else "tie"
+    )
+
+    freshness = shadow.get("data_freshness") if isinstance(shadow.get("data_freshness"), dict) else {}
+    expected_detail = shadow.get("expected_move_detail") if isinstance(shadow.get("expected_move_detail"), dict) else {}
+    components = expected_detail.get("components") if isinstance(expected_detail.get("components"), dict) else {}
+    weights_snapshot = shadow.get("weights") or {}
+
+    previous_close = _first_present(input_snapshot.get("previous_close"), stock_data.get("previous_close"), pick.get("prev_close"), pick.get("previous_close"))
+    session_open = _first_present(input_snapshot.get("open"), stock_data.get("open"), pick.get("open_price"), pick.get("open"))
+    gap = _first_present(input_snapshot.get("gap_percent"), stock_data.get("gap_percent"), pick.get("overnight_gap_pct"), pick.get("gap_percent"))
+    day_change = _first_present(input_snapshot.get("day_change_percent"), stock_data.get("day_change_percent"), pick.get("day_change_pct"))
+    volume_ratio = _first_present(input_snapshot.get("daily_average_relative_volume"), stock_data.get("volume_ratio"), pick.get("vol_ratio"), pick.get("volume_ratio"))
+    rs_delta = _first_present(
+        input_snapshot.get("relative_strength_delta"),
+        _delta_from_signal_values(signal_values, "relative_strength", "stock_5d", "spy_5d"),
+    )
+    sector_delta = _first_present(
+        input_snapshot.get("sector_relative_strength_delta"),
+        _delta_from_signal_values(signal_values, "sector_relative_strength", "etf_5d", "spy_5d"),
+    )
+
+    return {
+        "id": f"{scan_event_id or scan_timestamp}:{variant_id}:{ticker}:long",
+        "scan_id": scan_event_id,
+        "scan_timestamp": scan_timestamp,
+        "scan_type": scan_type,
+        "brain": brain,
+        "strategy": "SwingDesk",
+        "variant": variant_id,
+        "ticker": ticker,
+        "direction": "long",
+        "price": _divergence_float(_first_present(input_snapshot.get("price"), pick.get("price"), stock_data.get("price"))),
+        "previous_close": _divergence_float(previous_close),
+        "session_open": _divergence_float(session_open),
+        "gap_percent": _divergence_float(gap),
+        "day_change_percent": _divergence_float(day_change),
+        "volume_ratio": _divergence_float(volume_ratio),
+        "time_matched_relative_volume": _divergence_float(input_snapshot.get("time_matched_relative_volume")),
+        "volume_baseline_sessions": _divergence_int(input_snapshot.get("volume_baseline_sessions")),
+        "volume_source": input_snapshot.get("volume_source") or stock_data.get("volume_source"),
+        "rsi": _divergence_float(_first_present(input_snapshot.get("rsi"), pick.get("rsi"))),
+        "relative_strength_delta": _divergence_float(rs_delta),
+        "sector_relative_strength_delta": _divergence_float(sector_delta),
+        "vwap_delta_pct": _divergence_float(input_snapshot.get("vwap_delta_pct")),
+        "atr_percent": _divergence_float(input_snapshot.get("atr_percent")),
+        "support_resistance_state": _support_resistance_state(input_snapshot, signal_values),
+        "days_to_earnings": _divergence_int(input_snapshot.get("days_to_earnings")),
+        "average_daily_dollar_volume": _divergence_float(input_snapshot.get("average_daily_dollar_volume")),
+        "freshness_status": freshness.get("freshness_status") or input_snapshot.get("freshness_status"),
+        "provider": freshness.get("provider") or input_snapshot.get("provider") or stock_data.get("source") or pick.get("price_provider"),
+        "scan_completed_at": freshness.get("scan_completed_at") or input_snapshot.get("scan_completed_at"),
+        "legacy_actionable": int(bool(legacy_actionable)),
+        "legacy_selected": int(bool(legacy_selected)),
+        "legacy_rank": pick.get("rank") or pick.get("source_rank"),
+        "legacy_confidence": legacy_confidence,
+        "legacy_expected_move": gate.get("expected_move"),
+        "legacy_eligible": int(bool(legacy_eligible)),
+        "legacy_reasons": _json_field(gate.get("reasons") or [], fallback="list"),
+        "v2_score": v2_score,
+        "v2_band": shadow.get("score_band"),
+        "v2_actionable": int(v2_actionable),
+        "v2_blocked": int(bool(shadow.get("blocked"))),
+        "v2_block_reasons": _json_field(v2_block_reasons, fallback="list"),
+        "v2_caps_applied": _json_field(v2_caps, fallback="list"),
+        "v2_signals": _json_field(shadow.get("signals") or [], fallback="list"),
+        "v2_expected_move": shadow.get("expected_move"),
+        "v2_expected_move_components": _json_field(components, fallback="dict"),
+        "v2_explanation": shadow.get("explanation"),
+        "agreement_category": category,
+        "score_delta": score_delta,
+        "more_selective": more_selective,
+        "split_cause": _divergence_split_cause(category, gate.get("reasons") or [], v2_block_reasons, v2_caps, shadow.get("explanation")),
+        "scoring_engine_version": shadow.get("scoring_engine_version"),
+        "strategy_profile_version": f"SwingDesk:{shadow.get('formula_version') or 'unknown'}",
+        "formula_version": shadow.get("formula_version"),
+        "weight_snapshot": _json_field(weights_snapshot, fallback="dict"),
+        "legacy_opened": None,
+        "v2_opened": None,
+        "entry_price": None,
+        "exit_price": None,
+        "realized_net_pnl": None,
+        "realized_gross_pnl": None,
+        "hold_duration": None,
+        "close_reason": None,
+        "outcome_backfilled_at": None,
+        "created_at": current_time_cst().isoformat(),
+    }
+
+
+SCORING_DIVERGENCE_COLUMNS = [
+    "id", "scan_id", "scan_timestamp", "scan_type", "brain", "strategy", "variant", "ticker", "direction",
+    "price", "previous_close", "session_open", "gap_percent", "day_change_percent", "volume_ratio",
+    "time_matched_relative_volume", "volume_baseline_sessions", "volume_source", "rsi",
+    "relative_strength_delta", "sector_relative_strength_delta", "vwap_delta_pct", "atr_percent",
+    "support_resistance_state", "days_to_earnings", "average_daily_dollar_volume", "freshness_status",
+    "provider", "scan_completed_at", "legacy_actionable", "legacy_selected", "legacy_rank",
+    "legacy_confidence", "legacy_expected_move", "legacy_eligible", "legacy_reasons", "v2_score",
+    "v2_band", "v2_actionable", "v2_blocked", "v2_block_reasons", "v2_caps_applied", "v2_signals",
+    "v2_expected_move", "v2_expected_move_components", "v2_explanation", "agreement_category",
+    "score_delta", "more_selective", "split_cause", "scoring_engine_version", "strategy_profile_version",
+    "formula_version", "weight_snapshot", "legacy_opened", "v2_opened", "entry_price", "exit_price",
+    "realized_net_pnl", "realized_gross_pnl", "hold_duration", "close_reason", "outcome_backfilled_at",
+    "created_at",
+]
+
+
+def insert_scoring_divergence_rows(rows):
+    if not rows:
+        return 0
+    placeholders = ",".join(["?"] * len(SCORING_DIVERGENCE_COLUMNS))
+    columns_sql = ",".join(SCORING_DIVERGENCE_COLUMNS)
+    db = get_database()
+    inserted = 0
+    for row in rows:
+        try:
+            db.execute(
+                f"INSERT OR REPLACE INTO scoring_divergence_log ({columns_sql}) VALUES ({placeholders})",
+                [row.get(column) for column in SCORING_DIVERGENCE_COLUMNS],
+            )
+            inserted += 1
+        except Exception as exc:
+            log.debug(f"scoring divergence skipped for {row.get('ticker')}: {exc}")
+    db.commit()
+    db.close()
+    return inserted
+
+
+def log_scoring_divergences(
+    scan_event_id,
+    scan_type,
+    scan_timestamp,
+    price_data,
+    vector_rows,
+    nova_rows,
+    vector_selected_tickers=None,
+    vector_executable_tickers=None,
+    nova_selected_tickers=None,
+    nova_executable_tickers=None,
+    open_tickers=None,
+):
+    rows = []
+    vector_ranked = {ticker: idx + 1 for idx, ticker in enumerate(vector_executable_tickers or []) if ticker}
+    nova_ranked = {
+        str((row or {}).get("ticker") or "").upper(): idx + 1
+        for idx, row in enumerate(nova_rows or [])
+        if (row or {}).get("ticker")
+    }
+    for pick in vector_rows or []:
+        ticker = str((pick or {}).get("ticker") or "").upper()
+        ranked_pick = {**pick, "source_rank": vector_ranked.get(ticker)}
+        row = build_scoring_divergence_row(
+            scan_event_id,
+            scan_timestamp,
+            scan_type,
+            ranked_pick,
+            "Vector",
+            "swingdesk_vector_0845_all",
+            price_data=price_data,
+            selected_tickers=vector_selected_tickers,
+            executable_tickers=vector_executable_tickers,
+            open_tickers=open_tickers,
+        )
+        if row:
+            rows.append(row)
+    for pick in nova_rows or []:
+        ticker = str((pick or {}).get("ticker") or "").upper()
+        ranked_pick = {**pick, "source_rank": nova_ranked.get(ticker)}
+        row = build_scoring_divergence_row(
+            scan_event_id,
+            scan_timestamp,
+            scan_type,
+            ranked_pick,
+            "Nova",
+            "swingdesk_nova_0845_all",
+            price_data=price_data,
+            selected_tickers=nova_selected_tickers,
+            executable_tickers=nova_executable_tickers,
+            open_tickers=open_tickers,
+        )
+        if row:
+            rows.append(row)
+    inserted = insert_scoring_divergence_rows(rows)
+    if rows:
+        log.info(f"Scoring divergence log wrote {inserted}/{len(rows)} rows for scan {scan_event_id}")
+    return inserted
 
 
 
@@ -6860,6 +7296,8 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         key=lambda x: x["long_conf"], reverse=True
     )
     recommended_shorts = []  # Disabled until short-specific signals are implemented
+    vector_selected_tickers = [s["ticker"] for s in recommended_longs[:MAX_LONG_PICKS]]
+    vector_executable_tickers = [s["ticker"] for s in recommended_longs]
 
     # Run Darvas silent collection on all scored stocks
     run_darvas_silent_collection(price_data, scored_stocks)
@@ -6881,8 +7319,8 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         rsi_values,
         earnings_soon,
         weights,
-        selected_tickers=[s["ticker"] for s in recommended_longs[:MAX_LONG_PICKS]],
-        executable_tickers=[s["ticker"] for s in recommended_longs],
+        selected_tickers=vector_selected_tickers,
+        executable_tickers=vector_executable_tickers,
         queue_locked=queue_is_locked,
     )
 
@@ -6918,6 +7356,28 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         "nova": nn_scan_result.get("observations_logged", 0),
     }
     scoring_v2_scan_time = current_time_cst().isoformat()
+    nova_divergence_rows = nn_scan_result.get("scored_rows_for_divergence") or []
+    nova_selected_tickers = [row.get("ticker") for row in (nn_scan_result.get("recommended_longs") or []) if row.get("ticker")]
+    nova_executable_tickers = [row.get("ticker") for row in nova_divergence_rows if row.get("ticker") and row.get("nn_executable")]
+    try:
+        divergence_count = log_scoring_divergences(
+            scan_event_id,
+            scan_type,
+            scoring_v2_scan_time,
+            price_data,
+            scored_stocks,
+            nova_divergence_rows,
+            vector_selected_tickers=vector_selected_tickers,
+            vector_executable_tickers=vector_executable_tickers,
+            nova_selected_tickers=nova_selected_tickers,
+            nova_executable_tickers=nova_executable_tickers,
+            open_tickers=all_open_tickers,
+        )
+        scan_result["observations"]["divergence"] = divergence_count
+    except Exception as exc:
+        log.error(f"Scoring divergence log failed for scan {scan_event_id}: {exc}")
+        scan_result["observations"]["divergence"] = 0
+        scan_result["observations"]["divergence_error"] = str(exc)
     scoring_v2_scan_cache = {
         "success": True,
         "shadow_mode": True,
@@ -7575,11 +8035,13 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
             "message": "No Nova picks qualified above the shared executable gate" if not top_picks else None,
             "scoring_v2_shadow_summary": summarize_scoring_v2_shadow(scored),
             "scoring_v2_rows": [scoring_v2_card_row(row, "Nova", source_scan_time=current_time_cst().isoformat()) for row in scored],
+            "scored_rows_for_divergence": scored,
         }
 
         db = get_database()
         cached_result = dict(result)
         cached_result.pop("scoring_v2_rows", None)
+        cached_result.pop("scored_rows_for_divergence", None)
         db.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_nn_picks',?)", [json.dumps(cached_result)])
         db.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_nn_picks_time',?)", [current_time_cst().isoformat()])
         db.commit()
@@ -11298,6 +11760,113 @@ def api_signal_observations():
     except Exception as e:
         log.error(f"signal-observations error: {e}")
         return jsonify([]), 500
+
+@app.route("/api/scoring-divergence-log")
+def api_scoring_divergence_log():
+    """Return recent legacy-vs-V2 scoring divergence rows for review."""
+    try:
+        limit = min(max(int(request.args.get("limit", 50)), 1), 500)
+        offset = max(int(request.args.get("offset", 0)), 0)
+        category = (request.args.get("category") or "").strip()
+        brain = (request.args.get("brain") or "").strip()
+        ticker = (request.args.get("ticker") or "").strip().upper()
+        scan_id = request.args.get("scan_id")
+
+        where = []
+        params = []
+        if category:
+            if category == "splits":
+                where.append("agreement_category IN ('legacy_only','v2_only')")
+            else:
+                where.append("agreement_category=?")
+                params.append(category)
+        if brain:
+            where.append("brain=?")
+            params.append(brain)
+        if ticker:
+            where.append("ticker=?")
+            params.append(ticker)
+        if scan_id:
+            where.append("scan_id=?")
+            params.append(int(scan_id))
+
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        db = get_database()
+        total = db.execute(
+            f"SELECT COUNT(*) AS n FROM scoring_divergence_log {where_sql}",
+            params,
+        ).fetchone()["n"]
+        category_counts = [dict(r) for r in db.execute(f"""
+            SELECT agreement_category, COUNT(*) AS count
+            FROM scoring_divergence_log
+            {where_sql}
+            GROUP BY agreement_category
+            ORDER BY count DESC
+        """, params).fetchall()]
+        latest = db.execute("""
+            SELECT scan_id, scan_timestamp
+            FROM scoring_divergence_log
+            ORDER BY scan_timestamp DESC, scan_id DESC
+            LIMIT 1
+        """).fetchone()
+        rows = [dict(r) for r in db.execute(f"""
+            SELECT *
+            FROM scoring_divergence_log
+            {where_sql}
+            ORDER BY scan_timestamp DESC,
+                     scan_id DESC,
+                     CASE agreement_category
+                        WHEN 'legacy_only' THEN 0
+                        WHEN 'v2_only' THEN 1
+                        WHEN 'both_picked' THEN 2
+                        ELSE 3
+                     END,
+                     legacy_selected DESC,
+                     COALESCE(v2_score, 0) DESC,
+                     COALESCE(legacy_confidence, 0) DESC
+            LIMIT ? OFFSET ?
+        """, params + [limit, offset]).fetchall()]
+        db.close()
+
+        json_keys = (
+            "legacy_reasons",
+            "v2_block_reasons",
+            "v2_caps_applied",
+            "v2_signals",
+            "v2_expected_move_components",
+            "weight_snapshot",
+        )
+        bool_keys = (
+            "legacy_actionable",
+            "legacy_selected",
+            "legacy_eligible",
+            "v2_actionable",
+            "v2_blocked",
+            "legacy_opened",
+            "v2_opened",
+        )
+        for row in rows:
+            for key in json_keys:
+                row[key] = _json_parse_field(row.get(key), fallback="list" if key.endswith("reasons") or key in ("v2_caps_applied", "v2_signals") else "dict")
+            for key in bool_keys:
+                if row.get(key) is not None:
+                    row[key] = bool(row.get(key))
+
+        return jsonify({
+            "success": True,
+            "rows": rows,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "summary": {
+                "category_counts": category_counts,
+                "latest_scan_id": latest["scan_id"] if latest else None,
+                "latest_scan_timestamp": latest["scan_timestamp"] if latest else None,
+            },
+        })
+    except Exception as e:
+        log.error(f"scoring-divergence-log error: {e}")
+        return jsonify({"success": False, "error": str(e), "rows": [], "total": 0}), 500
 
 @app.route("/api/why-not")
 def api_why_not():
