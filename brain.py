@@ -2877,6 +2877,9 @@ class ProviderCycle:
                 self.errors[provider] = str(error)[:160]
             if global_failure:
                 self.unhealthy.add(provider)
+            max_failures = int(os.getenv("PROVIDER_CYCLE_MAX_FAILURES", "3"))
+            if self.failures.get(provider, 0) >= max_failures:
+                self.unhealthy.add(provider)
         if failure_type == "disabled":
             return
         record_provider_health(
@@ -5273,16 +5276,28 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
         log.debug(f"Cache load error: {e}")
 
     log.info(f"Cache hit: {len(results)}/{len(tickers)} tickers")
+    if scan_event_id:
+        record_nn_scan_status(
+            status="running",
+            scan_type=scan_type,
+            phase="price_cache_loaded",
+            scan_event_id=scan_event_id,
+            total_scanned=len(results),
+            total_expected=len(tickers),
+            current_ticker=None,
+            scanned_tickers=[],
+            price_cache_hits=len(results),
+        )
 
     # Fetch fresh quotes for missing or stale tickers — max 60 per cycle
     missing = [t for t in tickers if t not in results]
-    refresh_limit = int(os.getenv("SCAN_PRICE_REFRESH_LIMIT", "160"))
+    refresh_limit = int(os.getenv("SCAN_PRICE_REFRESH_LIMIT", "80"))
     to_refresh = missing[:refresh_limit]
 
     if to_refresh:
         log.info(f"Refreshing {len(to_refresh)}/{len(missing)} stale/missing tickers from price providers...")
-        RATE_DELAY = float(os.getenv("SCAN_PRICE_REFRESH_DELAY_SECONDS", "0.75"))
-        max_fetch_seconds = float(os.getenv("SCAN_PRICE_FETCH_MAX_SECONDS", "900"))
+        RATE_DELAY = float(os.getenv("SCAN_PRICE_REFRESH_DELAY_SECONDS", "0.25"))
+        max_fetch_seconds = float(os.getenv("SCAN_PRICE_FETCH_MAX_SECONDS", "600"))
         fetch_started = time.time()
         cycle = ProviderCycle("comprehensive_quote")
         refreshed_tickers = []
@@ -5295,11 +5310,13 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
                     scan_type=scan_type,
                     phase="fetching_prices_budget_exhausted",
                     scan_event_id=scan_event_id,
-                    total_scanned=len(results),
+                    total_scanned=min(len(results) + idx, len(tickers)),
                     total_expected=len(tickers),
                     current_ticker=ticker,
                     scanned_tickers=refreshed_tickers[-12:],
                     warning="price_refresh_budget_exhausted",
+                    price_refresh_attempted=idx,
+                    price_refresh_successes=len(refreshed_tickers),
                 )
                 break
             if scan_event_id and (idx == 1 or idx % 5 == 0 or idx == len(to_refresh)):
@@ -5308,10 +5325,12 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
                     scan_type=scan_type,
                     phase="fetching_prices",
                     scan_event_id=scan_event_id,
-                    total_scanned=len(results),
+                    total_scanned=min(len(results) + idx, len(tickers)),
                     total_expected=len(tickers),
                     current_ticker=ticker,
                     scanned_tickers=refreshed_tickers[-12:],
+                    price_refresh_attempted=idx,
+                    price_refresh_successes=len(refreshed_tickers),
                 )
             quote = fetch_quote_with_fallback(ticker, cycle=cycle, use_cache=False)
             if quote:
@@ -5342,10 +5361,12 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
                     scan_type=scan_type,
                     phase="fetching_prices",
                     scan_event_id=scan_event_id,
-                    total_scanned=len(results),
+                    total_scanned=min(len(results) + idx, len(tickers)),
                     total_expected=len(tickers),
                     current_ticker=ticker,
                     scanned_tickers=refreshed_tickers[-12:],
+                    price_refresh_attempted=idx,
+                    price_refresh_successes=len(refreshed_tickers),
                 )
             time.sleep(RATE_DELAY)
         set_app_state("last_price_provider_summary", json.dumps(cycle.summary()))
