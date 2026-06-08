@@ -3623,6 +3623,14 @@ def filter_variant_strategy_picks(picks, variant, weights=None):
         filtered.sort(key=lambda p: variant_weighted_signal_score(p, weights), reverse=True)
     return filtered
 
+def filter_scoring_v2_variant_rows(rows, variant):
+    """Filter read-only V2 shadow rows for variant preview without legacy pick gates."""
+    if (variant.get("strategy") or "").lower() == "swingdesk":
+        filtered = [row for row in rows if row.get("v2_actionable")]
+        filtered.sort(key=lambda row: (float(row.get("v2_score") or 0), float(row.get("legacy_confidence") or 0)), reverse=True)
+        return filtered
+    return filter_variant_strategy_picks(rows, variant)
+
 def pick_confidence_and_move(pick, brain="Vector"):
     confidence = pick.get("long_conf") or pick.get("confidence") or pick.get("nn_score") or 0
     expected_move = pick.get("long_move") or pick.get("expected_move") or 0
@@ -10531,10 +10539,7 @@ def api_scoring_v2_shadow():
                 variant_rows = []
                 for variant in variants:
                     source = nova_v2_rows if variant.get("brain") == "Nova" else vector_v2_rows
-                    qualified = [
-                        row for row in filter_variant_strategy_picks(source, variant)
-                        if row.get("v2_actionable")
-                    ]
+                    qualified = filter_scoring_v2_variant_rows(source, variant)
                     selected = select_variant_picks(qualified, variant.get("selection_mode"))
                     for row in selected[:10]:
                         variant_rows.append(apply_variant(row, variant))
@@ -10621,7 +10626,7 @@ def api_scoring_v2_shadow():
                 source = nova_shadow_rows if variant.get("brain") == "Nova" else vector_shadow_rows
                 if variant.get("brain") == "Nova":
                     source = [p for p in source if p.get("nn_executable", True)]
-                qualified = filter_variant_strategy_picks(source, variant)
+                qualified = filter_scoring_v2_variant_rows(source, variant)
                 selected = select_variant_picks(qualified, variant.get("selection_mode"))
                 for pick in selected[:10]:
                     variant_rows.append(shadow_card_row(variant, pick))

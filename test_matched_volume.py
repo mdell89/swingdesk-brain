@@ -40,6 +40,7 @@ sys.modules.setdefault("torch.optim", fake_torch.optim)
 from brain import (
     build_scoring_v2_shadow_input,
     calculate_matched_volume_from_bars,
+    filter_scoring_v2_variant_rows,
 )
 
 
@@ -180,6 +181,34 @@ class MatchedVolumeTest(unittest.TestCase):
         self.assertEqual(payload["sector_relative_strength_delta"], 0.0)
         self.assertEqual(payload["relative_strength_source"], "legacy_score_fallback")
         self.assertEqual(payload["sector_relative_strength_source"], "legacy_score_fallback")
+
+    def test_v2_swingdesk_preview_uses_v2_actionability_not_legacy_move_gate(self):
+        rows = [
+            {
+                "ticker": "MRVL",
+                "v2_actionable": True,
+                "v2_score": 66,
+                "legacy_confidence": 71,
+                "legacy_expected_move": 1.2,
+                "long_move": 1.2,
+                "gap_percent": 1.0,
+                "day_change_percent": 0.5,
+            },
+            {
+                "ticker": "LOW",
+                "v2_actionable": False,
+                "v2_score": 64,
+                "legacy_confidence": 80,
+                "legacy_expected_move": 7.0,
+            },
+        ]
+
+        selected = filter_scoring_v2_variant_rows(
+            rows,
+            {"strategy": "SwingDesk", "brain": "Vector", "execution_time": "08:45", "selection_mode": "All"},
+        )
+
+        self.assertEqual([row["ticker"] for row in selected], ["MRVL"])
 
 
 if __name__ == "__main__":
