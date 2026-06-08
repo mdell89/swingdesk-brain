@@ -3519,6 +3519,13 @@ def numeric_pick_value(pick, *keys):
             pass
     return None
 
+def is_stale_price_context(row):
+    """Rows from stale cache can support diagnostics but cannot be actionable picks."""
+    if not row:
+        return True
+    freshness = str(row.get("price_source_freshness") or row.get("freshness_status") or "").lower()
+    return bool(row.get("stale_cache_fallback")) or freshness in {"stale", "stale_cache", "stale_cache_fallback"}
+
 def bullish_price_action_block_reasons(pick):
     """Hard long-side price-action blocks for broad bullish SwingDesk picks."""
     gap = numeric_pick_value(pick, "overnight_gap_pct", "gap_percent", "gap_pct")
@@ -3909,6 +3916,8 @@ def is_long_pick_eligible(pick, open_tickers=None, confidence_floor=CONFIDENCE_F
     """Shared Vector/Nova long-pick gate before ranking or variant selection."""
     if not pick or not pick.get("ticker"):
         return False
+    if is_stale_price_context(pick):
+        return False
     if open_tickers and pick.get("ticker") in open_tickers:
         return False
     if bullish_price_action_block_reasons(pick):
@@ -3945,6 +3954,10 @@ def explain_long_pick_gate(row, open_tickers=None, confidence_floor=CONFIDENCE_F
     earnings_soon = bool(row.get("earnings_soon") or context.get("earnings_soon"))
     reasons = []
     passes = []
+    if is_stale_price_context(row):
+        reasons.append("Price context came from stale cache fallback, so it cannot be actionable.")
+    else:
+        passes.append("Price context was fresh enough for actionability.")
     if ticker in open_tickers:
         reasons.append("Already open, so it is hidden from fresh picks.")
     else:
@@ -6713,7 +6726,9 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
         "average_volume": average_volume,
         "average_daily_dollar_volume": average_daily_dollar_volume,
         "similar_setup_median_move": stock_data.get("similar_setup_median_move"),
-        "freshness_status": "fresh",
+        "freshness_status": "stale" if is_stale_price_context(stock_data) else "fresh",
+        "price_source_freshness": stock_data.get("price_source_freshness"),
+        "stale_cache_fallback": bool(stock_data.get("stale_cache_fallback")),
         "scan_completed_at": current_time_cst().isoformat(),
         "provider": stock_data.get("source") or stock_data.get("provider") or "scan",
         "rsi": rsi,
@@ -6878,6 +6893,9 @@ def scoring_v2_card_row(pick, brain="Vector", variant=None, source_scan_time=Non
         "industry": pick.get("industry"),
         "sector": pick.get("sector"),
         "price": pick.get("price"),
+        "price_source_freshness": pick.get("price_source_freshness"),
+        "stale_cache_fallback": bool(pick.get("stale_cache_fallback")),
+        "freshness_status": pick.get("freshness_status"),
         "open_price": pick.get("open_price") or pick.get("open"),
         "prev_close": pick.get("prev_close") or pick.get("previous_close"),
         "rsi": pick.get("rsi"),
@@ -8080,6 +8098,9 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
             "short_reasoning": build_reasoning_text(ticker, stock_data, rsi, has_earnings, "short"),
             "sell_time": predict_sell_time_window(long_confidence),
             "data_source": stock_data.get("source", "unknown"),
+            "price_source_freshness": stock_data.get("price_source_freshness"),
+            "stale_cache_fallback": bool(stock_data.get("stale_cache_fallback")),
+            "freshness_status": "stale" if is_stale_price_context(stock_data) else "fresh",
             "52w_high": stock_data.get("52w_high"),
             "broke_52w_high_days_ago": stock_data.get("broke_52w_high_days_ago"),
             "news": stock_data.get("news", []),
