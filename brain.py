@@ -2440,7 +2440,14 @@ def record_nn_open_execution_status(status):
 def record_nn_scan_status(**updates):
     """Persist lightweight NN scan status for non-blocking UI actions."""
     current = get_app_state_json(NN_SCAN_STATUS_KEY, {}) or {}
+    existing_total = current.get("scan_total_expected") or current.get("total_expected") or current.get("tickers_attempted")
+    incoming_total = updates.get("scan_total_expected") or updates.get("total_expected") or updates.get("tickers_attempted")
     current.update(updates)
+    try:
+        current["scan_total_expected"] = max(int(existing_total or 0), int(incoming_total or 0))
+    except Exception:
+        if incoming_total is not None:
+            current["scan_total_expected"] = incoming_total
     current["updated_at"] = current_time_cst().isoformat()
     set_app_state(NN_SCAN_STATUS_KEY, json.dumps(current))
     return current
@@ -2753,6 +2760,10 @@ def get_nn_scan_status_payload():
                 error=status.get("error") or "Background shared scan no longer has a running scan event.",
             )
             status = record_nn_scan_status(**next_status)
+        else:
+            scan_total = int(running_scan.get("tickers_attempted") or 0)
+            if scan_total and int(status.get("scan_total_expected") or status.get("total_expected") or 0) < scan_total:
+                status = record_nn_scan_status(scan_total_expected=scan_total, total_expected=scan_total)
     return status
 
 def start_shared_scan_background(scan_type="manual_shared"):
@@ -7833,6 +7844,8 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         started_at=current_time_cst().isoformat(),
         finished_at=None,
         total_scanned=0,
+        total_expected=len(universe),
+        scan_total_expected=len(universe),
         qualified=0,
         picks=0,
         phase="fetching_prices",

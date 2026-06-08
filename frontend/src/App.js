@@ -2418,9 +2418,10 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
     try {
       const res = await fetch(`${API}/nn-scan-status`);
       const d = await res.json();
+      const scanExpected = d.scan_total_expected || d.tickers_attempted || d.total_expected || 521;
       setPhase(d.phase || "");
       setTotalScanned(d.total_scanned || 0);
-      setTotalExpected(d.total_expected || d.tickers_attempted || 521);
+      setTotalExpected(scanExpected);
       setCurrentTicker(d.current_ticker || "");
       setScannedTickers(d.scanned_tickers || []);
       setQualified(d.qualified || 0);
