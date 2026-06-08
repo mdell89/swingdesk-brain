@@ -182,7 +182,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
 from glass_proof import build_variant_ledger_proof as build_variant_ledger_proof_core, proof_contract
-from scoring_v2 import score_stock_v2
+from scoring_v2 import DEFAULT_EXPECTED_MOVE_FLOOR, score_stock_v2
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10607,6 +10607,34 @@ def api_scoring_v2_shadow():
                 "selection_mode": variant.get("selection_mode"),
             }
 
+        def normalize_v2_preview_row(row):
+            row = dict(row or {})
+            score = _first_scan_number(row, "v2_score", "long_conf")
+            expected = _first_scan_number(row, "v2_expected_move", "long_move", "legacy_expected_move")
+            blocked = bool(row.get("v2_blocked"))
+            trade_reasons = list(row.get("v2_trade_gate_reasons") or [])
+            if score is not None and score >= 65 and not blocked and expected is not None and expected < DEFAULT_EXPECTED_MOVE_FLOOR:
+                reason = f"expected move {expected:.1f}% below {DEFAULT_EXPECTED_MOVE_FLOOR:.1f}% trade floor"
+                if reason not in trade_reasons:
+                    trade_reasons.append(reason)
+                row["v2_actionable"] = False
+                row["v2_trade_gate_reasons"] = trade_reasons
+                row["v2_expected_move_floor"] = DEFAULT_EXPECTED_MOVE_FLOOR
+                row["v2_explanation"] = row.get("v2_explanation") or f"{row.get('ticker')} watchlist: {reason}"
+            return row
+
+        def summarize_v2_preview_rows(rows):
+            shadows = []
+            for row in rows or []:
+                shadows.append({
+                    "actionable": bool(row.get("v2_actionable")),
+                    "blocked": bool(row.get("v2_blocked")),
+                    "score": row.get("v2_score"),
+                    "caps_applied": [{"name": cap} for cap in row.get("v2_caps", [])],
+                    "block_reasons": row.get("v2_block_reasons", []),
+                })
+            return summarize_scoring_v2_shadow([{"scoring_v2_shadow": shadow} for shadow in shadows])
+
         def compact_rows(rows, limit=20):
             output = []
             for row in rows[:limit]:
@@ -10640,8 +10668,8 @@ def api_scoring_v2_shadow():
 
         if v2_cache_row:
             v2_cache = json.loads(v2_cache_row["value"] or "{}")
-            vector_v2_rows = v2_cache.get("vector_rows") or []
-            nova_v2_rows = v2_cache.get("nova_rows") or []
+            vector_v2_rows = [normalize_v2_preview_row(row) for row in (v2_cache.get("vector_rows") or [])]
+            nova_v2_rows = [normalize_v2_preview_row(row) for row in (v2_cache.get("nova_rows") or [])]
             if vector_v2_rows or nova_v2_rows:
                 variant_rows = []
                 for variant in variants:
@@ -10658,8 +10686,8 @@ def api_scoring_v2_shadow():
                     "decision_authority": "legacy_scoring",
                     "vector_cached_at": v2_cache.get("vector_cached_at") or v2_cache.get("scan_time"),
                     "nova_cached_at": v2_cache.get("nova_cached_at") or v2_cache.get("scan_time"),
-                    "vector_summary": v2_cache.get("vector_summary") or summarize_scoring_v2_shadow([]),
-                    "nova_summary": v2_cache.get("nova_summary") or summarize_scoring_v2_shadow([]),
+                    "vector_summary": summarize_v2_preview_rows(vector_v2_rows),
+                    "nova_summary": summarize_v2_preview_rows(nova_v2_rows),
                     "vector_longs": compact_rows([row for row in vector_v2_rows if row.get("v2_actionable")]),
                     "nova_longs": compact_rows([row for row in nova_v2_rows if row.get("v2_actionable")]),
                     "vector_watchlist": watchlist_rows(vector_v2_rows),
@@ -10690,15 +10718,15 @@ def api_scoring_v2_shadow():
                     "legacy_actionable": True,
                     "v2_score": shadow.get("score"),
                     "v2_score_band": shadow.get("score_band"),
-                "v2_actionable": shadow.get("actionable"),
-                "v2_trade_gate_reasons": shadow.get("trade_gate_reasons", []),
-                "v2_expected_move_floor": shadow.get("expected_move_floor"),
-                "v2_blocked": shadow.get("blocked"),
-                "v2_block_reasons": shadow.get("block_reasons", []),
-                "v2_caps": [format_v2_cap_label(cap) for cap in shadow.get("caps_applied", [])],
-                "v2_expected_move": shadow.get("expected_move"),
-                "decision_authority": shadow.get("decision_authority", "legacy_scoring"),
-            })
+                    "v2_actionable": shadow.get("actionable"),
+                    "v2_trade_gate_reasons": shadow.get("trade_gate_reasons", []),
+                    "v2_expected_move_floor": shadow.get("expected_move_floor"),
+                    "v2_blocked": shadow.get("blocked"),
+                    "v2_block_reasons": shadow.get("block_reasons", []),
+                    "v2_caps": [format_v2_cap_label(cap) for cap in shadow.get("caps_applied", [])],
+                    "v2_expected_move": shadow.get("expected_move"),
+                    "decision_authority": shadow.get("decision_authority", "legacy_scoring"),
+                })
             return output
 
         def shadow_card_row(variant, pick):
