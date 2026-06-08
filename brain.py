@@ -8031,6 +8031,14 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         average_daily_dollar_volume = derive_average_daily_dollar_volume_from_scan(stock_data)
         intraday_range_pct = stock_data.get("intraday_range_pct") or derive_intraday_range_pct_from_scan(stock_data)
 
+        display_change_pct = _first_number(
+            pct_from_baseline(stock_data["price"], stock_data.get("previous_close")),
+            stock_data.get("day_change_percent"),
+            stock_data.get("day_change_pct"),
+            stock_data.get("premarket_change_percent"),
+            stock_data.get("gap_percent"),
+        ) or 0
+
         scored_row = {
             "ticker": ticker,
             "name": ticker,
@@ -8058,9 +8066,10 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
             "average_volume": average_volume,
             "average_daily_dollar_volume": average_daily_dollar_volume,
             "overnight_gap_pct": round(stock_data.get("gap_percent", 0), 2),
-            "day_change_pct": round(stock_data.get("day_change_percent", 0), 2),
-            "pct_change_prev_close": round(pct_from_baseline(stock_data["price"], stock_data.get("previous_close")) or 0, 2),
-            "pct_change_premarket": None,
+            "day_change_pct": round(display_change_pct, 2),
+            "day_change_percent": round(display_change_pct, 2),
+            "pct_change_prev_close": round(display_change_pct, 2),
+            "pct_change_premarket": round(stock_data.get("premarket_change_percent", display_change_pct) or 0, 2),
             "pct_change_regular_open": round(pct_from_baseline(stock_data["price"], stock_data.get("open")) or 0, 2),
             "earnings_soon": has_earnings,
             "long_conf": long_confidence,
