@@ -3557,10 +3557,28 @@ def variant_cache_snapshot(database, require_fresh=True, max_age_minutes=180):
             "scan_status": scan_status,
         }
 
-    vector_cached = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
-    nova_cached = database.execute("SELECT value FROM app_state WHERE key='cached_nn_picks'").fetchone()
-    vector_time_row = database.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
-    nova_time_row = database.execute("SELECT value FROM app_state WHERE key='cached_nn_picks_time'").fetchone()
+    locked = read_pick_queue_locked(database)
+    vector_cached = database.execute(
+        "SELECT value FROM app_state WHERE key=?",
+        ["locked_picks" if locked else "cached_picks"],
+    ).fetchone()
+    nova_cached = database.execute(
+        "SELECT value FROM app_state WHERE key=?",
+        ["locked_nn_picks" if locked else "cached_nn_picks"],
+    ).fetchone()
+    vector_time_row = database.execute(
+        "SELECT value FROM app_state WHERE key=?",
+        ["locked_picks_time" if locked else "cached_picks_time"],
+    ).fetchone()
+    nova_time_row = database.execute(
+        "SELECT value FROM app_state WHERE key=?",
+        ["locked_nn_picks_time" if locked else "cached_nn_picks_time"],
+    ).fetchone()
+    if locked and (not vector_cached or not nova_cached):
+        vector_cached = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
+        nova_cached = database.execute("SELECT value FROM app_state WHERE key='cached_nn_picks'").fetchone()
+        vector_time_row = database.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
+        nova_time_row = database.execute("SELECT value FROM app_state WHERE key='cached_nn_picks_time'").fetchone()
     if not vector_cached or not nova_cached:
         return None, {
             "success": False,
@@ -8340,13 +8358,21 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
 
 def get_cached_picks():
     """Return cached picks instantly without triggering a new scan."""
+    locked = is_pick_queue_locked()
     database = get_database()
-    cached = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
-    cache_time = database.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
+    cached = None
+    cache_time = None
+    if locked:
+        cached = database.execute("SELECT value FROM app_state WHERE key='locked_picks'").fetchone()
+        cache_time = database.execute("SELECT value FROM app_state WHERE key='locked_picks_time'").fetchone()
+    if not cached:
+        cached = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
+        cache_time = database.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
     database.close()
     if cached:
         result = sanitize_cached_pick_payload(json.loads(cached["value"]))
         result["cached"] = True
+        result["queue_locked_snapshot"] = bool(locked)
         result["cache_time"] = cache_time["value"] if cache_time else None
         return result
     return None
@@ -9299,9 +9325,21 @@ def lock_pick_queue():
     """
     try:
         database = get_database()
+        cached_picks = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
+        cached_picks_time = database.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
+        cached_nn_picks = database.execute("SELECT value FROM app_state WHERE key='cached_nn_picks'").fetchone()
+        cached_nn_picks_time = database.execute("SELECT value FROM app_state WHERE key='cached_nn_picks_time'").fetchone()
         database.execute("INSERT OR REPLACE INTO app_state VALUES ('queue_locked', 'true')")
         database.execute("INSERT OR REPLACE INTO app_state VALUES ('queue_locked_at', ?)",
                         [current_time_cst().isoformat()])
+        if cached_picks:
+            database.execute("INSERT OR REPLACE INTO app_state VALUES ('locked_picks', ?)", [cached_picks["value"]])
+        if cached_picks_time:
+            database.execute("INSERT OR REPLACE INTO app_state VALUES ('locked_picks_time', ?)", [cached_picks_time["value"]])
+        if cached_nn_picks:
+            database.execute("INSERT OR REPLACE INTO app_state VALUES ('locked_nn_picks', ?)", [cached_nn_picks["value"]])
+        if cached_nn_picks_time:
+            database.execute("INSERT OR REPLACE INTO app_state VALUES ('locked_nn_picks_time', ?)", [cached_nn_picks_time["value"]])
         database.commit()
         database.close()
         log.info("Pick queue locked at 8:25 AM CST — no new picks until next session")
@@ -9314,6 +9352,7 @@ def unlock_pick_queue():
     try:
         database = get_database()
         database.execute("INSERT OR REPLACE INTO app_state VALUES ('queue_locked', 'false')")
+        database.execute("DELETE FROM app_state WHERE key IN ('locked_picks', 'locked_picks_time', 'locked_nn_picks', 'locked_nn_picks_time')")
         database.commit()
         database.close()
         log.info("Pick queue unlocked — pre-market scanning resumed")
@@ -9328,6 +9367,7 @@ def is_pick_queue_locked():
         try:
             database = get_database()
             database.execute("INSERT OR REPLACE INTO app_state VALUES ('queue_locked', 'false')")
+            database.execute("DELETE FROM app_state WHERE key IN ('locked_picks', 'locked_picks_time', 'locked_nn_picks', 'locked_nn_picks_time')")
             database.commit()
             database.close()
         except Exception:
@@ -9337,6 +9377,18 @@ def is_pick_queue_locked():
         database = get_database()
         row = database.execute("SELECT value FROM app_state WHERE key='queue_locked'").fetchone()
         database.close()
+        return bool(row and row["value"] == "true")
+    except Exception:
+        return False
+
+def read_pick_queue_locked(database):
+    """Read lock state without opening another database connection."""
+    now = current_time_cst()
+    cutoff = now.replace(hour=8, minute=25, second=0, microsecond=0)
+    if now < cutoff:
+        return False
+    try:
+        row = database.execute("SELECT value FROM app_state WHERE key='queue_locked'").fetchone()
         return bool(row and row["value"] == "true")
     except Exception:
         return False
@@ -9353,15 +9405,12 @@ def _execute_opening_positions_legacy():
     systematic bias when multiple positions open simultaneously.
     """
     today = current_time_cst().strftime("%Y-%m-%d")
-    database = get_database()
-    cached = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
-    database.close()
-
-    if not cached:
+    cached_payload = get_cached_picks()
+    if not cached_payload:
         log.info("No cached picks to execute")
         return
 
-    picks = json.loads(cached["value"])
+    picks = cached_payload
     is_friday = current_time_cst().weekday() == 4
 
     # Shorts are disabled — only execute long picks.
@@ -9516,16 +9565,12 @@ def execute_opening_positions(trigger="scheduled", buy_time="08:45:00"):
 
     try:
         today = current_time_cst().strftime("%Y-%m-%d")
-        database = get_database()
-        cached = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
-        database.close()
-
-        if not cached:
+        picks = get_cached_picks()
+        if not picks:
             status["last_error"] = "No cached picks to execute"
             log.warning(status["last_error"])
             return record_open_execution_status(status)
 
-        picks = json.loads(cached["value"])
         cached_longs = picks.get("longs") or picks.get("recommended_longs") or []
         all_picks = [pick for pick in cached_longs if is_long_pick_eligible(pick)][:MAX_LONG_PICKS]
         status["cached_pick_count"] = len(all_picks)

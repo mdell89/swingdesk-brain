@@ -171,6 +171,16 @@ function hasVisiblePicksPayload(payload = {}) {
   return Boolean((payload.longs || []).length || (payload.shorts || []).length || (payload.recommended_longs || []).length || (payload.recommended_shorts || []).length);
 }
 
+function cacheFreshPicksPayload(payload) {
+  try {
+    if (hasVisiblePicksPayload(payload)) {
+      localStorage.setItem("swingdesk_picks", JSON.stringify(payload));
+    } else {
+      localStorage.removeItem("swingdesk_picks");
+    }
+  } catch {}
+}
+
 function mapPickFields(pick) {
   const normalized = withNormalizedSignals(pick);
   return {
@@ -3414,10 +3424,10 @@ export default function App() {
         apiFetch("/backfill-lock-in-confidence", { method: "POST" }).catch(() => {});
 
         const mappedPicks = { longs: (picksData.longs || []).map(mapPickFields), shorts: (picksData.shorts || []).map(mapPickFields) };
-        if (hasVisiblePicksPayload(mappedPicks)) setPicks(mappedPicks);
+        setPicks(mappedPicks);
         setTotalScanned(picksData.total_scanned || 0);
         setLastScan(picksData.cache_time || picksData.generated_at || null);
-        if (hasVisiblePicksPayload(picksData)) localStorage.setItem("swingdesk_picks", JSON.stringify(picksData));
+        cacheFreshPicksPayload(picksData);
 
         setOpenPositions(positions);
         if (uiPrefsData && typeof uiPrefsData.show_ticker_banner === "boolean") {
@@ -3434,7 +3444,7 @@ export default function App() {
         setPdtUsed(statsData.pdt_used || 0);
         setPdtRemaining(statsData.pdt_remaining ?? 3);
         buildPerfHistory(perfData, positions);
-        setNnPicks(prev => hasVisiblePicksPayload(nnPicksData || {}) ? nnPicksData : prev);
+        setNnPicks(nnPicksData || { recommended_longs: [], recommended_shorts: [] });
         setNnPositions(nnPositionsData || []);
         setNnStats(nnStatsData);
         setNnPerfHistory(nnPerfData || []);
@@ -3555,7 +3565,7 @@ export default function App() {
         setOpenPositions(positions);
         setTodayClosed(closedData || []);
         if (statsData?.open_execution) setOpenExecution(statsData.open_execution);
-        setNnPicks(prev => hasVisiblePicksPayload(nnPicksData || {}) ? nnPicksData : prev);
+        setNnPicks(nnPicksData || { recommended_longs: [], recommended_shorts: [] });
         setNnPositions(nnPositionsData || []);
         setNnStats(nnStatsData);
         setNnPerfHistory(nnPerfData || []);
