@@ -6272,9 +6272,26 @@ def derive_intraday_range_pct_from_scan(stock_data):
     return ((high - low) / price) * 100
 
 
-def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, confluence=None, signal_values=None):
+def _legacy_signal_score_to_delta(score):
+    """Conservative fallback when legacy scored RS but raw 5-day deltas are absent."""
+    number = _first_scan_number({"score": score}, "score")
+    if number is None:
+        return None
+    if number >= 0.9:
+        return 3.0
+    if number >= 0.7:
+        return 1.0
+    if number >= 0.4:
+        return 0.0
+    if number >= 0.2:
+        return -1.0
+    return -3.0
+
+
+def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, confluence=None, signal_values=None, signal_scores=None):
     """Translate the current scan payload into the Scoring V2 contract for shadow mode."""
     signal_values = signal_values or {}
+    signal_scores = signal_scores or {}
     days_to_earnings = earnings_soon.get(ticker, 99) if isinstance(earnings_soon, dict) else 99
     rs_values = signal_values.get("relative_strength") if isinstance(signal_values.get("relative_strength"), dict) else {}
     sector_values = signal_values.get("sector_relative_strength") if isinstance(signal_values.get("sector_relative_strength"), dict) else {}
@@ -6283,10 +6300,14 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
     relative_strength_delta = None
     if rs_values.get("stock_5d") is not None and rs_values.get("spy_5d") is not None:
         relative_strength_delta = float(rs_values["stock_5d"]) - float(rs_values["spy_5d"])
+    if relative_strength_delta is None:
+        relative_strength_delta = _legacy_signal_score_to_delta(signal_scores.get("relative_strength"))
 
     sector_relative_strength_delta = None
     if sector_values.get("etf_5d") is not None and sector_values.get("spy_5d") is not None:
         sector_relative_strength_delta = float(sector_values["etf_5d"]) - float(sector_values["spy_5d"])
+    if sector_relative_strength_delta is None:
+        sector_relative_strength_delta = _legacy_signal_score_to_delta(signal_scores.get("sector_relative_strength"))
 
     average_volume = derive_average_volume_from_scan(stock_data)
     average_daily_dollar_volume = derive_average_daily_dollar_volume_from_scan(stock_data)
@@ -6333,6 +6354,8 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
         "regular_baseline_median_volume": stock_data.get("regular_baseline_median_volume"),
         "relative_strength_delta": relative_strength_delta,
         "sector_relative_strength_delta": sector_relative_strength_delta,
+        "relative_strength_source": "raw_5d_delta" if rs_values.get("stock_5d") is not None and rs_values.get("spy_5d") is not None else "legacy_score_fallback",
+        "sector_relative_strength_source": "raw_5d_delta" if sector_values.get("etf_5d") is not None and sector_values.get("spy_5d") is not None else "legacy_score_fallback",
         "sr_analysis": stock_data.get("sr_analysis"),
         "vwap_delta_pct": vwap_delta_pct,
         "hv_ratio": hv_ratio,
@@ -6343,10 +6366,10 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
     }
 
 
-def build_scoring_v2_shadow(ticker, stock_data, rsi, earnings_soon, weights, brain="Vector", confluence=None, signal_values=None):
+def build_scoring_v2_shadow(ticker, stock_data, rsi, earnings_soon, weights, brain="Vector", confluence=None, signal_values=None, signal_scores=None):
     """Run Scoring V2 in non-authoritative shadow mode and return a compact-safe payload."""
     try:
-        payload = build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, confluence, signal_values)
+        payload = build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, confluence, signal_values, signal_scores)
         result = score_stock_v2(payload, strategy="SwingDesk", brain=brain, weights=weights)
         return {
             **result,
@@ -6377,6 +6400,11 @@ def build_scoring_v2_shadow_from_cached_pick(pick, weights, brain="Vector"):
     signal_values = (
         pick.get("signal_values_for_observation")
         or (pick.get("signal_scores") or {}).get("values")
+        or {}
+    )
+    signal_scores = (
+        pick.get("signal_scores_for_observation")
+        or (pick.get("signal_scores") or {}).get("scores")
         or {}
     )
     days_to_earnings = pick.get("days_to_earnings")
@@ -6415,6 +6443,7 @@ def build_scoring_v2_shadow_from_cached_pick(pick, weights, brain="Vector"):
         brain=brain,
         confluence=pick.get("confluence_methods") or [],
         signal_values=signal_values,
+        signal_scores=signal_scores,
     )
 
 
@@ -6444,6 +6473,14 @@ def summarize_scoring_v2_shadow(picks):
     }
 
 
+def format_v2_cap_label(cap):
+    if not isinstance(cap, dict):
+        return str(cap)
+    if cap.get("name") == "missing_active_signal" and cap.get("reason"):
+        return str(cap["reason"]).replace(" is missing", "_missing").replace(" ", "_")
+    return cap.get("name") or cap.get("reason") or str(cap)
+
+
 def scoring_v2_card_row(pick, brain="Vector", variant=None, source_scan_time=None):
     """Serialize one full-scan V2 row into the compact card/diagnostic shape."""
     shadow = pick.get("scoring_v2_shadow") or {}
@@ -6451,6 +6488,7 @@ def scoring_v2_card_row(pick, brain="Vector", variant=None, source_scan_time=Non
     legacy_expected_move = pick.get("long_move") or pick.get("expected_move")
     v2_score = shadow.get("score")
     v2_expected_move = shadow.get("expected_move")
+
     return {
         "ticker": pick.get("ticker"),
         "name": pick.get("name"),
@@ -6509,7 +6547,7 @@ def scoring_v2_card_row(pick, brain="Vector", variant=None, source_scan_time=Non
         "v2_actionable": shadow.get("actionable"),
         "v2_blocked": shadow.get("blocked"),
         "v2_block_reasons": shadow.get("block_reasons", []),
-        "v2_caps": [cap.get("name") for cap in shadow.get("caps_applied", []) if isinstance(cap, dict)],
+        "v2_caps": [format_v2_cap_label(cap) for cap in shadow.get("caps_applied", [])],
         "v2_explanation": shadow.get("explanation"),
     }
 
@@ -7582,6 +7620,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
             brain="Vector",
             confluence=confluence,
             signal_values=long_signal_values,
+            signal_scores=long_signal_scores,
         )
         average_volume = derive_average_volume_from_scan(stock_data)
         average_daily_dollar_volume = derive_average_daily_dollar_volume_from_scan(stock_data)
@@ -7640,7 +7679,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
             "scoring_v2_blocked": scoring_v2_shadow.get("blocked"),
             "scoring_v2_score_band": scoring_v2_shadow.get("score_band"),
             "scoring_v2_block_reasons": scoring_v2_shadow.get("block_reasons", []),
-            "scoring_v2_caps": [cap.get("name") for cap in scoring_v2_shadow.get("caps_applied", [])],
+            "scoring_v2_caps": [format_v2_cap_label(cap) for cap in scoring_v2_shadow.get("caps_applied", [])],
         }
         scored_stocks.append(attach_ticker_profile(scored_row))
 
@@ -8350,6 +8389,7 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
                 brain="Nova",
                 confluence=base.get("confluence_methods") or [],
                 signal_values=sig_values,
+                signal_scores=sig_scores,
             )
             nova_pick = {
                 **base,
@@ -8371,7 +8411,7 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
                 "scoring_v2_blocked": scoring_v2_shadow.get("blocked"),
                 "scoring_v2_score_band": scoring_v2_shadow.get("score_band"),
                 "scoring_v2_block_reasons": scoring_v2_shadow.get("block_reasons", []),
-                "scoring_v2_caps": [cap.get("name") for cap in scoring_v2_shadow.get("caps_applied", [])],
+                "scoring_v2_caps": [format_v2_cap_label(cap) for cap in scoring_v2_shadow.get("caps_applied", [])],
             }
             nova_pick["nn_executable"] = is_long_pick_eligible(
                 nova_pick,
@@ -10541,7 +10581,7 @@ def api_scoring_v2_shadow():
                     "v2_actionable": shadow.get("actionable"),
                     "v2_blocked": shadow.get("blocked"),
                     "v2_block_reasons": shadow.get("block_reasons", []),
-                    "v2_caps": [cap.get("name") for cap in shadow.get("caps_applied", []) if isinstance(cap, dict)],
+                    "v2_caps": [format_v2_cap_label(cap) for cap in shadow.get("caps_applied", [])],
                     "decision_authority": shadow.get("decision_authority", "legacy_scoring"),
                 })
             return output
@@ -10570,7 +10610,7 @@ def api_scoring_v2_shadow():
                 "v2_actionable": shadow.get("actionable"),
                 "v2_blocked": shadow.get("blocked"),
                 "v2_block_reasons": shadow.get("block_reasons", []),
-                "v2_caps": [cap.get("name") for cap in shadow.get("caps_applied", []) if isinstance(cap, dict)],
+                "v2_caps": [format_v2_cap_label(cap) for cap in shadow.get("caps_applied", [])],
                 "v2_explanation": shadow.get("explanation"),
                 "decision_authority": shadow.get("decision_authority", "legacy_scoring"),
             }

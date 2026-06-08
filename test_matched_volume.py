@@ -151,6 +151,36 @@ class MatchedVolumeTest(unittest.TestCase):
         self.assertEqual(payload["completed_session_relative_volume"], 2.4)
         self.assertEqual(payload["daily_average_relative_volume"], 2.4)
 
+    def test_signal_score_fallback_fills_missing_rs_deltas(self):
+        payload = build_scoring_v2_shadow_input(
+            "APTV",
+            {
+                "price": 80,
+                "previous_close": 78,
+                "open": 79,
+                "gap_percent": 2,
+                "day_change_percent": 1,
+                "volume_ratio": 1.5,
+                "volume_source": "last_session",
+                "volume_baseline_sessions": 20,
+            },
+            58,
+            {},
+            signal_values={
+                "relative_strength": {"stock_5d": None, "spy_5d": None},
+                "sector_relative_strength": {"etf_5d": None, "spy_5d": None},
+            },
+            signal_scores={
+                "relative_strength": 0.75,
+                "sector_relative_strength": 0.5,
+            },
+        )
+
+        self.assertEqual(payload["relative_strength_delta"], 1.0)
+        self.assertEqual(payload["sector_relative_strength_delta"], 0.0)
+        self.assertEqual(payload["relative_strength_source"], "legacy_score_fallback")
+        self.assertEqual(payload["sector_relative_strength_source"], "legacy_score_fallback")
+
 
 if __name__ == "__main__":
     unittest.main()
