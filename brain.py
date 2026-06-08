@@ -5114,18 +5114,30 @@ def enrich_matched_volume_context(tickers, price_data, now_central=None, scan_ev
         scan_event_id=scan_event_id,
         phase="fetching_matched_volume",
         current_ticker=None,
+        total_scanned=len(price_data),
+        total_expected=len(tickers),
+        matched_volume_attempted=0,
+        matched_volume_candidates=len(candidates),
     )
 
     updated = 0
+    started = time.time()
+    max_seconds = float(os.getenv("SCAN_MATCHED_VOLUME_MAX_SECONDS", "180"))
     for idx, ticker in enumerate(candidates, start=1):
+        if time.time() - started > max_seconds:
+            log.warning(f"Matched-volume refresh budget exhausted after {time.time() - started:.1f}s")
+            break
         if idx == 1 or idx % 10 == 0 or idx == len(candidates):
             record_nn_scan_status(
                 status="running",
                 phase="fetching_matched_volume",
                 scan_event_id=scan_event_id,
-                total_scanned=idx,
-                total_expected=len(candidates),
+                total_scanned=len(price_data),
+                total_expected=len(tickers),
                 current_ticker=ticker,
+                matched_volume_attempted=idx,
+                matched_volume_candidates=len(candidates),
+                matched_volume_updated=updated,
             )
         bars = fetch_intraday_volume_bars(ticker, now_central=now_central)
         if not bars:
@@ -5830,12 +5842,12 @@ def enrich_price_data_with_history(tickers, price_data, scan_event_id=None, scan
         record_nn_scan_status(
             status="running",
             scan_type=scan_type,
-            phase="scoring",
+            phase="preparing_context",
             scan_event_id=scan_event_id,
-            total_scanned=0,
+            total_scanned=len(price_data),
             total_expected=len(tickers),
             current_ticker=None,
-            scanned_tickers=[],
+            scanned_tickers=list(price_data.keys())[-12:],
         )
 
 def run_darvas_silent_collection(price_data, scored_stocks):
@@ -7839,11 +7851,11 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         already_running=False,
         started_at=current_time_cst().isoformat(),
         finished_at=None,
-        total_scanned=0,
+        total_scanned=len(price_data),
         total_expected=len(universe),
-        scanned_tickers=[],
+        scanned_tickers=list(price_data.keys())[-12:],
         current_ticker=None,
-        phase="scoring",
+        phase="preparing_context",
         scan_event_id=scan_event_id,
         error=None,
     )
