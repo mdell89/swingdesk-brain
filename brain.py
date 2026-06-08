@@ -5922,6 +5922,48 @@ def calculate_sector_relative_strength(ticker, price_data):
     except:
         return 0.5
 
+SECTOR_ETF_MAP = {
+    "Tech": "XLK", "Finance": "XLF", "Energy": "XLE",
+    "Healthcare": "XLV", "Industrial": "XLI", "Consumer": "XLY",
+    "Defense": "XLI", "Auto": "XLY", "Crypto": "XLK",
+    "ETF": None, "Other": None,
+}
+
+
+def five_day_return_pct(history):
+    """Return the same 5-session return legacy RS scoring uses, or None."""
+    if not isinstance(history, list) or len(history) < 5:
+        return None
+    try:
+        start = float(history[-5].get("close") or 0)
+        end = float(history[-1].get("close") or 0)
+    except Exception:
+        return None
+    if start <= 0 or end <= 0:
+        return None
+    return round((end - start) / start * 100, 2)
+
+
+def derive_relative_strength_values(ticker, price_data):
+    """Raw stock-vs-SPY 5-day values for V2 and display payloads."""
+    if ticker not in price_data or "SPY" not in price_data:
+        return {"stock_5d": None, "spy_5d": None, "delta": None}
+    stock_5d = five_day_return_pct((price_data.get(ticker) or {}).get("daily_history"))
+    spy_5d = five_day_return_pct((price_data.get("SPY") or {}).get("daily_history"))
+    delta = round(stock_5d - spy_5d, 2) if stock_5d is not None and spy_5d is not None else None
+    return {"stock_5d": stock_5d, "spy_5d": spy_5d, "delta": delta}
+
+
+def derive_sector_relative_strength_values(ticker, price_data):
+    """Raw sector-ETF-vs-SPY 5-day values for V2 and display payloads."""
+    sector_etf = SECTOR_ETF_MAP.get(get_sector(ticker))
+    if not sector_etf or sector_etf not in price_data or "SPY" not in price_data:
+        return {"etf": sector_etf, "etf_5d": None, "spy_5d": None, "delta": None}
+    etf_5d = five_day_return_pct((price_data.get(sector_etf) or {}).get("daily_history"))
+    spy_5d = five_day_return_pct((price_data.get("SPY") or {}).get("daily_history"))
+    delta = round(etf_5d - spy_5d, 2) if etf_5d is not None and spy_5d is not None else None
+    return {"etf": sector_etf, "etf_5d": etf_5d, "spy_5d": spy_5d, "delta": delta}
+
 
 def calculate_vwap_signal(ticker, price_data):
     """
@@ -6070,33 +6112,16 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
 
     # RS vs Market — compute diff for display
     rs_score = calculate_relative_strength(ticker, universe_data)
-    rs_stock_5d, rs_spy_5d = None, None
-    try:
-        ticker_history = universe_data[ticker].get("daily_history", [])
-        spy_history = universe_data.get("SPY", {}).get("daily_history", [])
-        if len(ticker_history) >= 5 and len(spy_history) >= 5:
-            rs_stock_5d = round((ticker_history[-1]["close"] - ticker_history[-5]["close"]) / max(ticker_history[-5]["close"], 0.01) * 100, 2)
-            rs_spy_5d = round((spy_history[-1]["close"] - spy_history[-5]["close"]) / max(spy_history[-5]["close"], 0.01) * 100, 2)
-    except: pass
+    rs_values = derive_relative_strength_values(ticker, universe_data)
+    rs_stock_5d, rs_spy_5d = rs_values.get("stock_5d"), rs_values.get("spy_5d")
     if direction == "short": rs_score = 1.0 - rs_score
 
     # Sector RS — compute diff + ETF name for display
     sector_rs_score = calculate_sector_relative_strength(ticker, universe_data)
-    sector_etf_name, sector_etf_5d, sector_spy_5d = None, None, None
-    try:
-        SECTOR_ETF_MAP = {
-            "Tech": "XLK", "Finance": "XLF", "Energy": "XLE",
-            "Healthcare": "XLV", "Industrial": "XLI", "Consumer": "XLY",
-            "Defense": "XLI", "Auto": "XLY", "Crypto": "XLK",
-        }
-        sector_etf_name = SECTOR_ETF_MAP.get(get_sector(ticker))
-        if sector_etf_name and sector_etf_name in universe_data and "SPY" in universe_data:
-            etf_hist = universe_data[sector_etf_name].get("daily_history", [])
-            spy_hist = universe_data.get("SPY", {}).get("daily_history", [])
-            if len(etf_hist) >= 5 and len(spy_hist) >= 5:
-                sector_etf_5d = round((etf_hist[-1]["close"] - etf_hist[-5]["close"]) / max(etf_hist[-5]["close"], 0.01) * 100, 2)
-                sector_spy_5d = round((spy_hist[-1]["close"] - spy_hist[-5]["close"]) / max(spy_hist[-5]["close"], 0.01) * 100, 2)
-    except: pass
+    sector_values = derive_sector_relative_strength_values(ticker, universe_data)
+    sector_etf_name = sector_values.get("etf")
+    sector_etf_5d = sector_values.get("etf_5d")
+    sector_spy_5d = sector_values.get("spy_5d")
     if direction == "short": sector_rs_score = 1.0 - sector_rs_score
 
     # VWAP — capture mode + distance
@@ -6305,17 +6330,27 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
     sector_values = signal_values.get("sector_relative_strength") if isinstance(signal_values.get("sector_relative_strength"), dict) else {}
     vwap_values = signal_values.get("vwap_reclaim") if isinstance(signal_values.get("vwap_reclaim"), dict) else {}
 
-    relative_strength_delta = None
+    relative_strength_delta = _first_scan_number(stock_data, "relative_strength_delta")
     if rs_values.get("stock_5d") is not None and rs_values.get("spy_5d") is not None:
         relative_strength_delta = float(rs_values["stock_5d"]) - float(rs_values["spy_5d"])
     if relative_strength_delta is None:
         relative_strength_delta = _legacy_signal_score_to_delta(signal_scores.get("relative_strength"))
 
-    sector_relative_strength_delta = None
+    sector_relative_strength_delta = _first_scan_number(stock_data, "sector_relative_strength_delta")
     if sector_values.get("etf_5d") is not None and sector_values.get("spy_5d") is not None:
         sector_relative_strength_delta = float(sector_values["etf_5d"]) - float(sector_values["spy_5d"])
     if sector_relative_strength_delta is None:
         sector_relative_strength_delta = _legacy_signal_score_to_delta(signal_scores.get("sector_relative_strength"))
+    relative_strength_source = (
+        "scan_raw_delta" if _first_scan_number(stock_data, "relative_strength_delta") is not None
+        else "raw_5d_delta" if rs_values.get("stock_5d") is not None and rs_values.get("spy_5d") is not None
+        else "legacy_score_fallback"
+    )
+    sector_relative_strength_source = (
+        "scan_raw_delta" if _first_scan_number(stock_data, "sector_relative_strength_delta") is not None
+        else "raw_5d_delta" if sector_values.get("etf_5d") is not None and sector_values.get("spy_5d") is not None
+        else "legacy_score_fallback"
+    )
 
     average_volume = derive_average_volume_from_scan(stock_data)
     average_daily_dollar_volume = derive_average_daily_dollar_volume_from_scan(stock_data)
@@ -6362,8 +6397,13 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
         "regular_baseline_median_volume": stock_data.get("regular_baseline_median_volume"),
         "relative_strength_delta": relative_strength_delta,
         "sector_relative_strength_delta": sector_relative_strength_delta,
-        "relative_strength_source": "raw_5d_delta" if rs_values.get("stock_5d") is not None and rs_values.get("spy_5d") is not None else "legacy_score_fallback",
-        "sector_relative_strength_source": "raw_5d_delta" if sector_values.get("etf_5d") is not None and sector_values.get("spy_5d") is not None else "legacy_score_fallback",
+        "relative_strength_source": relative_strength_source,
+        "sector_relative_strength_source": sector_relative_strength_source,
+        "stock_5d_return": stock_data.get("stock_5d_return") if stock_data.get("stock_5d_return") is not None else rs_values.get("stock_5d"),
+        "spy_5d_return": stock_data.get("spy_5d_return") if stock_data.get("spy_5d_return") is not None else rs_values.get("spy_5d"),
+        "sector_etf": stock_data.get("sector_etf") if stock_data.get("sector_etf") is not None else sector_values.get("etf"),
+        "sector_etf_5d_return": stock_data.get("sector_etf_5d_return") if stock_data.get("sector_etf_5d_return") is not None else sector_values.get("etf_5d"),
+        "sector_spy_5d_return": stock_data.get("sector_spy_5d_return") if stock_data.get("sector_spy_5d_return") is not None else sector_values.get("spy_5d"),
         "sr_analysis": stock_data.get("sr_analysis"),
         "vwap_delta_pct": vwap_delta_pct,
         "hv_ratio": hv_ratio,
@@ -6519,6 +6559,13 @@ def scoring_v2_card_row(pick, brain="Vector", variant=None, source_scan_time=Non
         "premarket_baseline_median_volume": pick.get("premarket_baseline_median_volume"),
         "regular_cumulative_volume": pick.get("regular_cumulative_volume"),
         "regular_baseline_median_volume": pick.get("regular_baseline_median_volume"),
+        "relative_strength_delta": pick.get("relative_strength_delta"),
+        "sector_relative_strength_delta": pick.get("sector_relative_strength_delta"),
+        "stock_5d_return": pick.get("stock_5d_return"),
+        "spy_5d_return": pick.get("spy_5d_return"),
+        "sector_etf": pick.get("sector_etf"),
+        "sector_etf_5d_return": pick.get("sector_etf_5d_return"),
+        "sector_spy_5d_return": pick.get("sector_spy_5d_return"),
         "overnight_gap_pct": pick.get("overnight_gap_pct") if pick.get("overnight_gap_pct") is not None else pick.get("gap_percent"),
         "day_change_pct": (
             pick.get("day_change_pct")
@@ -7620,6 +7667,17 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         long_signal_scores, long_fired_signals, long_signal_values = compute_signal_scores(
             ticker, price_data, rsi, earnings_soon, weights, "long"
         )
+        rs_raw = long_signal_values.get("relative_strength") if isinstance(long_signal_values.get("relative_strength"), dict) else {}
+        sector_rs_raw = long_signal_values.get("sector_relative_strength") if isinstance(long_signal_values.get("sector_relative_strength"), dict) else {}
+        if rs_raw.get("stock_5d") is not None and rs_raw.get("spy_5d") is not None:
+            stock_data["stock_5d_return"] = rs_raw.get("stock_5d")
+            stock_data["spy_5d_return"] = rs_raw.get("spy_5d")
+            stock_data["relative_strength_delta"] = round(float(rs_raw["stock_5d"]) - float(rs_raw["spy_5d"]), 2)
+        if sector_rs_raw.get("etf_5d") is not None and sector_rs_raw.get("spy_5d") is not None:
+            stock_data["sector_etf"] = sector_rs_raw.get("etf")
+            stock_data["sector_etf_5d_return"] = sector_rs_raw.get("etf_5d")
+            stock_data["sector_spy_5d_return"] = sector_rs_raw.get("spy_5d")
+            stock_data["sector_relative_strength_delta"] = round(float(sector_rs_raw["etf_5d"]) - float(sector_rs_raw["spy_5d"]), 2)
         scoring_v2_shadow = build_scoring_v2_shadow(
             ticker,
             stock_data,
@@ -7652,6 +7710,13 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
             "premarket_baseline_median_volume": stock_data.get("premarket_baseline_median_volume"),
             "regular_cumulative_volume": stock_data.get("regular_cumulative_volume"),
             "regular_baseline_median_volume": stock_data.get("regular_baseline_median_volume"),
+            "relative_strength_delta": stock_data.get("relative_strength_delta"),
+            "sector_relative_strength_delta": stock_data.get("sector_relative_strength_delta"),
+            "stock_5d_return": stock_data.get("stock_5d_return"),
+            "spy_5d_return": stock_data.get("spy_5d_return"),
+            "sector_etf": stock_data.get("sector_etf"),
+            "sector_etf_5d_return": stock_data.get("sector_etf_5d_return"),
+            "sector_spy_5d_return": stock_data.get("sector_spy_5d_return"),
             "average_volume": average_volume,
             "average_daily_dollar_volume": average_daily_dollar_volume,
             "overnight_gap_pct": round(stock_data.get("gap_percent", 0), 2),

@@ -40,6 +40,9 @@ sys.modules.setdefault("torch.optim", fake_torch.optim)
 from brain import (
     build_scoring_v2_shadow_input,
     calculate_matched_volume_from_bars,
+    derive_relative_strength_values,
+    derive_sector_relative_strength_values,
+    five_day_return_pct,
     filter_scoring_v2_variant_rows,
 )
 
@@ -50,6 +53,55 @@ def et_timestamp(day, hour, minute):
 
 
 class MatchedVolumeTest(unittest.TestCase):
+    def test_raw_five_day_rs_values_are_exact_scan_inputs(self):
+        history = [{"close": value} for value in [100, 101, 102, 103, 110]]
+        self.assertAlmostEqual(five_day_return_pct(history), 10.0)
+
+        price_data = {
+            "AAPL": {"daily_history": [{"close": value} for value in [100, 100, 100, 100, 110]]},
+            "SPY": {"daily_history": [{"close": value} for value in [100, 100, 100, 100, 105]]},
+            "XLK": {"daily_history": [{"close": value} for value in [100, 100, 100, 100, 112]]},
+        }
+        rs = derive_relative_strength_values("AAPL", price_data)
+
+        self.assertEqual(rs["stock_5d"], 10.0)
+        self.assertEqual(rs["spy_5d"], 5.0)
+        self.assertEqual(rs["delta"], 5.0)
+        sector = derive_sector_relative_strength_values("AAPL", price_data)
+        self.assertEqual(sector["etf"], "XLK")
+        self.assertEqual(sector["etf_5d"], 12.0)
+        self.assertEqual(sector["spy_5d"], 5.0)
+        self.assertEqual(sector["delta"], 7.0)
+
+    def test_v2_prefers_scan_raw_rs_delta_over_score_fallback(self):
+        payload = build_scoring_v2_shadow_input(
+            "ABC",
+            {
+                "price": 50,
+                "previous_close": 48,
+                "open": 49,
+                "gap_percent": 2,
+                "day_change_percent": 1,
+                "relative_strength_delta": 4.25,
+                "sector_relative_strength_delta": 1.75,
+                "stock_5d_return": 7.5,
+                "spy_5d_return": 3.25,
+                "sector_etf": "XLK",
+                "sector_etf_5d_return": 5.0,
+                "sector_spy_5d_return": 3.25,
+            },
+            58,
+            {},
+            signal_scores={"relative_strength": 0.2, "sector_relative_strength": 0.2},
+        )
+
+        self.assertEqual(payload["relative_strength_delta"], 4.25)
+        self.assertEqual(payload["sector_relative_strength_delta"], 1.75)
+        self.assertEqual(payload["relative_strength_source"], "scan_raw_delta")
+        self.assertEqual(payload["sector_relative_strength_source"], "scan_raw_delta")
+        self.assertEqual(payload["stock_5d_return"], 7.5)
+        self.assertEqual(payload["sector_etf"], "XLK")
+
     def test_premarket_relative_volume_uses_same_premarket_window(self):
         today = datetime(2026, 6, 8).date()
         bars = [
