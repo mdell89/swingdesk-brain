@@ -4577,6 +4577,72 @@ def fetch_entry_prices_at_cst(tickers, target_dt_cst):
     set_app_state("last_price_provider_summary", json.dumps(cycle.summary()))
     return results
 
+
+def completed_session_volume_ratio(history):
+    """Use the latest completed daily candle as off-hours volume context."""
+    if not history:
+        return None
+    completed = [row for row in history if isinstance(row, dict) and float(row.get("volume") or 0) > 0]
+    if not completed:
+        return None
+    latest = completed[-1]
+    baseline_rows = completed[-21:-1] or completed[:-1] or completed
+    volumes = [float(row.get("volume") or 0) for row in baseline_rows if float(row.get("volume") or 0) > 0]
+    if not volumes:
+        return None
+    average_volume = sum(volumes) / len(volumes)
+    if average_volume <= 0:
+        return None
+    return {
+        "volume": float(latest.get("volume") or 0),
+        "average_volume": average_volume,
+        "volume_ratio": float(latest.get("volume") or 0) / average_volume,
+        "volume_source": "last_session",
+        "volume_baseline_sessions": len(volumes),
+        "volume_session_date": latest.get("date"),
+    }
+
+
+def apply_volume_context_from_history(quote, history, market_open=None):
+    """Populate average volume and choose live vs last-session volume ratio."""
+    if not quote or not history:
+        return quote
+    vols = [float(h.get("volume") or 0) for h in history if isinstance(h, dict) and float(h.get("volume") or 0) > 0]
+    if not vols:
+        return quote
+    avg_vol = sum(vols) / len(vols)
+    quote["average_volume"] = avg_vol
+
+    market_open = is_market_open() if market_open is None else bool(market_open)
+    live_volume = float(quote.get("volume") or 0)
+    if market_open and live_volume > 0:
+        quote["volume_ratio"] = live_volume / max(avg_vol, 1)
+        quote["volume_source"] = "live"
+        quote["volume_baseline_sessions"] = len(vols)
+        return quote
+
+    context = completed_session_volume_ratio(history)
+    if context:
+        quote.update(context)
+    return quote
+
+
+def apply_volume_context_to_price_data(price_data, market_open=None):
+    """Refresh volume context for all rows that already have daily history."""
+    if not isinstance(price_data, dict):
+        return 0
+    updated = 0
+    for row in price_data.values():
+        if not isinstance(row, dict) or not row.get("daily_history"):
+            continue
+        before = row.get("volume_source"), row.get("volume_ratio")
+        apply_volume_context_from_history(row, row.get("daily_history"), market_open=market_open)
+        after = row.get("volume_source"), row.get("volume_ratio")
+        if after != before:
+            updated += 1
+    return updated
+
+
 def fetch_twelve_data_batch(tickers, interval="1day", outputsize=60):
     """
     Fetch OHLCV + history for multiple tickers.
@@ -4603,11 +4669,7 @@ def fetch_twelve_data_batch(tickers, interval="1day", outputsize=60):
 
         # Compute average volume from history
         if history:
-            vols = [h["volume"] for h in history if h["volume"] > 0]
-            avg_vol = sum(vols) / max(len(vols), 1)
-            quote["average_volume"] = avg_vol
-            quote["volume"] = history[-1]["volume"] if history else 0
-            quote["volume_ratio"] = quote["volume"] / max(avg_vol, 1)
+            apply_volume_context_from_history(quote, history)
 
         results[ticker] = quote
         time.sleep(RATE_LIMIT_DELAY)
@@ -4655,12 +4717,7 @@ def fetch_twelve_data_live(tickers):
                 cached = cached_raw.get(ticker, {})
                 hist = cached.get("daily_history", [])
                 if hist:
-                    latest = hist[-1]
-                    vol = latest.get("volume", 0)
-                    avg_vol = sum(h.get("volume", 0) for h in hist[-20:]) / max(len(hist[-20:]), 1)
-                    results[ticker]["volume"] = vol
-                    results[ticker]["average_volume"] = max(avg_vol, 1)
-                    results[ticker]["volume_ratio"] = vol / max(avg_vol, 1) if avg_vol > 0 else 1.0
+                    apply_volume_context_from_history(results[ticker], hist)
     except Exception as e:
         log.debug(f"Volume enrichment skipped: {e}")
 
@@ -4747,11 +4804,7 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
                 if history:
                     results[ticker]["daily_history"] = history
                     repair_quote_baselines_from_history(results[ticker], history)
-                    vols = [h["volume"] for h in history if h["volume"] > 0]
-                    if vols:
-                        avg_vol = sum(vols) / len(vols)
-                        results[ticker]["average_volume"] = avg_vol
-                        results[ticker]["volume_ratio"] = quote.get("volume", 0) / max(avg_vol, 1)
+                    apply_volume_context_from_history(results[ticker], history)
                 # Cache it
                 try:
                     database = get_database()
@@ -5231,9 +5284,7 @@ def enrich_price_data_with_history(tickers, price_data, scan_event_id=None, scan
         if ticker in supplemental and "daily_history" in supplemental[ticker]:
             price_data[ticker]["daily_history"] = supplemental[ticker]["daily_history"]
             repair_quote_baselines_from_history(price_data[ticker], price_data[ticker]["daily_history"])
-            price_data[ticker]["average_volume"] = supplemental[ticker].get("average_volume") or derive_average_volume_from_scan(price_data[ticker])
-            price_data[ticker]["volume"] = supplemental[ticker].get("volume", price_data[ticker].get("volume"))
-            price_data[ticker]["volume_ratio"] = supplemental[ticker].get("volume_ratio", price_data[ticker].get("volume_ratio", 1.0))
+            apply_volume_context_from_history(price_data[ticker], price_data[ticker]["daily_history"])
     if scan_event_id:
         record_nn_scan_status(
             status="running",
@@ -6010,6 +6061,8 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
         "rsi": rsi,
         # Time-matched volume is not available yet; daily-average fallback is intentionally capped by V2.
         "daily_average_relative_volume": stock_data.get("volume_ratio"),
+        "volume_source": stock_data.get("volume_source"),
+        "volume_baseline_sessions": stock_data.get("volume_baseline_sessions"),
         "relative_strength_delta": relative_strength_delta,
         "sector_relative_strength_delta": sector_relative_strength_delta,
         "sr_analysis": stock_data.get("sr_analysis"),
@@ -6135,6 +6188,8 @@ def scoring_v2_card_row(pick, brain="Vector", variant=None, source_scan_time=Non
         "vol_ratio": pick.get("vol_ratio") or pick.get("volume_ratio"),
         "average_volume": pick.get("average_volume") or pick.get("avg_volume"),
         "average_daily_dollar_volume": pick.get("average_daily_dollar_volume") or pick.get("avg_daily_dollar_volume"),
+        "volume_source": pick.get("volume_source"),
+        "volume_baseline_sessions": pick.get("volume_baseline_sessions"),
         "overnight_gap_pct": pick.get("overnight_gap_pct") if pick.get("overnight_gap_pct") is not None else pick.get("gap_percent"),
         "day_change_pct": (
             pick.get("day_change_pct")
@@ -7133,6 +7188,9 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
     # During pre/post market hours, override stale daily closes with live prices
     enrich_with_live_prices(universe_with_spy, price_data)
     enrich_price_data_with_history(universe_with_spy, price_data, scan_event_id=scan_event_id, scan_type=scan_type)
+    volume_context_updates = apply_volume_context_to_price_data(price_data)
+    if volume_context_updates:
+        log.info(f"Volume context updated from daily history for {volume_context_updates} scan rows")
 
     # Filter out tickers where yfinance returned weekend/holiday stale data.
     # If the latest price date is more than 3 days old, the data is stale.
@@ -7239,6 +7297,8 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
             "prev_close": stock_data.get("previous_close", stock_data["price"]),
             "rsi": round(rsi, 1),
             "vol_ratio": round(stock_data.get("volume_ratio", 1), 2),
+            "volume_source": stock_data.get("volume_source"),
+            "volume_baseline_sessions": stock_data.get("volume_baseline_sessions"),
             "average_volume": average_volume,
             "average_daily_dollar_volume": average_daily_dollar_volume,
             "overnight_gap_pct": round(stock_data.get("gap_percent", 0), 2),
