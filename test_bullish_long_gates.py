@@ -139,6 +139,37 @@ class BullishLongGateTest(unittest.TestCase):
         self.assertAlmostEqual(quote["previous_close"], 2.55)
         self.assertAlmostEqual(quote["day_change_percent"], 1.568627450980386)
 
+    def test_missing_previous_close_is_not_actionable_without_history_repair(self):
+        quote = validate_quote_baselines({
+            "ticker": "BITF",
+            "price": 2.59,
+            "previous_close": 2.59,
+            "previous_close_missing": True,
+            "open": 2.59,
+        })
+
+        self.assertTrue(quote["price_baseline_suspect"])
+        self.assertFalse(is_long_pick_eligible({
+            "ticker": "BITF",
+            "price": quote["price"],
+            "long_conf": 80,
+            "long_move": 7,
+            "previous_close_missing": True,
+            "freshness_status": quote["freshness_status"],
+            "price_baseline_suspect": True,
+        }))
+
+    def test_old_cached_premarket_spike_field_is_not_actionable(self):
+        self.assertFalse(is_long_pick_eligible({
+            "ticker": "BITF",
+            "price": 2.59,
+            "long_conf": 80,
+            "long_move": 7,
+            "pct_change_premarket": 159.0,
+            "day_change_pct": 0.0,
+            "gap_percent": 0.0,
+        }))
+
 
 if __name__ == "__main__":
     unittest.main()

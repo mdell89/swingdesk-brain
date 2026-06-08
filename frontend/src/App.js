@@ -183,13 +183,16 @@ function cacheFreshPicksPayload(payload) {
 
 function mapPickFields(pick) {
   const normalized = withNormalizedSignals(pick);
+  const primaryMetricIsGap = String(pick.primary_metric_label || "").toLowerCase() === "gap";
+  const gapMetric = Number(pick.overnight_gap_pct ?? pick.gap_percent);
+  const displayDayChange = getDisplayDayChangePercent(pick);
   return {
     ...normalized,
     lc: pick.long_conf, sc: pick.short_conf,
     lm: pick.long_move, sm: pick.short_move,
     lr: pick.long_reasoning, sr: pick.short_reasoning,
     st: pick.sell_time,
-    dayChg: getDisplayDayChangePercent(pick),
+    dayChg: primaryMetricIsGap && Number.isFinite(gapMetric) && Math.abs(gapMetric) <= 60 ? gapMetric : displayDayChange,
   };
 }
 
@@ -639,7 +642,10 @@ function getClosedTradePnlDollars(trade = {}, feeAdjusted = true) {
 function getDisplayDayChangePercent(item = {}) {
   const numeric = [];
   for (const key of ["pct_change_prev_close", "day_change_pct", "day_change_percent", "pct_change_premarket"]) {
-    if (item[key] != null && Number.isFinite(Number(item[key]))) numeric.push(Number(item[key]));
+    if (item[key] != null && Number.isFinite(Number(item[key]))) {
+      const value = Number(item[key]);
+      if (Math.abs(value) <= 60) numeric.push(value);
+    }
   }
   const nonZero = numeric.find(value => Math.abs(value) > 0.0001);
   return nonZero ?? numeric[0] ?? 0;
@@ -2753,8 +2759,10 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
                 long_conf: row.v2_score ?? row.long_conf ?? 0,
                 long_move: row.v2_expected_move ?? row.long_move ?? row.legacy_expected_move ?? 0,
                 long_reasoning: row.v2_explanation || row.long_reasoning,
-                pct_change_prev_close: row.overnight_gap_pct ?? row.gap_percent ?? row.day_change_pct ?? row.day_change_percent ?? 0,
-                day_change_pct: row.overnight_gap_pct ?? row.gap_percent ?? row.day_change_pct ?? row.day_change_percent ?? 0,
+                pct_change_prev_close: row.day_change_pct ?? row.day_change_percent ?? row.pct_change_prev_close ?? 0,
+                day_change_pct: row.day_change_pct ?? row.day_change_percent ?? row.pct_change_prev_close ?? 0,
+                overnight_gap_pct: row.overnight_gap_pct ?? row.gap_percent ?? 0,
+                gap_percent: row.gap_percent ?? row.overnight_gap_pct ?? 0,
                 source_scan_time: row.source_scan_time || (config.brain === "Nova" ? payload?.nova_cached_at : payload?.vector_cached_at),
                 price_provider: row.price_provider || "cached shadow",
                 primary_metric_label: "Gap",
@@ -2828,8 +2836,10 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
               long_conf: row.v2_score ?? row.long_conf ?? 0,
               long_move: row.v2_expected_move ?? row.long_move ?? row.legacy_expected_move ?? 0,
               long_reasoning: row.v2_explanation || row.long_reasoning,
-              pct_change_prev_close: row.overnight_gap_pct ?? row.gap_percent ?? row.day_change_pct ?? row.day_change_percent ?? 0,
-              day_change_pct: row.overnight_gap_pct ?? row.gap_percent ?? row.day_change_pct ?? row.day_change_percent ?? 0,
+              pct_change_prev_close: row.day_change_pct ?? row.day_change_percent ?? row.pct_change_prev_close ?? 0,
+              day_change_pct: row.day_change_pct ?? row.day_change_percent ?? row.pct_change_prev_close ?? 0,
+              overnight_gap_pct: row.overnight_gap_pct ?? row.gap_percent ?? 0,
+              gap_percent: row.gap_percent ?? row.overnight_gap_pct ?? 0,
               primary_metric_label: "Gap",
               move_metric_label: "Est",
               confidence_metric_label: "V2",

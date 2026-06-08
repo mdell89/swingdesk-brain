@@ -2958,6 +2958,7 @@ def _write_quote_cache(ticker, data):
 
 def _normalize_quote(price, previous_close=None, open_price=None, high=None, low=None, source="unknown"):
     price = float(price)
+    previous_close_missing = previous_close in (None, 0, "")
     prev = float(previous_close if previous_close not in (None, 0) else price)
     open_value = float(open_price if open_price not in (None, 0) else price)
     high_value = float(high if high not in (None, 0) else price)
@@ -2975,6 +2976,7 @@ def _normalize_quote(price, previous_close=None, open_price=None, high=None, low
         "day_change_pct": (price - prev) / max(prev, 0.01) * 100,
         "day_change_percent": (price - prev) / max(prev, 0.01) * 100,
         "source": source,
+        "previous_close_missing": bool(previous_close_missing),
     }
 
 def _first_number(*values):
@@ -3085,6 +3087,8 @@ def validate_quote_baselines(quote, history=None):
             quote["day_change_pct"] = day_change
         if gap_change is not None:
             quote["gap_percent"] = gap_change
+        if quote.get("previous_close_missing") and not quote.get("baseline_repaired_from_history"):
+            return mark_suspicious_price_baseline(quote, "missing verified previous close baseline")
         if (
             (day_change is not None and abs(day_change) > MAX_PLAUSIBLE_QUOTE_CHANGE_PCT)
             or (gap_change is not None and abs(gap_change) > MAX_PLAUSIBLE_QUOTE_CHANGE_PCT)
@@ -3564,6 +3568,27 @@ def numeric_pick_value(pick, *keys):
             pass
     return None
 
+def implausible_price_change_reasons(row):
+    """Detect impossible-looking cached percent fields before scoring/trading."""
+    if not row:
+        return ["missing price row"]
+    reasons = []
+    for label, keys in (
+        ("day change", ("pct_change_prev_close", "day_change_pct", "day_change_percent")),
+        ("premarket change", ("pct_change_premarket", "premarket_change_percent")),
+        ("gap", ("overnight_gap_pct", "gap_percent", "gap_pct")),
+    ):
+        value = numeric_pick_value(row, *keys)
+        if value is not None and abs(value) > MAX_PLAUSIBLE_QUOTE_CHANGE_PCT:
+            reasons.append(f"{label} {value:.1f}% exceeds plausible quote-change ceiling of {MAX_PLAUSIBLE_QUOTE_CHANGE_PCT:.0f}%")
+    price = numeric_pick_value(row, "price", "current_price", "last_price")
+    previous_close = numeric_pick_value(row, "previous_close", "prev_close")
+    if price is not None and previous_close is not None:
+        recomputed = pct_from_baseline(price, previous_close)
+        if recomputed is not None and abs(recomputed) > MAX_PLAUSIBLE_QUOTE_CHANGE_PCT:
+            reasons.append(f"price vs previous close implies {recomputed:.1f}%, above plausible quote-change ceiling")
+    return reasons
+
 def is_stale_price_context(row):
     """Rows from stale cache can support diagnostics but cannot be actionable picks."""
     if not row:
@@ -3572,6 +3597,7 @@ def is_stale_price_context(row):
     return (
         bool(row.get("stale_cache_fallback"))
         or bool(row.get("price_baseline_suspect"))
+        or bool(implausible_price_change_reasons(row))
         or freshness in {"stale", "stale_cache", "stale_cache_fallback", "suspect", "suspect_baseline"}
     )
 
@@ -3579,7 +3605,7 @@ def bullish_price_action_block_reasons(pick):
     """Hard long-side price-action blocks for broad bullish SwingDesk picks."""
     gap = numeric_pick_value(pick, "overnight_gap_pct", "gap_percent", "gap_pct")
     day_change = numeric_pick_value(pick, "pct_change_prev_close", "day_change_pct", "day_change_percent")
-    reasons = []
+    reasons = implausible_price_change_reasons(pick)
     if gap is not None and gap <= MAX_LONG_GAP_DOWN_PCT:
         reasons.append(f"gap {gap:.1f}% is below the bullish floor of {MAX_LONG_GAP_DOWN_PCT:.1f}%")
     if day_change is not None and day_change <= MAX_LONG_RED_DAY_PCT:
@@ -3852,6 +3878,25 @@ def normalize_v2_preview_row(row):
     expected = _first_scan_number(row, "v2_expected_move", "long_move", "legacy_expected_move")
     blocked = bool(row.get("v2_blocked"))
     trade_reasons = list(row.get("v2_trade_gate_reasons") or [])
+    integrity_reasons = implausible_price_change_reasons(row)
+    if integrity_reasons:
+        row["v2_actionable"] = False
+        row["v2_blocked"] = True
+        existing_blocks = list(row.get("v2_block_reasons") or [])
+        for reason in integrity_reasons:
+            if reason not in existing_blocks:
+                existing_blocks.append(reason)
+        row["v2_block_reasons"] = existing_blocks
+        existing_caps = list(row.get("v2_caps") or [])
+        if "suspect_price_baseline" not in existing_caps:
+            existing_caps.append("suspect_price_baseline")
+        row["v2_caps"] = existing_caps
+        row["freshness_status"] = "stale"
+        row["price_source_freshness"] = "suspect_baseline"
+        row["price_baseline_suspect"] = True
+        row["price_baseline_suspect_reason"] = integrity_reasons[0]
+        row["v2_explanation"] = f"{row.get('ticker')} blocked: {integrity_reasons[0]}"
+        return row
     if score is not None and score >= 65 and not blocked and expected is not None and expected < DEFAULT_EXPECTED_MOVE_FLOOR:
         reason = f"expected move {expected:.1f}% below {DEFAULT_EXPECTED_MOVE_FLOOR:.1f}% trade floor"
         if reason not in trade_reasons:
