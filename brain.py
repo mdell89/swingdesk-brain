@@ -174,7 +174,7 @@ Confidence Floor:
     it has meaningful conviction about.
 """
 
-import os, json, sqlite3, time, logging, threading, random, math
+import os, json, sqlite3, time, logging, threading, random, math, socket
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -188,6 +188,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 load_dotenv()
+socket.setdefaulttimeout(float(os.getenv("GLOBAL_HTTP_TIMEOUT_SECONDS", "10")))
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_KEY") or os.getenv("ANTHROPIC_API_KEY")
@@ -4522,7 +4523,7 @@ def _history_from_yfinance(ticker, days=60):
 # to serve a full scan universe.
 HISTORY_PROVIDER_CHAIN = [p.strip() for p in os.getenv(
     "HISTORY_PROVIDER_CHAIN",
-    "massive,twelve_data,yfinance,finnhub"
+    "massive,twelve_data,finnhub"
 ).split(",") if p.strip()]
 
 _HISTORY_PROVIDERS = {
@@ -5004,9 +5005,10 @@ def fetch_intraday_volume_bars(ticker, now_central=None, lookback_days=32):
     bars = fetch_massive_intraday_volume_bars(ticker, start_et, end_et, multiplier=5)
     if not bars:
         bars = fetch_massive_intraday_volume_bars(ticker, start_et, end_et, multiplier=15)
-    if not bars:
+    yfinance_enabled = os.getenv("SCAN_ENABLE_YFINANCE_VOLUME_FALLBACK", "0").lower() in {"1", "true", "yes", "on"}
+    if not bars and yfinance_enabled:
         bars = fetch_yfinance_intraday_volume_bars(ticker, days=min(lookback_days, 30), interval="5m")
-    if not bars:
+    if not bars and yfinance_enabled:
         bars = fetch_yfinance_intraday_volume_bars(ticker, days=min(lookback_days, 30), interval="15m")
     return bars
 
@@ -5244,7 +5246,7 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
     # Load fresh cached prices first. Rows without fetched_at are stale because
     # stale previous_close values corrupt %CHG and gap math.
     results = {}
-    max_cache_age_seconds = int(os.getenv("SCAN_PRICE_CACHE_SECONDS", "900"))
+    max_cache_age_seconds = int(os.getenv("SCAN_PRICE_CACHE_SECONDS", "3600"))
 
     try:
         database = get_database()
@@ -5274,15 +5276,32 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
 
     # Fetch fresh quotes for missing or stale tickers — max 60 per cycle
     missing = [t for t in tickers if t not in results]
-    refresh_limit = int(os.getenv("SCAN_PRICE_REFRESH_LIMIT", str(len(missing))))
+    refresh_limit = int(os.getenv("SCAN_PRICE_REFRESH_LIMIT", "160"))
     to_refresh = missing[:refresh_limit]
 
     if to_refresh:
-        log.info(f"Refreshing {len(to_refresh)} tickers from Finnhub...")
-        RATE_DELAY = 2.2
+        log.info(f"Refreshing {len(to_refresh)}/{len(missing)} stale/missing tickers from price providers...")
+        RATE_DELAY = float(os.getenv("SCAN_PRICE_REFRESH_DELAY_SECONDS", "0.75"))
+        max_fetch_seconds = float(os.getenv("SCAN_PRICE_FETCH_MAX_SECONDS", "900"))
+        fetch_started = time.time()
         cycle = ProviderCycle("comprehensive_quote")
         refreshed_tickers = []
         for idx, ticker in enumerate(to_refresh, start=1):
+            elapsed = time.time() - fetch_started
+            if elapsed > max_fetch_seconds:
+                log.warning(f"Price refresh budget exhausted after {elapsed:.1f}s; continuing scan with {len(results)}/{len(tickers)} tickers")
+                record_nn_scan_status(
+                    status="running",
+                    scan_type=scan_type,
+                    phase="fetching_prices_budget_exhausted",
+                    scan_event_id=scan_event_id,
+                    total_scanned=len(results),
+                    total_expected=len(tickers),
+                    current_ticker=ticker,
+                    scanned_tickers=refreshed_tickers[-12:],
+                    warning="price_refresh_budget_exhausted",
+                )
+                break
             if scan_event_id and (idx == 1 or idx % 5 == 0 or idx == len(to_refresh)):
                 record_nn_scan_status(
                     status="running",
@@ -5330,6 +5349,8 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
                 )
             time.sleep(RATE_DELAY)
         set_app_state("last_price_provider_summary", json.dumps(cycle.summary()))
+    elif missing:
+        log.info(f"Using cached scan price rows; {len(missing)} stale/missing tickers left for future scans")
 
     log.info(f"fetch_price_data complete: {len(results)}/{len(tickers)} tickers")
     return results
