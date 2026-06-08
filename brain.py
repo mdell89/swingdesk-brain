@@ -4643,6 +4643,264 @@ def apply_volume_context_to_price_data(price_data, market_open=None):
     return updated
 
 
+def _median_number(values):
+    clean = sorted(float(value) for value in values if value is not None and float(value) > 0)
+    if not clean:
+        return None
+    mid = len(clean) // 2
+    if len(clean) % 2:
+        return clean[mid]
+    return (clean[mid - 1] + clean[mid]) / 2
+
+
+def _bar_datetime_et(bar):
+    raw = bar.get("timestamp") if isinstance(bar, dict) else None
+    if raw is None:
+        raw = bar.get("t") if isinstance(bar, dict) else None
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, str):
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        else:
+            raw_number = float(raw)
+            if raw_number > 10_000_000_000:
+                raw_number = raw_number / 1000
+            parsed = datetime.fromtimestamp(raw_number, tz=ZoneInfo("UTC"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+        return parsed.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        return None
+
+
+def fetch_massive_intraday_volume_bars(ticker, start_et, end_et, multiplier=5):
+    """Fetch 5/15-minute volume bars in Eastern time from Massive/Polygon."""
+    if not MASSIVE_API_KEY:
+        return []
+    try:
+        import urllib.parse
+        import urllib.request
+
+        eastern = ZoneInfo("America/New_York")
+        start_aware = start_et.replace(tzinfo=eastern) if start_et.tzinfo is None else start_et
+        end_aware = end_et.replace(tzinfo=eastern) if end_et.tzinfo is None else end_et
+        from_ms = int(start_aware.astimezone(ZoneInfo("UTC")).timestamp() * 1000)
+        to_ms = int(end_aware.astimezone(ZoneInfo("UTC")).timestamp() * 1000)
+        encoded_ticker = urllib.parse.quote(ticker.upper())
+        params = urllib.parse.urlencode({
+            "adjusted": "false",
+            "sort": "asc",
+            "limit": 50000,
+            "apiKey": MASSIVE_API_KEY,
+        })
+        url = (
+            f"{MASSIVE_BASE}/v2/aggs/ticker/{encoded_ticker}/range/"
+            f"{multiplier}/minute/{from_ms}/{to_ms}?{params}"
+        )
+        with urllib.request.urlopen(url, timeout=12) as resp:
+            data = json.loads(resp.read())
+
+        status_text = str(data.get("status") or data.get("error") or "").lower()
+        if data.get("error") or status_text in ("error", "auth_failed"):
+            log.debug(f"Massive intraday volume error {ticker}: {data.get('error') or data.get('message') or data.get('status')}")
+            return []
+        rows = []
+        for row in data.get("results") or []:
+            ts = row.get("t") or row.get("timestamp")
+            vol = _first_number(row.get("v"), row.get("volume"))
+            if ts is not None and vol is not None and vol > 0:
+                rows.append({"timestamp": ts, "volume": float(vol), "source": f"massive_{multiplier}m"})
+        return rows
+    except Exception as exc:
+        log.debug(f"Massive intraday volume fetch failed for {ticker}: {exc}")
+        return []
+
+
+def fetch_yfinance_intraday_volume_bars(ticker, days=30, interval="5m"):
+    """Recent intraday volume fallback with pre/post-market bars enabled."""
+    try:
+        import yfinance as yf
+
+        frame = yf.download(
+            ticker,
+            period=f"{days}d",
+            interval=interval,
+            prepost=True,
+            auto_adjust=True,
+            progress=False,
+        )
+        if frame is None or frame.empty:
+            return []
+
+        rows = []
+        for idx, row in frame.iterrows():
+            volume = row.get("Volume")
+            if hasattr(volume, "iloc"):
+                volume = volume.iloc[0]
+            if volume is None or float(volume or 0) <= 0:
+                continue
+            timestamp = idx.to_pydatetime()
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=ZoneInfo("America/New_York"))
+            rows.append({
+                "timestamp": timestamp.astimezone(ZoneInfo("UTC")).timestamp(),
+                "volume": float(volume),
+                "source": f"yfinance_{interval}",
+            })
+        return rows
+    except Exception as exc:
+        log.debug(f"yfinance intraday volume fetch failed for {ticker}: {exc}")
+        return []
+
+
+def fetch_intraday_volume_bars(ticker, now_central=None, lookback_days=32):
+    """Provider fallback for intraday volume history used by V2 matched-volume metrics."""
+    now_central = now_central or current_time_cst()
+    now_et = now_central.replace(tzinfo=ZoneInfo("America/Chicago")).astimezone(ZoneInfo("America/New_York"))
+    start_et = (now_et - timedelta(days=lookback_days)).replace(hour=3, minute=45, second=0, microsecond=0)
+    end_et = now_et.replace(hour=16, minute=15, second=0, microsecond=0)
+    bars = fetch_massive_intraday_volume_bars(ticker, start_et, end_et, multiplier=5)
+    if not bars:
+        bars = fetch_massive_intraday_volume_bars(ticker, start_et, end_et, multiplier=15)
+    if not bars:
+        bars = fetch_yfinance_intraday_volume_bars(ticker, days=min(lookback_days, 30), interval="5m")
+    if not bars:
+        bars = fetch_yfinance_intraday_volume_bars(ticker, days=min(lookback_days, 30), interval="15m")
+    return bars
+
+
+def _volume_window_for_now(now_central=None, window="premarket"):
+    """Return the active exchange-time volume window for premarket or regular matching."""
+    now_central = now_central or current_time_cst()
+    central = ZoneInfo("America/Chicago")
+    eastern = ZoneInfo("America/New_York")
+    now_et = now_central.replace(tzinfo=central).astimezone(eastern)
+    if now_et.weekday() >= 5:
+        return None
+
+    if window == "premarket":
+        start = now_et.replace(hour=4, minute=0, second=0, microsecond=0)
+        end = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        if now_et < start:
+            return None
+        cutoff = min(now_et, end)
+    else:
+        start = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        end = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        if now_et < start:
+            return None
+        cutoff = min(now_et, end)
+
+    if cutoff <= start:
+        return None
+    return {"date": now_et.date(), "start": start.time(), "cutoff": cutoff.time(), "window": window}
+
+
+def calculate_matched_volume_from_bars(bars, window, max_sessions=20):
+    """Calculate cumulative same-window relative volume from intraday bars."""
+    if not bars or not window:
+        return None
+
+    by_date = {}
+    for bar in bars:
+        dt_et = _bar_datetime_et(bar)
+        volume = _first_number((bar or {}).get("volume"), (bar or {}).get("v"))
+        if not dt_et or volume is None or volume <= 0:
+            continue
+        if window["start"] <= dt_et.time() < window["cutoff"]:
+            by_date.setdefault(dt_et.date(), 0.0)
+            by_date[dt_et.date()] += float(volume)
+
+    today_volume = by_date.get(window["date"])
+    if today_volume is None or today_volume <= 0:
+        return None
+
+    prior_dates = sorted([day for day in by_date if day < window["date"]], reverse=True)
+    prior_values = [by_date[day] for day in prior_dates if by_date.get(day, 0) > 0][:max_sessions]
+    baseline = _median_number(prior_values)
+    if baseline is None or baseline <= 0:
+        return None
+
+    metric_name = "premarket_relative_volume" if window["window"] == "premarket" else "time_matched_relative_volume"
+    source_name = "premarket_time_matched" if window["window"] == "premarket" else "regular_time_matched"
+    return {
+        metric_name: today_volume / baseline,
+        f"{window['window']}_cumulative_volume": today_volume,
+        f"{window['window']}_baseline_median_volume": baseline,
+        "volume_baseline_sessions": len(prior_values),
+        "volume_source": source_name,
+    }
+
+
+def matched_volume_priority(row):
+    """Prioritize names most likely to matter for V2 actionability under provider caps."""
+    if not isinstance(row, dict):
+        return 0
+    gap = _first_number(row.get("gap_percent"), row.get("overnight_gap_pct")) or 0
+    day = _first_number(row.get("day_change_percent"), row.get("day_change_pct")) or 0
+    vol = _first_number(row.get("volume_ratio"), row.get("vol_ratio")) or 1
+    price = _first_number(row.get("price")) or 0
+    return max(gap, 0) * 3 + max(day, 0) * 2 + max(vol - 1, 0) + (1 if price >= 2 else 0)
+
+
+def enrich_matched_volume_context(tickers, price_data, now_central=None, scan_event_id=None, scan_type=None):
+    """Hydrate V2's premarket/regular time-matched volume inputs for prioritized scan rows."""
+    if not isinstance(price_data, dict):
+        return 0
+    premarket_window = _volume_window_for_now(now_central, "premarket")
+    regular_window = _volume_window_for_now(now_central, "regular")
+    if not premarket_window and not regular_window:
+        return 0
+
+    candidates = [ticker for ticker in tickers if ticker in price_data and ticker != "SPY"]
+    candidates.sort(key=lambda ticker: matched_volume_priority(price_data.get(ticker)), reverse=True)
+    limit = max(0, int(os.getenv("SCAN_MATCHED_VOLUME_REFRESH_LIMIT", "120")))
+    if limit:
+        candidates = candidates[:limit]
+    if not candidates:
+        return 0
+
+    record_nn_scan_status(
+        status="running",
+        scan_type=scan_type,
+        source="shared_comprehensive_scan",
+        scan_event_id=scan_event_id,
+        phase="fetching_matched_volume",
+        current_ticker=None,
+    )
+
+    updated = 0
+    for idx, ticker in enumerate(candidates, start=1):
+        if idx == 1 or idx % 10 == 0 or idx == len(candidates):
+            record_nn_scan_status(
+                status="running",
+                phase="fetching_matched_volume",
+                scan_event_id=scan_event_id,
+                total_scanned=idx,
+                total_expected=len(candidates),
+                current_ticker=ticker,
+            )
+        bars = fetch_intraday_volume_bars(ticker, now_central=now_central)
+        if not bars:
+            continue
+        updates = []
+        if premarket_window:
+            updates.append(calculate_matched_volume_from_bars(bars, premarket_window))
+        if regular_window:
+            updates.append(calculate_matched_volume_from_bars(bars, regular_window))
+        applied = False
+        for update in updates:
+            if not update:
+                continue
+            price_data[ticker].update(update)
+            applied = True
+        if applied:
+            updated += 1
+        time.sleep(float(os.getenv("SCAN_MATCHED_VOLUME_DELAY_SECONDS", "0.05")))
+    return updated
+
+
 def fetch_twelve_data_batch(tickers, interval="1day", outputsize=60):
     """
     Fetch OHLCV + history for multiple tickers.
@@ -6059,10 +6317,16 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
         "scan_completed_at": current_time_cst().isoformat(),
         "provider": stock_data.get("source") or stock_data.get("provider") or "scan",
         "rsi": rsi,
-        # Time-matched volume is not available yet; daily-average fallback is intentionally capped by V2.
+        "time_matched_relative_volume": stock_data.get("time_matched_relative_volume"),
+        "premarket_relative_volume": stock_data.get("premarket_relative_volume"),
+        "recent_block_volume_acceleration": stock_data.get("recent_block_volume_acceleration"),
         "daily_average_relative_volume": stock_data.get("volume_ratio"),
         "volume_source": stock_data.get("volume_source"),
         "volume_baseline_sessions": stock_data.get("volume_baseline_sessions"),
+        "premarket_cumulative_volume": stock_data.get("premarket_cumulative_volume"),
+        "premarket_baseline_median_volume": stock_data.get("premarket_baseline_median_volume"),
+        "regular_cumulative_volume": stock_data.get("regular_cumulative_volume"),
+        "regular_baseline_median_volume": stock_data.get("regular_baseline_median_volume"),
         "relative_strength_delta": relative_strength_delta,
         "sector_relative_strength_delta": sector_relative_strength_delta,
         "sr_analysis": stock_data.get("sr_analysis"),
@@ -6124,6 +6388,15 @@ def build_scoring_v2_shadow_from_cached_pick(pick, weights, brain="Vector"):
         "average_volume": pick.get("average_volume") or pick.get("avg_volume"),
         "average_daily_dollar_volume": pick.get("average_daily_dollar_volume") or pick.get("avg_daily_dollar_volume"),
         "volume_ratio": pick.get("volume_ratio") or pick.get("vol_ratio"),
+        "time_matched_relative_volume": pick.get("time_matched_relative_volume"),
+        "premarket_relative_volume": pick.get("premarket_relative_volume"),
+        "recent_block_volume_acceleration": pick.get("recent_block_volume_acceleration"),
+        "volume_source": pick.get("volume_source"),
+        "volume_baseline_sessions": pick.get("volume_baseline_sessions"),
+        "premarket_cumulative_volume": pick.get("premarket_cumulative_volume"),
+        "premarket_baseline_median_volume": pick.get("premarket_baseline_median_volume"),
+        "regular_cumulative_volume": pick.get("regular_cumulative_volume"),
+        "regular_baseline_median_volume": pick.get("regular_baseline_median_volume"),
         "source": pick.get("data_source") or pick.get("source") or pick.get("provider"),
         "sr_analysis": pick.get("sr_analysis"),
         "atr_percent": pick.get("atr_percent"),
@@ -6190,6 +6463,12 @@ def scoring_v2_card_row(pick, brain="Vector", variant=None, source_scan_time=Non
         "average_daily_dollar_volume": pick.get("average_daily_dollar_volume") or pick.get("avg_daily_dollar_volume"),
         "volume_source": pick.get("volume_source"),
         "volume_baseline_sessions": pick.get("volume_baseline_sessions"),
+        "time_matched_relative_volume": pick.get("time_matched_relative_volume"),
+        "premarket_relative_volume": pick.get("premarket_relative_volume"),
+        "premarket_cumulative_volume": pick.get("premarket_cumulative_volume"),
+        "premarket_baseline_median_volume": pick.get("premarket_baseline_median_volume"),
+        "regular_cumulative_volume": pick.get("regular_cumulative_volume"),
+        "regular_baseline_median_volume": pick.get("regular_baseline_median_volume"),
         "overnight_gap_pct": pick.get("overnight_gap_pct") if pick.get("overnight_gap_pct") is not None else pick.get("gap_percent"),
         "day_change_pct": (
             pick.get("day_change_pct")
@@ -6420,6 +6699,14 @@ def build_scoring_divergence_row(
     gap = _first_present(input_snapshot.get("gap_percent"), stock_data.get("gap_percent"), pick.get("overnight_gap_pct"), pick.get("gap_percent"))
     day_change = _first_present(input_snapshot.get("day_change_percent"), stock_data.get("day_change_percent"), pick.get("day_change_pct"))
     volume_ratio = _first_present(input_snapshot.get("daily_average_relative_volume"), stock_data.get("volume_ratio"), pick.get("vol_ratio"), pick.get("volume_ratio"))
+    matched_volume = _first_present(
+        input_snapshot.get("time_matched_relative_volume"),
+        input_snapshot.get("premarket_relative_volume"),
+        stock_data.get("time_matched_relative_volume"),
+        stock_data.get("premarket_relative_volume"),
+        pick.get("time_matched_relative_volume"),
+        pick.get("premarket_relative_volume"),
+    )
     rs_delta = _first_present(
         input_snapshot.get("relative_strength_delta"),
         _delta_from_signal_values(signal_values, "relative_strength", "stock_5d", "spy_5d"),
@@ -6445,7 +6732,7 @@ def build_scoring_divergence_row(
         "gap_percent": _divergence_float(gap),
         "day_change_percent": _divergence_float(day_change),
         "volume_ratio": _divergence_float(volume_ratio),
-        "time_matched_relative_volume": _divergence_float(input_snapshot.get("time_matched_relative_volume")),
+        "time_matched_relative_volume": _divergence_float(matched_volume),
         "volume_baseline_sessions": _divergence_int(input_snapshot.get("volume_baseline_sessions")),
         "volume_source": input_snapshot.get("volume_source") or stock_data.get("volume_source"),
         "rsi": _divergence_float(_first_present(input_snapshot.get("rsi"), pick.get("rsi"))),
@@ -7191,6 +7478,14 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
     volume_context_updates = apply_volume_context_to_price_data(price_data)
     if volume_context_updates:
         log.info(f"Volume context updated from daily history for {volume_context_updates} scan rows")
+    matched_volume_updates = enrich_matched_volume_context(
+        universe,
+        price_data,
+        scan_event_id=scan_event_id,
+        scan_type=scan_type,
+    )
+    if matched_volume_updates:
+        log.info(f"Matched volume context updated for {matched_volume_updates} scan rows")
 
     # Filter out tickers where yfinance returned weekend/holiday stale data.
     # If the latest price date is more than 3 days old, the data is stale.
@@ -7299,6 +7594,12 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
             "vol_ratio": round(stock_data.get("volume_ratio", 1), 2),
             "volume_source": stock_data.get("volume_source"),
             "volume_baseline_sessions": stock_data.get("volume_baseline_sessions"),
+            "time_matched_relative_volume": stock_data.get("time_matched_relative_volume"),
+            "premarket_relative_volume": stock_data.get("premarket_relative_volume"),
+            "premarket_cumulative_volume": stock_data.get("premarket_cumulative_volume"),
+            "premarket_baseline_median_volume": stock_data.get("premarket_baseline_median_volume"),
+            "regular_cumulative_volume": stock_data.get("regular_cumulative_volume"),
+            "regular_baseline_median_volume": stock_data.get("regular_baseline_median_volume"),
             "average_volume": average_volume,
             "average_daily_dollar_volume": average_daily_dollar_volume,
             "overnight_gap_pct": round(stock_data.get("gap_percent", 0), 2),
