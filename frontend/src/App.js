@@ -2709,9 +2709,11 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
                 long_conf: row.v2_score ?? row.long_conf ?? 0,
                 long_move: row.v2_expected_move ?? row.long_move ?? row.legacy_expected_move ?? 0,
                 long_reasoning: row.v2_explanation || row.long_reasoning,
+                pct_change_prev_close: row.overnight_gap_pct ?? row.gap_percent ?? row.day_change_pct ?? row.day_change_percent ?? 0,
+                day_change_pct: row.overnight_gap_pct ?? row.gap_percent ?? row.day_change_pct ?? row.day_change_percent ?? 0,
                 source_scan_time: row.source_scan_time || (config.brain === "Nova" ? payload?.nova_cached_at : payload?.vector_cached_at),
                 price_provider: row.price_provider || "cached shadow",
-                primary_metric_label: "Day",
+                primary_metric_label: "Gap",
                 move_metric_label: "Est",
                 confidence_metric_label: "V2",
               });
