@@ -4954,7 +4954,7 @@ def fetch_massive_intraday_volume_bars(ticker, start_et, end_et, multiplier=5):
             f"{MASSIVE_BASE}/v2/aggs/ticker/{encoded_ticker}/range/"
             f"{multiplier}/minute/{from_ms}/{to_ms}?{params}"
         )
-        with urllib.request.urlopen(url, timeout=12) as resp:
+        with urllib.request.urlopen(url, timeout=float(os.getenv("SCAN_INTRADAY_VOLUME_TIMEOUT_SECONDS", "4"))) as resp:
             data = json.loads(resp.read())
 
         status_text = str(data.get("status") or data.get("error") or "").lower()
@@ -5112,7 +5112,7 @@ def enrich_matched_volume_context(tickers, price_data, now_central=None, scan_ev
 
     candidates = [ticker for ticker in tickers if ticker in price_data and ticker != "SPY"]
     candidates.sort(key=lambda ticker: matched_volume_priority(price_data.get(ticker)), reverse=True)
-    limit = max(0, int(os.getenv("SCAN_MATCHED_VOLUME_REFRESH_LIMIT", "120")))
+    limit = max(0, int(os.getenv("SCAN_MATCHED_VOLUME_REFRESH_LIMIT", "20")))
     if limit:
         candidates = candidates[:limit]
     if not candidates:
@@ -5133,7 +5133,7 @@ def enrich_matched_volume_context(tickers, price_data, now_central=None, scan_ev
 
     updated = 0
     started = time.time()
-    max_seconds = float(os.getenv("SCAN_MATCHED_VOLUME_MAX_SECONDS", "180"))
+    max_seconds = float(os.getenv("SCAN_MATCHED_VOLUME_MAX_SECONDS", "45"))
     for idx, ticker in enumerate(candidates, start=1):
         if time.time() - started > max_seconds:
             log.warning(f"Matched-volume refresh budget exhausted after {time.time() - started:.1f}s")
@@ -5273,6 +5273,7 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
     # stale previous_close values corrupt %CHG and gap math.
     results = {}
     max_cache_age_seconds = int(os.getenv("SCAN_PRICE_CACHE_SECONDS", "3600"))
+    max_stale_cache_age_seconds = int(os.getenv("SCAN_PRICE_STALE_FALLBACK_SECONDS", "21600"))
 
     try:
         database = get_database()
@@ -5285,10 +5286,16 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
                     payload = json.loads(cached["value"])
                     if isinstance(payload, dict) and "data" in payload:
                         fetched_at = datetime.fromisoformat(payload.get("fetched_at"))
-                        if (current_time_cst() - fetched_at).total_seconds() > max_cache_age_seconds:
+                        age_seconds = (current_time_cst() - fetched_at).total_seconds()
+                        if age_seconds > max_stale_cache_age_seconds:
                             continue
                         data = payload.get("data") or {}
                         data["cached_at"] = payload.get("fetched_at")
+                        if age_seconds > max_cache_age_seconds:
+                            data["stale_cache_fallback"] = True
+                            data["price_source_freshness"] = "stale_cache_fallback"
+                        else:
+                            data["price_source_freshness"] = "fresh_cache"
                     else:
                         continue
                     results[ticker] = data
@@ -5298,7 +5305,8 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
     except Exception as e:
         log.debug(f"Cache load error: {e}")
 
-    log.info(f"Cache hit: {len(results)}/{len(tickers)} tickers")
+    stale_cache_count = sum(1 for row in results.values() if row.get("stale_cache_fallback"))
+    log.info(f"Cache hit: {len(results)}/{len(tickers)} tickers ({stale_cache_count} stale fallback)")
     if scan_event_id:
         record_nn_scan_status(
             status="running",
@@ -5310,17 +5318,19 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
             current_ticker=None,
             scanned_tickers=[],
             price_cache_hits=len(results),
+            stale_cache_fallback_count=stale_cache_count,
         )
 
     # Fetch fresh quotes for missing or stale tickers — max 60 per cycle
+    stale = [t for t in tickers if t in results and results[t].get("stale_cache_fallback")]
     missing = [t for t in tickers if t not in results]
-    refresh_limit = int(os.getenv("SCAN_PRICE_REFRESH_LIMIT", "80"))
-    to_refresh = missing[:refresh_limit]
+    refresh_limit = int(os.getenv("SCAN_PRICE_REFRESH_LIMIT", "40"))
+    to_refresh = list(dict.fromkeys(missing + stale))[:refresh_limit]
 
     if to_refresh:
-        log.info(f"Refreshing {len(to_refresh)}/{len(missing)} stale/missing tickers from price providers...")
+        log.info(f"Refreshing {len(to_refresh)} bounded stale/missing tickers from price providers ({len(missing)} missing, {len(stale)} stale)...")
         RATE_DELAY = float(os.getenv("SCAN_PRICE_REFRESH_DELAY_SECONDS", "0.25"))
-        max_fetch_seconds = float(os.getenv("SCAN_PRICE_FETCH_MAX_SECONDS", "600"))
+        max_fetch_seconds = float(os.getenv("SCAN_PRICE_FETCH_MAX_SECONDS", "180"))
         fetch_started = time.time()
         cycle = ProviderCycle("comprehensive_quote")
         refreshed_tickers = []
@@ -5359,12 +5369,6 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
             if quote:
                 results[ticker] = quote
                 refreshed_tickers.append(ticker)
-                # Fetch candle history for fresh tickers
-                history = fetch_daily_history(ticker, days=60)
-                if history:
-                    results[ticker]["daily_history"] = history
-                    repair_quote_baselines_from_history(results[ticker], history)
-                    apply_volume_context_from_history(results[ticker], history)
                 # Cache it
                 try:
                     database = get_database()
@@ -5829,7 +5833,7 @@ def enrich_price_data_with_history(tickers, price_data, scan_event_id=None, scan
         data = price_data.get(ticker, {}) or {}
         return max(abs(float(data.get("gap_percent") or 0)), abs(float(data.get("day_change_percent") or 0)))
 
-    max_history_fetch = int(os.getenv("SCAN_HISTORY_REFRESH_LIMIT", "40"))
+    max_history_fetch = int(os.getenv("SCAN_HISTORY_REFRESH_LIMIT", "15"))
     selected = sorted(missing, key=history_priority, reverse=True)[:max_history_fetch]
     log.info(f"Fetching history for {len(selected)}/{len(missing)} tickers missing daily_history...")
     if scan_event_id:
@@ -5843,12 +5847,29 @@ def enrich_price_data_with_history(tickers, price_data, scan_event_id=None, scan
             current_ticker=selected[0] if selected else None,
             scanned_tickers=selected[:12],
         )
-    supplemental = fetch_twelve_data_batch(selected, interval="1day", outputsize=60)
-    for ticker in missing:
-        if ticker in supplemental and "daily_history" in supplemental[ticker]:
-            price_data[ticker]["daily_history"] = supplemental[ticker]["daily_history"]
-            repair_quote_baselines_from_history(price_data[ticker], price_data[ticker]["daily_history"])
-            apply_volume_context_from_history(price_data[ticker], price_data[ticker]["daily_history"])
+    started = time.time()
+    max_seconds = float(os.getenv("SCAN_HISTORY_REFRESH_MAX_SECONDS", "45"))
+    for idx, ticker in enumerate(selected, start=1):
+        if time.time() - started > max_seconds:
+            log.warning(f"History refresh budget exhausted after {time.time() - started:.1f}s")
+            break
+        if scan_event_id and (idx == 1 or idx == len(selected) or idx % 5 == 0):
+            record_nn_scan_status(
+                status="running",
+                scan_type=scan_type,
+                phase="fetching_history",
+                scan_event_id=scan_event_id,
+                total_scanned=len(price_data),
+                total_expected=len(tickers),
+                current_ticker=ticker,
+                history_refresh_attempted=idx,
+                history_refresh_candidates=len(selected),
+            )
+        history = fetch_daily_history(ticker, days=60)
+        if history:
+            price_data[ticker]["daily_history"] = history
+            repair_quote_baselines_from_history(price_data[ticker], history)
+            apply_volume_context_from_history(price_data[ticker], history)
     if scan_event_id:
         record_nn_scan_status(
             status="running",
