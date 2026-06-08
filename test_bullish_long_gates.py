@@ -39,6 +39,7 @@ from brain import (
     calculate_confidence_score,
     estimate_overnight_move,
     is_long_pick_eligible,
+    validate_quote_baselines,
 )
 
 
@@ -98,6 +99,45 @@ class BullishLongGateTest(unittest.TestCase):
 
         self.assertEqual(confidence, 0)
         self.assertEqual(expected_move, neutral_gap_move)
+
+    def test_implausible_quote_baseline_is_not_actionable(self):
+        quote = validate_quote_baselines({
+            "ticker": "BITF",
+            "price": 2.59,
+            "previous_close": 1.0,
+            "open": 2.59,
+            "gap_percent": 159.0,
+            "day_change_percent": 159.0,
+        })
+
+        self.assertTrue(quote["price_baseline_suspect"])
+        self.assertFalse(is_long_pick_eligible({
+            "ticker": "BITF",
+            "price": quote["price"],
+            "long_conf": 80,
+            "long_move": 7,
+            "gap_percent": quote["gap_percent"],
+            "day_change_percent": quote["day_change_percent"],
+            "price_baseline_suspect": quote["price_baseline_suspect"],
+            "freshness_status": quote["freshness_status"],
+        }))
+
+    def test_daily_history_repairs_bad_previous_close(self):
+        quote = validate_quote_baselines(
+            {
+                "ticker": "BITF",
+                "price": 2.59,
+                "previous_close": 1.0,
+                "open": 2.55,
+                "gap_percent": 155.0,
+                "day_change_percent": 159.0,
+            },
+            [{"date": "2026-06-05", "close": 2.55}],
+        )
+
+        self.assertFalse(quote.get("price_baseline_suspect", False))
+        self.assertAlmostEqual(quote["previous_close"], 2.55)
+        self.assertAlmostEqual(quote["day_change_percent"], 1.568627450980386)
 
 
 if __name__ == "__main__":

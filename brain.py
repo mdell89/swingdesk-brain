@@ -211,6 +211,7 @@ MAX_SHORT_PICKS      = 10        # Maximum short recommendations per scan
 MIN_VOLUME_RATIO     = 1.2       # Minimum volume activity to confirm a real setup
 MAX_LONG_GAP_DOWN_PCT = -3.0     # Bullish longs cannot start from a major gap-down.
 MAX_LONG_RED_DAY_PCT  = -3.0     # Bullish longs cannot be deep red versus prior close.
+MAX_PLAUSIBLE_QUOTE_CHANGE_PCT = float(os.getenv("MAX_PLAUSIBLE_QUOTE_CHANGE_PCT", "60"))
 MAX_ALL_VARIANT_OPEN_POSITIONS = 50
 SCAN_EVENT_RETENTION_DAYS = 30   # Raw operational scan telemetry retention
 ARCHIVED_VARIANT_OUTCOMES = ("archived_excess_open",)
@@ -2944,6 +2945,7 @@ def _read_quote_cache(ticker, max_age_seconds=QUOTE_CACHE_SECONDS):
 
 def _write_quote_cache(ticker, data):
     try:
+        data = validate_quote_baselines(dict(data), data.get("daily_history") if isinstance(data, dict) else None)
         database = get_database()
         database.execute(
             "INSERT OR REPLACE INTO app_state VALUES (?,?)",
@@ -3052,6 +3054,49 @@ def repair_quote_baselines_from_history(quote, history):
             quote["baseline_repaired_from_history"] = True
     except Exception:
         pass
+    return quote
+
+def mark_suspicious_price_baseline(quote, reason, day_change=None, gap_change=None):
+    """Flag quote rows whose baseline math is too suspicious for actionable picks."""
+    quote["price_baseline_suspect"] = True
+    quote["price_baseline_suspect_reason"] = reason
+    quote["freshness_status"] = "suspect"
+    quote["price_source_freshness"] = "suspect_baseline"
+    if day_change is not None:
+        quote["suspect_day_change_percent"] = round(float(day_change), 4)
+    if gap_change is not None:
+        quote["suspect_gap_percent"] = round(float(gap_change), 4)
+    return quote
+
+def validate_quote_baselines(quote, history=None):
+    """Repair or quarantine quote baselines before scoring/display uses them."""
+    if not quote:
+        return quote
+    if history:
+        repair_quote_baselines_from_history(quote, history)
+    try:
+        price = float(quote.get("price") or 0)
+        previous_close = float(quote.get("previous_close") or 0)
+        open_price = float(quote.get("open") or price or 0)
+        day_change = pct_from_baseline(price, previous_close)
+        gap_change = pct_from_baseline(open_price, previous_close)
+        if day_change is not None:
+            quote["day_change_percent"] = day_change
+            quote["day_change_pct"] = day_change
+        if gap_change is not None:
+            quote["gap_percent"] = gap_change
+        if (
+            (day_change is not None and abs(day_change) > MAX_PLAUSIBLE_QUOTE_CHANGE_PCT)
+            or (gap_change is not None and abs(gap_change) > MAX_PLAUSIBLE_QUOTE_CHANGE_PCT)
+        ):
+            return mark_suspicious_price_baseline(
+                quote,
+                f"quote baseline implies an implausible move above {MAX_PLAUSIBLE_QUOTE_CHANGE_PCT:.0f}%",
+                day_change=day_change,
+                gap_change=gap_change,
+            )
+    except Exception:
+        return mark_suspicious_price_baseline(quote, "quote baseline validation failed")
     return quote
 
 def canonical_signal_weights():
@@ -3524,7 +3569,11 @@ def is_stale_price_context(row):
     if not row:
         return True
     freshness = str(row.get("price_source_freshness") or row.get("freshness_status") or "").lower()
-    return bool(row.get("stale_cache_fallback")) or freshness in {"stale", "stale_cache", "stale_cache_fallback"}
+    return (
+        bool(row.get("stale_cache_fallback"))
+        or bool(row.get("price_baseline_suspect"))
+        or freshness in {"stale", "stale_cache", "stale_cache_fallback", "suspect", "suspect_baseline"}
+    )
 
 def bullish_price_action_block_reasons(pick):
     """Hard long-side price-action blocks for broad bullish SwingDesk picks."""
@@ -4238,8 +4287,6 @@ def _provider_quote(provider, ticker):
                     session.get("previous_close"),
                     previous_day.get("c"),
                     previous_day.get("close"),
-                    day.get("vw"),
-                    price,
                 )
                 open_price = _first_number(session.get("open"), day.get("o"), day.get("open"), price)
                 high = _first_number(session.get("high"), day.get("h"), day.get("high"), price)
@@ -4350,6 +4397,7 @@ def fetch_quote_with_fallback(ticker, cycle=None, use_cache=True):
         layers_used += 1
         quote, failure_type, error, global_failure = _provider_quote(provider, ticker)
         if quote:
+            quote = validate_quote_baselines(quote, quote.get("daily_history"))
             cycle.record(provider, True)
             _write_quote_cache(ticker, quote)
             return quote
@@ -5237,6 +5285,7 @@ def fetch_twelve_data_batch(tickers, interval="1day", outputsize=60):
         time.sleep(RATE_LIMIT_DELAY)
         history = fetch_daily_history(ticker, days=outputsize)
         quote["daily_history"] = history
+        validate_quote_baselines(quote, history)
 
         # Compute average volume from history
         if history:
@@ -5334,6 +5383,7 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
                         if age_seconds > max_stale_cache_age_seconds:
                             continue
                         data = payload.get("data") or {}
+                        data = validate_quote_baselines(data, data.get("daily_history"))
                         data["cached_at"] = payload.get("fetched_at")
                         if age_seconds > max_cache_age_seconds:
                             data["stale_cache_fallback"] = True
@@ -5411,6 +5461,7 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
                 )
             quote = fetch_quote_with_fallback(ticker, cycle=cycle, use_cache=False)
             if quote:
+                quote = validate_quote_baselines(quote, quote.get("daily_history"))
                 results[ticker] = quote
                 refreshed_tickers.append(ticker)
                 # Cache it
@@ -6747,6 +6798,8 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
         "freshness_status": "stale" if is_stale_price_context(stock_data) else "fresh",
         "price_source_freshness": stock_data.get("price_source_freshness"),
         "stale_cache_fallback": bool(stock_data.get("stale_cache_fallback")),
+        "price_baseline_suspect": bool(stock_data.get("price_baseline_suspect")),
+        "price_baseline_suspect_reason": stock_data.get("price_baseline_suspect_reason"),
         "scan_completed_at": current_time_cst().isoformat(),
         "provider": stock_data.get("source") or stock_data.get("provider") or "scan",
         "rsi": rsi,
@@ -6839,6 +6892,8 @@ def build_scoring_v2_shadow_from_cached_pick(pick, weights, brain="Vector"):
         "recent_block_volume_acceleration": pick.get("recent_block_volume_acceleration"),
         "volume_source": pick.get("volume_source"),
         "volume_baseline_sessions": pick.get("volume_baseline_sessions"),
+        "price_baseline_suspect": bool(pick.get("price_baseline_suspect")),
+        "price_baseline_suspect_reason": pick.get("price_baseline_suspect_reason"),
         "premarket_cumulative_volume": pick.get("premarket_cumulative_volume"),
         "premarket_baseline_median_volume": pick.get("premarket_baseline_median_volume"),
         "regular_cumulative_volume": pick.get("regular_cumulative_volume"),
@@ -6913,6 +6968,8 @@ def scoring_v2_card_row(pick, brain="Vector", variant=None, source_scan_time=Non
         "price": pick.get("price"),
         "price_source_freshness": pick.get("price_source_freshness"),
         "stale_cache_fallback": bool(pick.get("stale_cache_fallback")),
+        "price_baseline_suspect": bool(pick.get("price_baseline_suspect")),
+        "price_baseline_suspect_reason": pick.get("price_baseline_suspect_reason"),
         "freshness_status": pick.get("freshness_status"),
         "open_price": pick.get("open_price") or pick.get("open"),
         "prev_close": pick.get("prev_close") or pick.get("previous_close"),
@@ -8071,8 +8128,6 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
             pct_from_baseline(stock_data["price"], stock_data.get("previous_close")),
             stock_data.get("day_change_percent"),
             stock_data.get("day_change_pct"),
-            stock_data.get("premarket_change_percent"),
-            stock_data.get("gap_percent"),
         ) or 0
 
         scored_row = {
@@ -8118,6 +8173,8 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
             "data_source": stock_data.get("source", "unknown"),
             "price_source_freshness": stock_data.get("price_source_freshness"),
             "stale_cache_fallback": bool(stock_data.get("stale_cache_fallback")),
+            "price_baseline_suspect": bool(stock_data.get("price_baseline_suspect")),
+            "price_baseline_suspect_reason": stock_data.get("price_baseline_suspect_reason"),
             "freshness_status": "stale" if is_stale_price_context(stock_data) else "fresh",
             "52w_high": stock_data.get("52w_high"),
             "broke_52w_high_days_ago": stock_data.get("broke_52w_high_days_ago"),
