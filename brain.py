@@ -2145,14 +2145,27 @@ def acquire_comprehensive_scan_db_lock(scan_type):
             acquired_at = _parse_iso(payload.get("acquired_at"))
             age_minutes = ((now - acquired_at).total_seconds() / 60) if acquired_at else None
             if acquired_at and age_minutes is not None and age_minutes < max_age_minutes:
-                database.rollback()
-                return None, {
-                    "active": True,
-                    "scan_type": payload.get("scan_type"),
-                    "acquired_at": payload.get("acquired_at"),
-                    "age_minutes": round(age_minutes, 1),
-                    "owner": payload.get("owner"),
-                }
+                running = database.execute("""
+                    SELECT id FROM scan_events
+                    WHERE job_type='comprehensive' AND status='running'
+                    ORDER BY started_at DESC LIMIT 1
+                """).fetchone()
+                if not running:
+                    database.execute("DELETE FROM app_state WHERE key=?", [key])
+                    log.warning("Cleared orphaned comprehensive scan DB lock with no running scan event")
+                else:
+                    database.rollback()
+                    return None, {
+                        "active": True,
+                        "scan_type": payload.get("scan_type"),
+                        "acquired_at": payload.get("acquired_at"),
+                        "age_minutes": round(age_minutes, 1),
+                        "owner": payload.get("owner"),
+                        "scan_event_id": running["id"],
+                    }
+            elif row:
+                database.execute("DELETE FROM app_state WHERE key=?", [key])
+                log.warning("Cleared stale comprehensive scan DB lock beyond max age")
         payload = {
             "token": token,
             "scan_type": scan_type,
