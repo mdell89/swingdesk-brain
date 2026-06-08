@@ -2126,6 +2126,78 @@ def get_running_comprehensive_scan():
     database.close()
     return dict(row) if row else None
 
+def acquire_comprehensive_scan_db_lock(scan_type):
+    """Cross-process scan lock so Railway workers cannot overlap full scans."""
+    key = "comprehensive_scan_lock"
+    now = current_time_cst()
+    max_age_minutes = int(os.getenv("COMPREHENSIVE_SCAN_LOCK_MAX_AGE_MINUTES", "75"))
+    token = f"{now.isoformat()}:{os.getpid()}:{threading.get_ident()}:{scan_type}"
+    database = get_database()
+    try:
+        database.execute("BEGIN IMMEDIATE")
+        row = database.execute("SELECT value FROM app_state WHERE key=?", [key]).fetchone()
+        if row:
+            try:
+                payload = json.loads(row["value"] or "{}")
+            except Exception:
+                payload = {}
+            acquired_at = _parse_iso(payload.get("acquired_at"))
+            age_minutes = ((now - acquired_at).total_seconds() / 60) if acquired_at else None
+            if acquired_at and age_minutes is not None and age_minutes < max_age_minutes:
+                database.rollback()
+                return None, {
+                    "active": True,
+                    "scan_type": payload.get("scan_type"),
+                    "acquired_at": payload.get("acquired_at"),
+                    "age_minutes": round(age_minutes, 1),
+                    "owner": payload.get("owner"),
+                }
+        payload = {
+            "token": token,
+            "scan_type": scan_type,
+            "acquired_at": now.isoformat(),
+            "owner": f"pid:{os.getpid()} thread:{threading.get_ident()}",
+        }
+        database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)", [key, json.dumps(payload)])
+        database.commit()
+        return token, None
+    except Exception as error:
+        try:
+            database.rollback()
+        except Exception:
+            pass
+        log.warning(f"Could not acquire comprehensive scan DB lock: {error}")
+        return None, {"active": True, "error": str(error)}
+    finally:
+        database.close()
+
+def release_comprehensive_scan_db_lock(token):
+    """Release the cross-process comprehensive scan lock if still owned by token."""
+    if not token:
+        return
+    key = "comprehensive_scan_lock"
+    database = get_database()
+    try:
+        database.execute("BEGIN IMMEDIATE")
+        row = database.execute("SELECT value FROM app_state WHERE key=?", [key]).fetchone()
+        payload = {}
+        if row:
+            try:
+                payload = json.loads(row["value"] or "{}")
+            except Exception:
+                payload = {}
+        if payload.get("token") == token:
+            database.execute("DELETE FROM app_state WHERE key=?", [key])
+        database.commit()
+    except Exception as error:
+        try:
+            database.rollback()
+        except Exception:
+            pass
+        log.warning(f"Could not release comprehensive scan DB lock: {error}")
+    finally:
+        database.close()
+
 def record_provider_health(provider, ok, failure_type=None, error=None, cooldown_minutes=0):
     """Track provider reliability so noisy APIs can cool down or be benched."""
     now = current_time_cst()
@@ -8111,13 +8183,28 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
             "reason": "comprehensive_scan_already_running",
             "nn_picks": {"picks": 0, "qualified_count": 0, "source": "shared_comprehensive_scan"},
         }
+    db_lock_token = None
     started_after = current_time_cst().isoformat()
     try:
+        db_lock_token, active_lock = acquire_comprehensive_scan_db_lock(scan_type)
+        if not db_lock_token:
+            log.warning(f"Comprehensive scan skipped because DB lock is active ({scan_type}): {active_lock}")
+            return {
+                "longs": [],
+                "shorts": [],
+                "total_scanned": 0,
+                "scan_type": scan_type,
+                "skipped": True,
+                "reason": "comprehensive_scan_db_lock_active",
+                "active_scan": active_lock,
+                "nn_picks": {"picks": 0, "qualified_count": 0, "source": "shared_comprehensive_scan"},
+            }
         return _run_comprehensive_scan_impl(weights=weights, scan_type=scan_type)
     except Exception as error:
         mark_running_events_error("comprehensive", started_after, error)
         raise
     finally:
+        release_comprehensive_scan_db_lock(db_lock_token)
         _comprehensive_scan_lock.release()
 
 def get_cached_picks():
@@ -8170,7 +8257,7 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None, require_fr
     }
     today = current_time_cst().strftime("%Y-%m-%d")
     buy_time = buy_time or current_time_cst().strftime("%H:%M:%S")
-    target_execution_time = normalize_v2_execution_time(buy_time[:5])
+    target_execution_time = buy_time[:5]
     buy_time_parts = [int(part) for part in buy_time.split(":")[:3]]
     while len(buy_time_parts) < 3:
         buy_time_parts.append(0)
