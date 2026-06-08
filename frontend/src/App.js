@@ -467,7 +467,7 @@ function SpinePercent({ value, color, fontSize = 12, fontWeight = 600, decimals 
 }
 
 function SpineCell({ children }) {
-  return <div style={{ display: "flex", justifyContent: "center", alignItems: "center", minWidth: 0 }}>{children}</div>;
+  return <div style={{ position: "relative", display: "flex", justifyContent: "center", alignItems: "center", minWidth: 0 }}>{children}</div>;
 }
 
 function SpineTriangle({ color, expanded }) {
@@ -1457,12 +1457,17 @@ function PickCard({ pick, isLong = true, expanded, onToggle, themeKey = "black",
           </div>
           {pick.name && pick.name !== pick.ticker && <span style={{ fontSize: 9, color: T3, lineHeight: 1.2, marginTop: 1 }}>{pick.name}</span>}
         </div>
-        <div style={{ fontSize: 11, fontWeight: 600, color: dayUp ? GREEN : RED, textAlign: "center" }}>{dayUp ? "+" : ""}{dayChange.toFixed(1)}%</div>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 1 }}>
+          <span style={{ fontSize: 6, color: T3, fontWeight: 900, letterSpacing: .45, textTransform: "uppercase" }}>{pick.primary_metric_label || "Day"}</span>
+          <span style={{ fontSize: 11, fontWeight: 600, color: dayUp ? GREEN : RED, textAlign: "center" }}>{dayUp ? "+" : ""}{dayChange.toFixed(1)}%</span>
+        </div>
         <SpineCell>
+          <span style={{ position: "absolute", top: -7, left: "50%", transform: "translateX(-50%)", fontSize: 6, color: T3, fontWeight: 900, letterSpacing: .45, textTransform: "uppercase" }}>{pick.move_metric_label || "Est"}</span>
           <SpinePercent value={isLong ? estimatedMove : -estimatedMove} color={isLong ? GREEN : RED} fontSize={12} />
         </SpineCell>
         <div></div>
         <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center", alignSelf: "center" }}>
+          <span style={{ fontSize: 6, color: T3, fontWeight: 900, letterSpacing: .45, textTransform: "uppercase", marginBottom: 1 }}>{pick.confidence_metric_label || "Conf"}</span>
           <div style={{ display: "inline-flex", alignItems: "baseline", justifyContent: "flex-end", gap: 3, lineHeight: 1, fontFamily: "'DM Mono',monospace" }}>
             {isAggregateConfidence && <span style={{ fontSize: 7, fontWeight: 800, color: T3, letterSpacing: .2 }}>avg</span>}
             <span style={{ fontSize: 13, fontWeight: 700, color: borderColor }}>{confidence}%</span>
@@ -2702,10 +2707,13 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
               const pick = mapPickFields({
                 ...row,
                 long_conf: row.v2_score ?? row.long_conf ?? 0,
-                long_move: row.long_move ?? row.legacy_expected_move ?? 0,
+                long_move: row.v2_expected_move ?? row.long_move ?? row.legacy_expected_move ?? 0,
                 long_reasoning: row.v2_explanation || row.long_reasoning,
                 source_scan_time: row.source_scan_time || (config.brain === "Nova" ? payload?.nova_cached_at : payload?.vector_cached_at),
                 price_provider: row.price_provider || "cached shadow",
+                primary_metric_label: "Day",
+                move_metric_label: "Est",
+                confidence_metric_label: "V2",
               });
               return (
                 <div key={key}>

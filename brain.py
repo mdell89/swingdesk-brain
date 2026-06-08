@@ -6556,6 +6556,7 @@ def scoring_v2_card_row(pick, brain="Vector", variant=None, source_scan_time=Non
         "v2_blocked": shadow.get("blocked"),
         "v2_block_reasons": shadow.get("block_reasons", []),
         "v2_caps": [format_v2_cap_label(cap) for cap in shadow.get("caps_applied", [])],
+        "v2_expected_move": v2_expected_move,
         "v2_explanation": shadow.get("explanation"),
     }
 
@@ -10518,6 +10519,8 @@ def api_scoring_v2_shadow():
                     "v2_blocked": row.get("v2_blocked"),
                     "v2_block_reasons": row.get("v2_block_reasons", []),
                     "v2_caps": row.get("v2_caps", []),
+                    "v2_expected_move": row.get("v2_expected_move"),
+                    "long_move": row.get("long_move"),
                     "decision_authority": row.get("decision_authority", "legacy_scoring"),
                     "candidate_source": row.get("candidate_source"),
                 })
@@ -10583,12 +10586,13 @@ def api_scoring_v2_shadow():
                     "legacy_actionable": True,
                     "v2_score": shadow.get("score"),
                     "v2_score_band": shadow.get("score_band"),
-                    "v2_actionable": shadow.get("actionable"),
-                    "v2_blocked": shadow.get("blocked"),
-                    "v2_block_reasons": shadow.get("block_reasons", []),
-                    "v2_caps": [format_v2_cap_label(cap) for cap in shadow.get("caps_applied", [])],
-                    "decision_authority": shadow.get("decision_authority", "legacy_scoring"),
-                })
+                "v2_actionable": shadow.get("actionable"),
+                "v2_blocked": shadow.get("blocked"),
+                "v2_block_reasons": shadow.get("block_reasons", []),
+                "v2_caps": [format_v2_cap_label(cap) for cap in shadow.get("caps_applied", [])],
+                "v2_expected_move": shadow.get("expected_move"),
+                "decision_authority": shadow.get("decision_authority", "legacy_scoring"),
+            })
             return output
 
         def shadow_card_row(variant, pick):
@@ -10616,6 +10620,7 @@ def api_scoring_v2_shadow():
                 "v2_blocked": shadow.get("blocked"),
                 "v2_block_reasons": shadow.get("block_reasons", []),
                 "v2_caps": [format_v2_cap_label(cap) for cap in shadow.get("caps_applied", [])],
+                "v2_expected_move": shadow.get("expected_move"),
                 "v2_explanation": shadow.get("explanation"),
                 "decision_authority": shadow.get("decision_authority", "legacy_scoring"),
             }
