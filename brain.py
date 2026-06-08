@@ -1730,6 +1730,14 @@ def initialize_database():
         ("swingdesk_nova_0600_all", "SwingDesk", "Nova", "06:00", "All", "time_or_thesis", "SwingDesk / Nova / 6:00"),
         ("swingdesk_vector_0700_all", "SwingDesk", "Vector", "07:00", "All", "time_or_thesis", "SwingDesk / Vector / 7:00"),
         ("swingdesk_nova_0700_all", "SwingDesk", "Nova", "07:00", "All", "time_or_thesis", "SwingDesk / Nova / 7:00"),
+        ("v2_swingdesk_vector_0500_all", "SwingDesk V2", "Vector", "05:00", "All", "time_or_thesis", "V2 SwingDesk / Vector / 5:00"),
+        ("v2_swingdesk_nova_0500_all", "SwingDesk V2", "Nova", "05:00", "All", "time_or_thesis", "V2 SwingDesk / Nova / 5:00"),
+        ("v2_swingdesk_vector_0600_all", "SwingDesk V2", "Vector", "06:00", "All", "time_or_thesis", "V2 SwingDesk / Vector / 6:00"),
+        ("v2_swingdesk_nova_0600_all", "SwingDesk V2", "Nova", "06:00", "All", "time_or_thesis", "V2 SwingDesk / Nova / 6:00"),
+        ("v2_swingdesk_vector_0700_all", "SwingDesk V2", "Vector", "07:00", "All", "time_or_thesis", "V2 SwingDesk / Vector / 7:00"),
+        ("v2_swingdesk_nova_0700_all", "SwingDesk V2", "Nova", "07:00", "All", "time_or_thesis", "V2 SwingDesk / Nova / 7:00"),
+        ("v2_swingdesk_vector_0845_all", "SwingDesk V2", "Vector", "08:45", "All", "time_or_thesis", "V2 SwingDesk / Vector / 8:45"),
+        ("v2_swingdesk_nova_0845_all", "SwingDesk V2", "Nova", "08:45", "All", "time_or_thesis", "V2 SwingDesk / Nova / 8:45"),
         ("darvas_vector_reg_all", "Darvas", "Vector", "reg", "All", "strategy_exit", "Darvas / Vector / Reg"),
         ("darvas_nova_reg_all", "Darvas", "Nova", "reg", "All", "strategy_exit", "Darvas / Nova / Reg"),
         ("gap_go_vector_reg_all", "Gap & Go", "Vector", "reg", "All", "strategy_exit", "Gap & Go / Vector / Reg"),
@@ -3657,11 +3665,132 @@ def filter_variant_strategy_picks(picks, variant, weights=None):
 
 def filter_scoring_v2_variant_rows(rows, variant):
     """Filter read-only V2 shadow rows for variant preview without legacy pick gates."""
-    if (variant.get("strategy") or "").lower() == "swingdesk":
+    if (variant.get("strategy") or "").lower() in ("swingdesk", "swingdesk v2"):
         filtered = [row for row in rows if row.get("v2_actionable")]
         filtered.sort(key=lambda row: (float(row.get("v2_score") or 0), float(row.get("legacy_confidence") or 0)), reverse=True)
         return filtered
     return filter_variant_strategy_picks(rows, variant)
+
+def normalize_v2_preview_row(row):
+    """Keep cached Scoring V2 rows aligned with the current trade gates."""
+    row = dict(row or {})
+    score = _first_scan_number(row, "v2_score", "long_conf")
+    expected = _first_scan_number(row, "v2_expected_move", "long_move", "legacy_expected_move")
+    blocked = bool(row.get("v2_blocked"))
+    trade_reasons = list(row.get("v2_trade_gate_reasons") or [])
+    if score is not None and score >= 65 and not blocked and expected is not None and expected < DEFAULT_EXPECTED_MOVE_FLOOR:
+        reason = f"expected move {expected:.1f}% below {DEFAULT_EXPECTED_MOVE_FLOOR:.1f}% trade floor"
+        if reason not in trade_reasons:
+            trade_reasons.append(reason)
+        row["v2_actionable"] = False
+        row["v2_trade_gate_reasons"] = trade_reasons
+        row["v2_expected_move_floor"] = DEFAULT_EXPECTED_MOVE_FLOOR
+        row["v2_explanation"] = row.get("v2_explanation") or f"{row.get('ticker')} watchlist: {reason}"
+    return row
+
+def load_scoring_v2_cache_rows(database):
+    """Return the latest full-scan V2 cache with normalized Vector/Nova rows."""
+    cache_row = database.execute("SELECT value FROM app_state WHERE key=?", [SCORING_V2_SCAN_CACHE_KEY]).fetchone()
+    if not cache_row:
+        return None, [], []
+    cache = json.loads(cache_row["value"] or "{}")
+    vector_rows = [normalize_v2_preview_row(row) for row in (cache.get("vector_rows") or [])]
+    nova_rows = [normalize_v2_preview_row(row) for row in (cache.get("nova_rows") or [])]
+    return cache, vector_rows, nova_rows
+
+def normalize_v2_execution_time(slot):
+    """Map manual V2 paper-ledger runs onto the nearest configured variant time."""
+    configured = ["05:00", "06:00", "07:00", "08:45"]
+    if slot in configured:
+        return slot
+    try:
+        hour, minute = [int(part) for part in str(slot or "05:00").split(":")[:2]]
+        minutes = hour * 60 + minute
+    except Exception:
+        return "05:00"
+    configured_minutes = [(int(item[:2]) * 60 + int(item[3:]), item) for item in configured]
+    if minutes < configured_minutes[0][0]:
+        return configured[0]
+    selected = configured[0]
+    for threshold, item in configured_minutes:
+        if minutes >= threshold:
+            selected = item
+    return selected
+
+def v2_ledger_snapshot(database, trade_limit=12):
+    """Return V2-only paper ledger stats and recent/open trades for Peek."""
+    variants = [dict(r) for r in database.execute("""
+        SELECT sv.id, sv.strategy, sv.brain, sv.execution_time, sv.selection_mode, sv.label,
+               vp.cash, vp.equity, vp.realized_pnl, vp.open_value, vp.open_count,
+               vp.closed_count, vp.win_count, vp.loss_count, vp.max_drawdown_pct,
+               vp.lifecycle_status, vp.recommended_status
+        FROM strategy_variants sv
+        LEFT JOIN variant_portfolios vp ON vp.variant_id = sv.id
+        WHERE sv.status='active'
+          AND sv.strategy='SwingDesk V2'
+        ORDER BY sv.brain, sv.execution_time, sv.selection_mode
+    """).fetchall()]
+    variant_ids = [row["id"] for row in variants]
+    trades_by_variant = {variant_id: [] for variant_id in variant_ids}
+    if variant_ids:
+        placeholders = ",".join(["?"] * len(variant_ids))
+        for trade in database.execute(f"""
+            SELECT *
+            FROM variant_virtual_trades
+            WHERE variant_id IN ({placeholders})
+              AND outcome NOT IN ('archived_excess_open')
+            ORDER BY outcome='open' DESC, buy_date DESC, created_at DESC
+            LIMIT ?
+        """, [*variant_ids, max(trade_limit * len(variant_ids), trade_limit)]).fetchall():
+            row = dict(trade)
+            trades_by_variant.setdefault(row.get("variant_id"), []).append(row)
+
+    output = []
+    totals = {
+        "variant_count": len(variants),
+        "open_count": 0,
+        "closed_count": 0,
+        "win_count": 0,
+        "loss_count": 0,
+        "realized_pnl": 0.0,
+    }
+    for variant in variants:
+        wins = int(variant.get("win_count") or 0)
+        losses = int(variant.get("loss_count") or 0)
+        closed = int(variant.get("closed_count") or 0)
+        open_count = int(variant.get("open_count") or 0)
+        realized = float(variant.get("realized_pnl") or 0.0)
+        denominator = wins + losses
+        win_rate = round((wins / denominator) * 100, 1) if denominator else None
+        totals["open_count"] += open_count
+        totals["closed_count"] += closed
+        totals["win_count"] += wins
+        totals["loss_count"] += losses
+        totals["realized_pnl"] = round(totals["realized_pnl"] + realized, 4)
+        output.append({
+            "variant": variant,
+            "stats": {
+                "open_count": open_count,
+                "closed_count": closed,
+                "win_count": wins,
+                "loss_count": losses,
+                "win_rate": win_rate,
+                "realized_pnl": realized,
+                "equity": float(variant.get("equity") or 0.0),
+                "cash": float(variant.get("cash") or 0.0),
+                "open_value": float(variant.get("open_value") or 0.0),
+                "max_drawdown_pct": variant.get("max_drawdown_pct"),
+            },
+            "trades": trades_by_variant.get(variant["id"], [])[:trade_limit],
+        })
+    total_denominator = totals["win_count"] + totals["loss_count"]
+    totals["win_rate"] = round((totals["win_count"] / total_denominator) * 100, 1) if total_denominator else None
+    last_run = database.execute("SELECT value FROM app_state WHERE key='last_v2_variant_run'").fetchone()
+    try:
+        last_run_payload = json.loads(last_run["value"] or "{}") if last_run else None
+    except Exception:
+        last_run_payload = None
+    return {"summary": totals, "variants": output, "last_run": last_run_payload}
 
 def pick_confidence_and_move(pick, brain="Vector"):
     confidence = pick.get("long_conf") or pick.get("confidence") or pick.get("nn_score") or 0
@@ -8041,7 +8170,7 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None, require_fr
     }
     today = current_time_cst().strftime("%Y-%m-%d")
     buy_time = buy_time or current_time_cst().strftime("%H:%M:%S")
-    target_execution_time = buy_time[:5]
+    target_execution_time = normalize_v2_execution_time(buy_time[:5])
     buy_time_parts = [int(part) for part in buy_time.split(":")[:3]]
     while len(buy_time_parts) < 3:
         buy_time_parts.append(0)
@@ -8235,6 +8364,229 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None, require_fr
         status["success"] = False
         status["errors"].append(str(error))
         log.error(f"variant universe run failed: {error}")
+        return status
+    finally:
+        database.close()
+
+def run_v2_variant_universes_from_cache(trigger="manual_v2", buy_time=None, require_fresh=True, max_age_minutes=180):
+    """Open V2-only paper trades from the latest Scoring V2 full-scan cache."""
+    today = current_time_cst().strftime("%Y-%m-%d")
+    buy_time = buy_time or current_time_cst().strftime("%H:%M:%S")
+    target_execution_time = normalize_v2_execution_time(buy_time[:5])
+    status = {
+        "success": True,
+        "v2_ledger": True,
+        "trigger": trigger,
+        "ran_at": current_time_cst().isoformat(),
+        "variants": 0,
+        "opened_count": 0,
+        "skipped_count": 0,
+        "opened": [],
+        "skipped": [],
+        "variant_summaries": [],
+        "errors": [],
+        "requested_buy_time": buy_time,
+        "target_execution_time": target_execution_time,
+    }
+    buy_time_parts = [int(part) for part in buy_time.split(":")[:3]]
+    while len(buy_time_parts) < 3:
+        buy_time_parts.append(0)
+    entry_target_dt = datetime.strptime(today, "%Y-%m-%d").replace(
+        hour=buy_time_parts[0],
+        minute=buy_time_parts[1],
+        second=buy_time_parts[2],
+        microsecond=0,
+    )
+    database = get_database()
+    try:
+        v2_cache, vector_rows, nova_rows = load_scoring_v2_cache_rows(database)
+        if not v2_cache:
+            status.update({
+                "success": False,
+                "refused": True,
+                "reason": "missing_v2_cache",
+                "message": "No Scoring V2 full-scan cache exists yet.",
+            })
+            database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_v2_variant_run', ?)", [json.dumps(status)])
+            database.commit()
+            return status
+
+        scan_time = v2_cache.get("scan_time") or v2_cache.get("vector_cached_at") or v2_cache.get("nova_cached_at")
+        scan_age = cache_age_minutes(scan_time)
+        status.update({
+            "scan_time": scan_time,
+            "scan_age_minutes": scan_age,
+            "vector_source_rows": len(vector_rows),
+            "nova_source_rows": len(nova_rows),
+        })
+        if require_fresh and (scan_age is None or scan_age > max_age_minutes):
+            status.update({
+                "success": False,
+                "refused": True,
+                "reason": "stale_v2_cache",
+                "message": "Scoring V2 cache is stale; run a fresh shared/full scan before opening V2 paper trades.",
+            })
+            database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_v2_variant_run', ?)", [json.dumps(status)])
+            database.commit()
+            return status
+
+        variants = [dict(r) for r in database.execute("""
+            SELECT sv.*, vp.cash, vp.equity
+            FROM strategy_variants sv
+            JOIN variant_portfolios vp ON vp.variant_id = sv.id
+            WHERE sv.status='active'
+              AND vp.lifecycle_status!='archived'
+              AND sv.strategy='SwingDesk V2'
+            ORDER BY sv.brain, sv.execution_time, sv.selection_mode
+        """).fetchall()]
+        status["variants"] = len(variants)
+
+        for variant in variants:
+            execution_time = (variant.get("execution_time") or "").strip()
+            if execution_time and execution_time != target_execution_time:
+                continue
+            brain = variant.get("brain")
+            source_rows = nova_rows if brain == "Nova" else vector_rows
+            qualified = filter_scoring_v2_variant_rows(source_rows, variant)
+            if not qualified:
+                status["skipped"].append({"variant_id": variant["id"], "reason": "no v2-actionable picks"})
+                status["skipped_count"] += 1
+                status["variant_summaries"].append({
+                    "variant_id": variant["id"],
+                    "brain": brain,
+                    "strategy": variant.get("strategy"),
+                    "source_rows": len(source_rows),
+                    "strategy_qualified": 0,
+                    "selected": 0,
+                    "opened": 0,
+                })
+                update_variant_portfolio(database, variant["id"], note="no_v2_picks")
+                continue
+
+            selected = select_variant_picks(qualified, variant.get("selection_mode"))
+            entry_quotes = fetch_entry_prices_at_cst(
+                sorted({pick.get("ticker") for pick in selected if pick.get("ticker")}),
+                entry_target_dt,
+            )
+            variant_weights = get_variant_signal_weights(database, variant["id"])
+            variant_opened = 0
+            variant_skipped = 0
+            open_cap = variant_open_position_cap(variant)
+            existing_open_count = int(database.execute(
+                "SELECT COUNT(*) AS n FROM variant_virtual_trades WHERE variant_id=? AND outcome='open'",
+                [variant["id"]]
+            ).fetchone()["n"] or 0)
+            if existing_open_count >= open_cap:
+                status["skipped"].append({"variant_id": variant["id"], "reason": "variant open-position cap reached", "open_count": existing_open_count, "cap": open_cap})
+                status["skipped_count"] += 1
+                update_variant_portfolio(database, variant["id"], note="open_cap_reached")
+                continue
+
+            for rank, pick in enumerate(selected, start=1):
+                if existing_open_count + variant_opened >= open_cap:
+                    break
+                ticker = (pick.get("ticker") or "").upper()
+                if not ticker:
+                    continue
+                trade_id = f"{variant['id']}_{ticker}_{today}_long"
+                if database.execute("SELECT id FROM variant_virtual_trades WHERE id=?", [trade_id]).fetchone():
+                    status["skipped_count"] += 1
+                    variant_skipped += 1
+                    status["skipped"].append({"variant_id": variant["id"], "ticker": ticker, "reason": "already open/executed today"})
+                    continue
+                if database.execute(
+                    "SELECT id FROM variant_virtual_trades WHERE variant_id=? AND ticker=? AND outcome='open'",
+                    [variant["id"], ticker]
+                ).fetchone():
+                    status["skipped_count"] += 1
+                    variant_skipped += 1
+                    status["skipped"].append({"variant_id": variant["id"], "ticker": ticker, "reason": "already open in variant"})
+                    continue
+
+                portfolio = dict(database.execute("SELECT * FROM variant_portfolios WHERE variant_id=?", [variant["id"]]).fetchone())
+                invested = variant_investment_amount(portfolio)
+                if invested <= 0:
+                    status["skipped_count"] += 1
+                    variant_skipped += 1
+                    status["skipped"].append({"variant_id": variant["id"], "ticker": ticker, "reason": "no cash"})
+                    continue
+
+                entry_quote = normalize_monitor_quote(entry_quotes.get(ticker), pick.get("price")) if entry_quotes.get(ticker) else None
+                buy_price = (entry_quote or {}).get("price") or pick.get("open_price") or pick.get("price") or pick.get("buy_price") or 0
+                if not buy_price:
+                    status["skipped_count"] += 1
+                    variant_skipped += 1
+                    status["skipped"].append({"variant_id": variant["id"], "ticker": ticker, "reason": "missing price"})
+                    continue
+                day_change_percent = float(
+                    (entry_quote or {}).get("day_change_percent")
+                    if (entry_quote or {}).get("day_change_percent") is not None
+                    else pick.get("pct_change_prev_close", pick.get("day_change_pct", pick.get("day_change_percent", 0)))
+                    or 0
+                )
+                confidence = int(round(float(pick.get("v2_score") or pick.get("long_conf") or 0)))
+                expected_move = float(pick.get("v2_expected_move") or pick.get("long_move") or 0)
+                signal_scores = build_signal_payload_json_from_pick(
+                    pick, ticker, buy_price, variant_weights, "long"
+                )
+                confluence_methods = pick.get("confluence_methods") or pick.get("confluence_methods_for_observation") or []
+                if not isinstance(confluence_methods, str):
+                    confluence_methods = json.dumps(confluence_methods)
+                confluence_count = int(pick.get("confluence_count") or 0)
+                reasoning = pick.get("v2_explanation") or pick.get("long_reasoning") or f"{brain} V2 paper ledger"
+                fee_quote = calculate_stock_fee_model(invested, buy_price, buy_price, "long")
+                database.execute(f"""
+                    INSERT INTO variant_virtual_trades
+                    (id, variant_id, strategy, brain, ticker, direction, buy_date, buy_time,
+                     buy_price, current_price, day_change_percent, invested_amount, current_value, confidence, expected_move,
+                     {FEE_MODEL_INSERT_COLUMNS},
+                     outcome, sector, reasoning, signal_scores, confluence_count, confluence_methods, source_scan_time, source_rank,
+                     created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 'long', ?, ?, ?, ?, ?, ?, ?, ?, ?, {FEE_MODEL_INSERT_PLACEHOLDERS}, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    trade_id, variant["id"], variant["strategy"], brain, ticker, today, buy_time,
+                    float(buy_price), float(buy_price), round(day_change_percent, 4), round(invested, 4), fee_quote["net_current_value"], confidence, expected_move,
+                    *fee_model_values(fee_quote),
+                    pick.get("sector") or get_sector(ticker), reasoning, signal_scores, confluence_count, confluence_methods, scan_time, rank,
+                    status["ran_at"], status["ran_at"],
+                ])
+                database.execute("""
+                    UPDATE variant_portfolios
+                    SET cash=ROUND(cash - ?, 4), updated_at=?
+                    WHERE variant_id=?
+                """, [round(invested, 4), status["ran_at"], variant["id"]])
+                status["opened_count"] += 1
+                variant_opened += 1
+                status["opened"].append({
+                    "variant_id": variant["id"],
+                    "ticker": ticker,
+                    "buy_price": float(buy_price),
+                    "invested_amount": round(invested, 4),
+                    "confidence": confidence,
+                    "expected_move": expected_move,
+                    "rank": rank,
+                })
+
+            update_variant_portfolio(database, variant["id"], note=f"v2_run_{trigger}")
+            status["variant_summaries"].append({
+                "variant_id": variant["id"],
+                "brain": brain,
+                "strategy": variant.get("strategy"),
+                "source_rows": len(source_rows),
+                "strategy_qualified": len(qualified),
+                "selected": len(selected),
+                "opened": variant_opened,
+                "skipped": variant_skipped,
+            })
+
+        database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_v2_variant_run', ?)", [json.dumps(status)])
+        database.commit()
+        return status
+    except Exception as error:
+        database.rollback()
+        status["success"] = False
+        status["errors"].append(str(error))
+        log.error(f"V2 variant universe run failed: {error}")
         return status
     finally:
         database.close()
@@ -10354,8 +10706,11 @@ def run_scheduler():
 
     add_job(dispatch, "04:00", "unlock_pick_queue", unlock_pick_queue)
     add_job(dispatch, "05:00", "variant_0500", lambda: run_variant_universes_from_cache(trigger="scheduled_0500", buy_time="05:00:00"))
+    add_job(dispatch, "05:00", "v2_variant_0500", lambda: run_v2_variant_universes_from_cache(trigger="scheduled_v2_0500", buy_time="05:00:00"))
     add_job(dispatch, "06:00", "variant_0600", lambda: run_variant_universes_from_cache(trigger="scheduled_0600", buy_time="06:00:00"))
+    add_job(dispatch, "06:00", "v2_variant_0600", lambda: run_v2_variant_universes_from_cache(trigger="scheduled_v2_0600", buy_time="06:00:00"))
     add_job(dispatch, "07:00", "variant_0700", lambda: run_variant_universes_from_cache(trigger="scheduled_0700", buy_time="07:00:00"))
+    add_job(dispatch, "07:00", "v2_variant_0700", lambda: run_v2_variant_universes_from_cache(trigger="scheduled_v2_0700", buy_time="07:00:00"))
     add_scan(dispatch, "08:15", "final_scan")
     add_job(dispatch, "08:25", "lock_pick_queue", lock_pick_queue)
     add_scan(dispatch, "08:30", "market_open")
@@ -10365,6 +10720,7 @@ def run_scheduler():
     else:
         log.info("Legacy virtual_trades openers disabled; variant universe is authoritative")
     add_job(dispatch, "08:45", "variant_0845", lambda: run_variant_universes_from_cache(trigger="scheduled_0845", buy_time="08:45:00"))
+    add_job(dispatch, "08:45", "v2_variant_0845", lambda: run_v2_variant_universes_from_cache(trigger="scheduled_v2_0845", buy_time="08:45:00"))
 
     for slot, label in [
         ("09:00", "9:00am"), ("09:30", "9:30am"),
@@ -10594,6 +10950,7 @@ def api_scoring_v2_shadow():
             WHERE sv.status='active'
             ORDER BY sv.brain, sv.strategy, sv.execution_time, sv.selection_mode
         """).fetchall()]
+        v2_ledger = v2_ledger_snapshot(database)
         database.close()
 
         def apply_variant(row, variant):
@@ -10606,22 +10963,6 @@ def api_scoring_v2_shadow():
                 "execution_time": variant.get("execution_time"),
                 "selection_mode": variant.get("selection_mode"),
             }
-
-        def normalize_v2_preview_row(row):
-            row = dict(row or {})
-            score = _first_scan_number(row, "v2_score", "long_conf")
-            expected = _first_scan_number(row, "v2_expected_move", "long_move", "legacy_expected_move")
-            blocked = bool(row.get("v2_blocked"))
-            trade_reasons = list(row.get("v2_trade_gate_reasons") or [])
-            if score is not None and score >= 65 and not blocked and expected is not None and expected < DEFAULT_EXPECTED_MOVE_FLOOR:
-                reason = f"expected move {expected:.1f}% below {DEFAULT_EXPECTED_MOVE_FLOOR:.1f}% trade floor"
-                if reason not in trade_reasons:
-                    trade_reasons.append(reason)
-                row["v2_actionable"] = False
-                row["v2_trade_gate_reasons"] = trade_reasons
-                row["v2_expected_move_floor"] = DEFAULT_EXPECTED_MOVE_FLOOR
-                row["v2_explanation"] = row.get("v2_explanation") or f"{row.get('ticker')} watchlist: {reason}"
-            return row
 
         def summarize_v2_preview_rows(rows):
             shadows = []
@@ -10693,6 +11034,7 @@ def api_scoring_v2_shadow():
                     "vector_watchlist": watchlist_rows(vector_v2_rows),
                     "nova_watchlist": watchlist_rows(nova_v2_rows),
                     "variant_rows": variant_rows,
+                    "v2_ledger": v2_ledger,
                 })
 
         vector_payload = sanitize_cached_pick_payload(json.loads(vector_row["value"]) if vector_row else {})
@@ -10784,6 +11126,7 @@ def api_scoring_v2_shadow():
             "vector_longs": pick_rows(vector_shadow_rows),
             "nova_longs": pick_rows(nova_shadow_rows),
             "variant_rows": variant_rows,
+            "v2_ledger": v2_ledger,
         })
     except Exception as error:
         return jsonify({"success": False, "error": str(error)}), 500
@@ -11995,6 +12338,15 @@ def api_variant_run_now():
     buy_time = body.get("buy_time")
     trigger = body.get("trigger") or ("manual_recovery" if buy_time else "manual")
     return jsonify(run_variant_universes_from_cache(trigger=trigger, buy_time=buy_time))
+
+@app.route("/api/v2-variant-run-now", methods=["POST"])
+def api_v2_variant_run_now():
+    """Manually run V2-only paper universes from the latest Scoring V2 scan cache."""
+    body = request.get_json(silent=True) or {}
+    buy_time = body.get("buy_time")
+    trigger = body.get("trigger") or ("manual_v2_recovery" if buy_time else "manual_v2")
+    require_fresh = str(body.get("require_fresh", "true")).lower() not in ("0", "false", "no")
+    return jsonify(run_v2_variant_universes_from_cache(trigger=trigger, buy_time=buy_time, require_fresh=require_fresh))
 
 @app.route("/api/recover-missed-variant-open", methods=["POST"])
 def api_recover_missed_variant_open():

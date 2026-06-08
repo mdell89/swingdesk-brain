@@ -2611,19 +2611,13 @@ function WhyNotPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED })
 function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED, themeKey = "black", pdtRemaining = 3 }) {
   const [open, setOpen] = React.useState(false);
   const [loading, setLoading] = React.useState(false);
+  const [runningLedger, setRunningLedger] = React.useState(false);
   const [payload, setPayload] = React.useState(null);
-  const [spotlightDetails, setSpotlightDetails] = React.useState({});
   const [expandedSpotlight, setExpandedSpotlight] = React.useState({});
   const [error, setError] = React.useState("");
 
-  const spotlightVariants = [
-    { id: "swingdesk_vector_0845_all", label: "SwingDesk / Vector / 8:45", brain: "Vector", color: BLUE },
-    { id: "swingdesk_nova_0845_all", label: "SwingDesk / Nova / 8:45", brain: "Nova", color: "#a78bfa" },
-  ];
-  const spotlightVariantIds = new Set(spotlightVariants.map(item => item.id));
-
-  const fetchJson = async (url) => {
-    const res = await fetch(url);
+  const fetchJson = async (url, options) => {
+    const res = await fetch(url, options);
     const text = await res.text();
     const data = text ? JSON.parse(text) : {};
     if (!res.ok || data.success === false) throw new Error(data.error || `HTTP ${res.status}`);
@@ -2635,16 +2629,8 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
     setLoading(true);
     setError("");
     try {
-      const [data, vectorDetail, novaDetail] = await Promise.all([
-        fetchJson(`${API}/scoring-v2-shadow`),
-        fetchJson(`${API}/variant/swingdesk_vector_0845_all`).catch(() => null),
-        fetchJson(`${API}/variant/swingdesk_nova_0845_all`).catch(() => null),
-      ]);
+      const data = await fetchJson(`${API}/scoring-v2-shadow`);
       setPayload(data);
-      setSpotlightDetails({
-        swingdesk_vector_0845_all: vectorDetail,
-        swingdesk_nova_0845_all: novaDetail,
-      });
     } catch (err) {
       const message = String(err.message || "");
       setError(message.includes("JSON") ? "Scoring V2 shadow endpoint is not available on this backend yet." : (message || "Failed to load Scoring V2 shadow view"));
@@ -2653,12 +2639,43 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
     }
   };
 
+  const runV2LedgerNow = async () => {
+    setRunningLedger(true);
+    setError("");
+    try {
+      const now = new Date();
+      const buyTime = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:00`;
+      await fetchJson(`${API}/v2-variant-run-now`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ buy_time: buyTime, trigger: "manual_v2_peek", require_fresh: false }),
+      });
+      const data = await fetchJson(`${API}/scoring-v2-shadow`);
+      setPayload(data);
+    } catch (err) {
+      setError(String(err.message || "Failed to run V2 paper ledger"));
+    } finally {
+      setRunningLedger(false);
+    }
+  };
+
+  const v2Ledger = payload?.v2_ledger || {};
+  const v2LedgerVariants = Array.isArray(v2Ledger?.variants) ? v2Ledger.variants : [];
+  const spotlightVariants = v2LedgerVariants.map(item => ({
+    id: item?.variant?.id,
+    label: item?.variant?.label || item?.variant?.id,
+    brain: item?.variant?.brain,
+    color: item?.variant?.brain === "Nova" ? "#a78bfa" : BLUE,
+    ledger: item,
+  })).filter(item => item.id);
+  const spotlightVariantIds = new Set(spotlightVariants.map(item => item.id));
   const variantRows = Array.isArray(payload?.variant_rows) ? payload.variant_rows : [];
   const fallbackRows = [
     ...(Array.isArray(payload?.vector_longs) ? payload.vector_longs.map(row => ({ ...row, brain: "Vector", variant_label: "Vector cached picks" })) : []),
     ...(Array.isArray(payload?.nova_longs) ? payload.nova_longs.map(row => ({ ...row, brain: "Nova", variant_label: "Nova cached picks" })) : []),
   ];
-  const allRows = variantRows.length ? variantRows : fallbackRows;
+  const v2VariantRows = variantRows.filter(row => String(row.variant_id || "").startsWith("v2_") || String(row.strategy || "").toLowerCase() === "swingdesk v2");
+  const allRows = v2VariantRows.length ? v2VariantRows : fallbackRows;
   const rows = allRows.filter(row => !spotlightVariantIds.has(row.variant_id)).slice(0, 16);
   const vectorSummary = payload?.vector_summary || {};
   const novaSummary = payload?.nova_summary || {};
@@ -2690,8 +2707,10 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
     const variantShadowRows = allRows.filter(row => row.variant_id === config.id);
     const picks = variantShadowRows.filter(row => row.v2_actionable);
     const blockedCount = variantShadowRows.length - picks.length;
-    const detail = spotlightDetails[config.id] || {};
+    const detail = config.ledger || {};
+    const stats = detail.stats || {};
     const openTrades = (Array.isArray(detail.trades) ? detail.trades : []).filter(trade => trade.outcome === "open");
+    const winRate = stats.win_rate == null ? "--" : `${stats.win_rate}%`;
     return (
       <div key={config.id} style={{ marginBottom: 12 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, marginBottom: 6 }}>
@@ -2699,6 +2718,18 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
           <div style={{ fontSize: 8, color: config.color, fontFamily: "'DM Mono',monospace", fontWeight: 900 }}>
             {picks.length} V2 picks / {openTrades.length} open
           </div>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 5, marginBottom: 7 }}>
+          {[
+            ["Win", winRate],
+            ["Closed", stats.closed_count ?? 0],
+            ["P/L", Number(stats.realized_pnl || 0).toFixed(2)],
+          ].map(([label, value]) => (
+            <div key={`${config.id}_${label}`} style={{ background: "#070708", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "5px 6px" }}>
+              <div style={{ fontSize: 7, color: T3, textTransform: "uppercase" }}>{label}</div>
+              <div style={{ fontSize: 9, color: config.color, fontFamily: "'DM Mono',monospace", fontWeight: 900 }}>{value}</div>
+            </div>
+          ))}
         </div>
         {picks.length > 0 ? (
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -2737,7 +2768,7 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
           </div>
         ) : (
           <div style={{ fontSize: 9, color: T3, lineHeight: 1.4, padding: "6px 1px" }}>
-            No V2-actionable picks for this 8:45 variant yet{blockedCount > 0 ? ` (${blockedCount} blocked/skip rows hidden from pick cards).` : "."}
+            No V2-actionable picks for this variant yet{blockedCount > 0 ? ` (${blockedCount} blocked/skip rows hidden from pick cards).` : "."}
           </div>
         )}
         {openTrades.length > 0 && (
@@ -2855,6 +2886,24 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
                     <div style={{ fontSize: 7, color: T3, marginTop: 2 }}>{Number(item.v2_skip_count || 0)} skip / {Number(item.v2_blocked_count || 0)} blocked</div>
                   </div>
                 ))}
+              </div>
+
+              <div style={{ background: "#070708", border: `1px solid ${BORDER}`, borderRadius: 7, padding: "7px 8px", marginBottom: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 8, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .5 }}>V2 paper ledger</div>
+                    <div style={{ fontSize: 11, color: T1, fontFamily: "'DM Mono',monospace", fontWeight: 900 }}>
+                      {v2Ledger?.summary?.win_rate == null ? "--" : `${v2Ledger.summary.win_rate}%`} win / {v2Ledger?.summary?.open_count || 0} open / {v2Ledger?.summary?.closed_count || 0} closed
+                    </div>
+                  </div>
+                  <button
+                    onClick={runV2LedgerNow}
+                    disabled={runningLedger}
+                    style={{ flexShrink: 0, background: "transparent", color: runningLedger ? T3 : BLUE, border: `1px solid ${runningLedger ? BORDER : BLUE}`, borderRadius: 6, padding: "5px 7px", fontSize: 8, fontWeight: 900, fontFamily: "'DM Mono',monospace", cursor: runningLedger ? "default" : "pointer" }}
+                  >
+                    {runningLedger ? "Running" : "Run ledger"}
+                  </button>
+                </div>
               </div>
 
               {spotlightVariants.map(renderSpotlight)}
