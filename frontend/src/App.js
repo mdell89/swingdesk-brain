@@ -2777,25 +2777,41 @@ function ScoringV2ShadowPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBE
         <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
           {items.map((row, idx) => {
             const capText = (row.v2_caps || []).slice(0, 3).join(", ");
+            const tradeText = (row.v2_trade_gate_reasons || []).slice(0, 1).join(", ");
+            const key = `${label}_watch_${row.ticker}_${idx}`;
+            const pick = mapPickFields({
+              ...row,
+              long_conf: row.v2_score ?? row.long_conf ?? 0,
+              long_move: row.v2_expected_move ?? row.long_move ?? row.legacy_expected_move ?? 0,
+              long_reasoning: row.v2_explanation || row.long_reasoning,
+              pct_change_prev_close: row.overnight_gap_pct ?? row.gap_percent ?? row.day_change_pct ?? row.day_change_percent ?? 0,
+              day_change_pct: row.overnight_gap_pct ?? row.gap_percent ?? row.day_change_pct ?? row.day_change_percent ?? 0,
+              primary_metric_label: "Gap",
+              move_metric_label: "Est",
+              confidence_metric_label: "V2",
+              price_provider: row.price_provider || "cached shadow",
+            });
             return (
-              <div key={`${label}_watch_${row.ticker}_${idx}`} style={{ background: "#070708", border: `1px solid ${BORDER}`, borderRadius: 7, padding: "7px 8px" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
-                  <div style={{ minWidth: 0, fontSize: 11, color: T1, fontWeight: 900, fontFamily: "'DM Mono',monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                    {row.ticker || "-"}
-                  </div>
-                  <div style={{ flexShrink: 0, fontSize: 10, color: AMBER, fontFamily: "'DM Mono',monospace", fontWeight: 900 }}>
-                    V2 {row.v2_score == null ? "--" : row.v2_score}
-                  </div>
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginTop: 2 }}>
+              <div key={key}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center", margin: "5px 1px 4px" }}>
                   <div style={{ minWidth: 0, fontSize: 8, color: T3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                    {row.v2_explanation || row.v2_score_band || "skip"}
+                    V2 {row.v2_score == null ? "--" : row.v2_score} / watchlist{tradeText || capText ? ` / ${tradeText || capText}` : ""}
                   </div>
-                  <div style={{ flexShrink: 0, fontSize: 8, color: T3, fontFamily: "'DM Mono',monospace" }}>
+                  <div style={{ flexShrink: 0, fontSize: 8, color: T3, fontFamily: "'DM Mono',monospace", fontWeight: 900 }}>
                     old {row.legacy_confidence ?? "--"}
                   </div>
                 </div>
-                {capText && <div style={{ marginTop: 3, fontSize: 7, color: T3, lineHeight: 1.35 }}>Needs: {capText}</div>}
+                <PickCard
+                  pick={pick}
+                  isLong={true}
+                  themeKey={themeKey}
+                  strategyName="SwingDesk"
+                  strategyTotal={10}
+                  brainTags={[label]}
+                  expanded={expandedSpotlight[key]}
+                  cardKeyOverride={key}
+                  onToggle={toggleSpotlightCard}
+                />
               </div>
             );
           })}

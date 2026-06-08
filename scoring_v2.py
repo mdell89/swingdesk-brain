@@ -9,6 +9,7 @@ from typing import Any
 SCORING_ENGINE_VERSION = "scoring_v2"
 FORMULA_VERSION = "2026-06-06"
 DEFAULT_ACTION_FLOOR = 65
+DEFAULT_EXPECTED_MOVE_FLOOR = 5.0
 BASE_SCORE = 50
 MAX_SIGNAL_POINTS = 35
 SECONDARY_AUTHORITY = 0.40
@@ -538,14 +539,24 @@ def score_stock_v2(
     capped_score = min(raw_score, cap_limit)
     blocked = bool(block_reasons)
     score = None if blocked else int(round(clamp(capped_score, 0, 100)))
-    actionable = bool(score is not None and score >= DEFAULT_ACTION_FLOOR and not blocked)
     confluence = selected_strategy_confluence(data.get("confluence") or data.get("confluence_methods"), strategy)
     move = expected_move(data, score)
+    trade_gate_reasons = []
+    if score is not None and score >= DEFAULT_ACTION_FLOOR and move["expected_move"] < DEFAULT_EXPECTED_MOVE_FLOOR:
+        trade_gate_reasons.append(f"expected move {move['expected_move']:.1f}% below {DEFAULT_EXPECTED_MOVE_FLOOR:.1f}% trade floor")
+    actionable = bool(
+        score is not None
+        and score >= DEFAULT_ACTION_FLOOR
+        and move["expected_move"] >= DEFAULT_EXPECTED_MOVE_FLOOR
+        and not blocked
+    )
 
     if blocked:
         explanation = f"{ticker or 'Ticker'} blocked: {block_reasons[0]}"
     elif actionable:
         explanation = f"{ticker} passed as {confidence_band(score)} with confidence {score}"
+    elif trade_gate_reasons:
+        explanation = f"{ticker} watchlist: {trade_gate_reasons[0]}"
     else:
         explanation = f"{ticker} skipped with confidence {score}"
 
@@ -558,6 +569,8 @@ def score_stock_v2(
         "score": score,
         "score_band": confidence_band(score),
         "actionable": actionable,
+        "trade_gate_reasons": trade_gate_reasons,
+        "expected_move_floor": DEFAULT_EXPECTED_MOVE_FLOOR,
         "blocked": blocked,
         "block_reasons": block_reasons,
         "caps_applied": caps,

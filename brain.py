@@ -2454,6 +2454,38 @@ def evidence_for_confidence(confidence, cache=None):
     )
     return evidence
 
+def median(values):
+    nums = sorted(float(value) for value in values if value is not None)
+    if not nums:
+        return None
+    mid = len(nums) // 2
+    if len(nums) % 2:
+        return nums[mid]
+    return (nums[mid - 1] + nums[mid]) / 2
+
+def derive_similar_setup_median_move(strategy="SwingDesk", confidence=None, min_samples=3):
+    """Median realized move from resolved observations in the same strategy/confidence band."""
+    low, high, _ = confidence_evidence_bin(confidence)
+    try:
+        db = get_database()
+        rows = [dict(r) for r in db.execute("""
+            SELECT actual_move
+            FROM signal_observations
+            WHERE strategy=?
+              AND actual_move IS NOT NULL
+              AND confidence BETWEEN ? AND ?
+            ORDER BY resolved_at DESC, scan_time DESC
+            LIMIT 80
+        """, [strategy, low, high]).fetchall()]
+        db.close()
+    except Exception as exc:
+        log.debug(f"similar setup median unavailable: {exc}")
+        return None
+    moves = [row.get("actual_move") for row in rows if row.get("actual_move") is not None]
+    if len(moves) < min_samples:
+        return None
+    return round(median(moves), 2)
+
 def attach_confidence_evidence(items, confidence_key="long_conf", cache=None):
     cache = cache if cache is not None else build_confidence_evidence_cache()
     for item in items or []:
@@ -6380,6 +6412,7 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
         "day_change_percent": stock_data.get("day_change_percent") or stock_data.get("day_change_pct"),
         "average_volume": average_volume,
         "average_daily_dollar_volume": average_daily_dollar_volume,
+        "similar_setup_median_move": stock_data.get("similar_setup_median_move"),
         "freshness_status": "fresh",
         "scan_completed_at": current_time_cst().isoformat(),
         "provider": stock_data.get("source") or stock_data.get("provider") or "scan",
@@ -6600,6 +6633,8 @@ def scoring_v2_card_row(pick, brain="Vector", variant=None, source_scan_time=Non
         "v2_score": v2_score,
         "v2_score_band": shadow.get("score_band"),
         "v2_actionable": shadow.get("actionable"),
+        "v2_trade_gate_reasons": shadow.get("trade_gate_reasons", []),
+        "v2_expected_move_floor": shadow.get("expected_move_floor"),
         "v2_blocked": shadow.get("blocked"),
         "v2_block_reasons": shadow.get("block_reasons", []),
         "v2_caps": [format_v2_cap_label(cap) for cap in shadow.get("caps_applied", [])],
@@ -7659,6 +7694,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
 
         long_confidence = calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, "long")
         short_confidence = calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, "short")
+        stock_data["similar_setup_median_move"] = derive_similar_setup_median_move("SwingDesk", long_confidence)
         long_move = estimate_overnight_move(stock_data, long_confidence, has_earnings)
         short_move = estimate_overnight_move(stock_data, short_confidence, has_earnings)
 
@@ -8454,6 +8490,7 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
             }
 
             nn_conf = nn_score_ticker(synthetic, "long")
+            stock_data["similar_setup_median_move"] = derive_similar_setup_median_move("SwingDesk", nn_conf)
             scoring_v2_shadow = build_scoring_v2_shadow(
                 ticker,
                 stock_data,
@@ -10581,6 +10618,8 @@ def api_scoring_v2_shadow():
                     "v2_score": row.get("v2_score"),
                     "v2_score_band": row.get("v2_score_band"),
                     "v2_actionable": row.get("v2_actionable"),
+                    "v2_trade_gate_reasons": row.get("v2_trade_gate_reasons", []),
+                    "v2_expected_move_floor": row.get("v2_expected_move_floor"),
                     "v2_blocked": row.get("v2_blocked"),
                     "v2_block_reasons": row.get("v2_block_reasons", []),
                     "v2_caps": row.get("v2_caps", []),
@@ -10652,6 +10691,8 @@ def api_scoring_v2_shadow():
                     "v2_score": shadow.get("score"),
                     "v2_score_band": shadow.get("score_band"),
                 "v2_actionable": shadow.get("actionable"),
+                "v2_trade_gate_reasons": shadow.get("trade_gate_reasons", []),
+                "v2_expected_move_floor": shadow.get("expected_move_floor"),
                 "v2_blocked": shadow.get("blocked"),
                 "v2_block_reasons": shadow.get("block_reasons", []),
                 "v2_caps": [format_v2_cap_label(cap) for cap in shadow.get("caps_applied", [])],
@@ -10682,6 +10723,8 @@ def api_scoring_v2_shadow():
                 "v2_score": v2_score,
                 "v2_score_band": shadow.get("score_band"),
                 "v2_actionable": shadow.get("actionable"),
+                "v2_trade_gate_reasons": shadow.get("trade_gate_reasons", []),
+                "v2_expected_move_floor": shadow.get("expected_move_floor"),
                 "v2_blocked": shadow.get("blocked"),
                 "v2_block_reasons": shadow.get("block_reasons", []),
                 "v2_caps": [format_v2_cap_label(cap) for cap in shadow.get("caps_applied", [])],

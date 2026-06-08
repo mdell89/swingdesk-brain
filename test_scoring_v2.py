@@ -46,6 +46,20 @@ class ScoringV2Test(unittest.TestCase):
         self.assertEqual(result["score_band"], "valid")
         self.assertEqual(result["data_freshness"]["freshness_status"], "fresh")
 
+    def test_sub_five_expected_move_is_watchlist_not_actionable(self):
+        result = score_stock_v2(clean_setup(
+            gap_percent=1.0,
+            atr_percent=1.0,
+            similar_setup_median_move=0.0,
+            intraday_range_pct=1.0,
+        ))
+
+        self.assertFalse(result["blocked"])
+        self.assertGreaterEqual(result["score"], 65)
+        self.assertFalse(result["actionable"])
+        self.assertLess(result["expected_move"], 5.0)
+        self.assertIn("expected move", result["trade_gate_reasons"][0])
+
     def test_gap_down_long_is_blocked(self):
         result = score_stock_v2(clean_setup(gap_percent=-3.0))
 
