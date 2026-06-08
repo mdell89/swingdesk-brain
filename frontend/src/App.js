@@ -627,10 +627,12 @@ function getClosedTradePnlDollars(trade = {}, feeAdjusted = true) {
 }
 
 function getDisplayDayChangePercent(item = {}) {
+  const numeric = [];
   for (const key of ["pct_change_prev_close", "day_change_pct", "day_change_percent"]) {
-    if (item[key] != null && Number.isFinite(Number(item[key]))) return Number(item[key]);
+    if (item[key] != null && Number.isFinite(Number(item[key]))) numeric.push(Number(item[key]));
   }
-  return 0;
+  const nonZero = numeric.find(value => Math.abs(value) > 0.0001);
+  return nonZero ?? numeric[0] ?? 0;
 }
 
 const SIGNAL_KEY_ALIASES = {
