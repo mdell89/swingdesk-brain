@@ -2423,6 +2423,9 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
   const [startedAt, setStartedAt] = React.useState(null);
   const [finishedAt, setFinishedAt] = React.useState(null);
   const [errorMsg, setErrorMsg] = React.useState("");
+  const [control, setControl] = React.useState({ scheduled_scans_paused: false, scan_frequency_minutes: 30 });
+  const [friction, setFriction] = React.useState(null);
+  const [frictionOpen, setFrictionOpen] = React.useState(false);
   const pollRef = React.useRef(null);
 
   const stopPolling = React.useCallback(() => {
@@ -2434,8 +2437,18 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
 
   const poll = React.useCallback(async () => {
     try {
-      const res = await fetch(`${API}/nn-scan-status`);
-      const d = await res.json();
+      const [statusRes, frictionRes] = await Promise.all([
+        fetch(`${API}/nn-scan-status`),
+        fetch(`${API}/scan-friction`).catch(() => null),
+      ]);
+      const d = await statusRes.json();
+      if (frictionRes) {
+        const f = await frictionRes.json();
+        if (f?.success) {
+          setFriction(f);
+          if (f.control) setControl(f.control);
+        }
+      }
       const scanExpected = d.scan_total_expected || d.tickers_attempted || d.total_expected || 521;
       setPhase(d.phase || "");
       setTotalScanned(d.total_scanned || 0);
@@ -2445,15 +2458,16 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
       setQualified(d.qualified || 0);
       setPicks(d.picks || 0);
       if (d.started_at) setStartedAt(d.started_at);
-      if (d.status === "running") {
+      if (d.status === "running" || d.status === "cancelling") {
         setState("running");
+        if (d.status === "cancelling") setPhase("cancelling");
       } else if (d.status === "success" || d.status === "degraded" || d.status === "complete") {
         setState("done");
         setFinishedAt(d.finished_at || new Date().toISOString());
         stopPolling();
-      } else if (d.status === "error" || d.status === "stalled") {
+      } else if (d.status === "error" || d.status === "stalled" || d.status === "cancelled") {
         setState("error");
-        setErrorMsg(d.error || "Scan stalled.");
+        setErrorMsg(d.error || (d.status === "cancelled" ? "Scan cancelled." : "Scan stalled."));
         stopPolling();
       }
     } catch (_) {}
@@ -2472,6 +2486,21 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
     pollRef.current = setInterval(poll, 1200);
   };
 
+  const cancelScan = async () => {
+    setPhase("cancelling");
+    try { await fetch(`${API}/scan-cancel`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason: "user_requested" }) }); } catch (_) {}
+    poll();
+  };
+
+  const updateControl = async (patch) => {
+    setControl(prev => ({ ...prev, ...patch }));
+    try {
+      const res = await fetch(`${API}/scan-control`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch) });
+      const data = await res.json();
+      if (data?.control) setControl(data.control);
+    } catch (_) {}
+  };
+
   const elapsed = startedAt ? Math.round((new Date(finishedAt || Date.now()) - new Date(startedAt)) / 1000) : 0;
   const pct = totalExpected > 0 ? Math.min(98, Math.round(totalScanned / totalExpected * 100)) : 0;
   const accent = state === "done" ? GREEN : state === "error" ? RED : BLUE;
@@ -2481,6 +2510,8 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
     : state === "done"
       ? `${totalScanned}/${totalExpected} scanned | ${qualified} qualified | ${picks} picks`
       : "No scan running";
+  const frictionStatus = friction?.latest_scan?.status || "";
+  const frictionReason = friction?.degraded_reason || friction?.status?.error || "";
   const phaseLabel = { starting: "Initializing…", fetching_prices: "Fetching price data…", scoring: "Scoring tickers…" }[phase] || (state === "running" ? "Scanning…" : "");
 
   return (
@@ -2501,9 +2532,16 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
                 : "Vector + Nova · full universe · live data"}
             </div>
           </div>
-          <button onClick={trigger} disabled={state === "running"} style={{ background: state === "running" ? "transparent" : accent, border: `1.5px solid ${accent}`, borderRadius: 8, padding: "7px 14px", fontSize: 10, fontWeight: 700, color: state === "running" ? accent : "#000", cursor: state === "running" ? "default" : "pointer", fontFamily: "'DM Mono',monospace", letterSpacing: 1, whiteSpace: "nowrap", opacity: state === "running" ? 0.7 : 1 }}>
-            {state === "running" ? "RUNNING" : state === "done" ? "RUN AGAIN" : "SCAN NOW"}
-          </button>
+          <div style={{ display: "flex", gap: 6 }}>
+            {state === "running" && (
+              <button onClick={cancelScan} style={{ background: "transparent", border: `1.5px solid ${RED}`, borderRadius: 8, padding: "7px 10px", fontSize: 10, fontWeight: 700, color: RED, cursor: "pointer", fontFamily: "'DM Mono',monospace", letterSpacing: 1, whiteSpace: "nowrap" }}>
+                CANCEL
+              </button>
+            )}
+            <button onClick={trigger} disabled={state === "running"} style={{ background: state === "running" ? "transparent" : accent, border: `1.5px solid ${accent}`, borderRadius: 8, padding: "7px 14px", fontSize: 10, fontWeight: 700, color: state === "running" ? accent : "#000", cursor: state === "running" ? "default" : "pointer", fontFamily: "'DM Mono',monospace", letterSpacing: 1, whiteSpace: "nowrap", opacity: state === "running" ? 0.7 : 1 }}>
+              {state === "running" ? "RUNNING" : state === "done" ? "RUN AGAIN" : "SCAN NOW"}
+            </button>
+          </div>
         </div>
 
         {/* Progress bar */}
@@ -2526,6 +2564,47 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
       {/* Warning */}
       <div style={{ fontSize: 9, color: T3, marginTop: 5, paddingLeft: 2, lineHeight: 1.5 }}>
         Scans consume API quota. Avoid triggering more than once per hour during market hours — the scheduler runs automatically at 8:15 AM and throughout the session.
+      </div>
+      <div style={{ marginTop: 6, display: "grid", gridTemplateColumns: "1fr auto", gap: 6, alignItems: "center" }}>
+        <button onClick={() => updateControl({ scheduled_scans_paused: !control.scheduled_scans_paused })}
+          style={{ background: control.scheduled_scans_paused ? RED + "18" : GREEN + "14", border: `1px solid ${control.scheduled_scans_paused ? RED + "66" : GREEN + "55"}`, borderRadius: 8, padding: "7px 9px", color: control.scheduled_scans_paused ? RED : GREEN, fontSize: 9, fontWeight: 800, fontFamily: "'DM Mono',monospace", letterSpacing: .5 }}>
+          {control.scheduled_scans_paused ? "SCHEDULED SCANS OFF" : "SCHEDULED SCANS ON"}
+        </button>
+        <select value={control.scan_frequency_minutes || 30} onChange={e => updateControl({ scan_frequency_minutes: Number(e.target.value) })}
+          style={{ background: "#050506", border: `1px solid ${BORDER}`, borderRadius: 8, padding: "7px 8px", color: BLUE, fontSize: 9, fontWeight: 800, fontFamily: "'DM Mono',monospace" }}>
+          <option value={30}>30 min</option>
+          <option value={60}>1 hr</option>
+          <option value={120}>2 hr</option>
+        </select>
+      </div>
+      <div style={{ marginTop: 6, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, overflow: "hidden" }}>
+        <button onClick={() => setFrictionOpen(v => !v)}
+          style={{ width: "100%", background: "transparent", border: 0, padding: "8px 10px", display: "flex", justifyContent: "space-between", alignItems: "center", color: T2, cursor: "pointer" }}>
+          <span style={{ fontSize: 9, fontWeight: 800, letterSpacing: .7, textTransform: "uppercase" }}>Scan friction</span>
+          <span style={{ fontSize: 9, color: frictionStatus === "degraded" ? AMBER : frictionStatus === "stalled" || frictionStatus === "error" ? RED : BLUE, fontFamily: "'DM Mono',monospace" }}>
+            {friction?.current_phase || phase || frictionStatus || "idle"} {friction?.current_ticker ? `| ${friction.current_ticker}` : ""} {frictionOpen ? "^" : "v"}
+          </span>
+        </button>
+        {frictionOpen && (
+          <div style={{ borderTop: `1px solid ${BORDER}`, padding: "9px 10px 10px", display: "grid", gap: 7 }}>
+            <div style={{ fontSize: 9, color: frictionReason ? AMBER : T3, lineHeight: 1.4 }}>
+              {frictionReason || "No current degraded or stalled reason reported."}
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+              {[
+                ["Last full", friction?.last_successful_full_scan?.finished_at ? new Date(friction.last_successful_full_scan.finished_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "--"],
+                ["Heartbeat", friction?.heartbeat_age_minutes != null ? `${friction.heartbeat_age_minutes}m` : "--"],
+                ["Providers", friction?.provider_health_summary ? `${friction.provider_health_summary.active || 0} ok / ${friction.provider_health_summary.degraded || 0} bad` : "--"],
+                ["Lock", friction?.lock ? "held" : "clear"],
+              ].map(([label, value]) => (
+                <div key={label} style={{ background: "#070708", border: `1px solid ${BORDER}`, borderRadius: 7, padding: "7px 8px" }}>
+                  <div style={{ fontSize: 7, color: T3, textTransform: "uppercase", letterSpacing: .5 }}>{label}</div>
+                  <div style={{ fontSize: 10, color: T1, fontFamily: "'DM Mono',monospace", marginTop: 2 }}>{value}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

@@ -272,7 +272,16 @@ NN_CONFIDENCE_FLOOR = 65  # Same floor as crude algo
 NN_MODEL_KEY   = "nn_model_weights"  # app_state key for persisted weights
 NN_SCAN_STATUS_KEY = "nn_scan_status"
 SCORING_V2_SCAN_CACHE_KEY = "cached_scoring_v2_scan"
+SCAN_CONTROL_KEY = "scan_control"
+SCAN_CANCEL_KEY = "scan_cancel_request"
+COMPREHENSIVE_SCAN_LOCK_KEY = "comprehensive_scan_lock"
+SCAN_TERMINAL_STATUSES = {"success", "complete", "degraded", "error", "failed", "stalled", "cancelled", "skipped"}
+SCAN_HEARTBEAT_STALE_MINUTES = float(os.getenv("SCAN_HEARTBEAT_STALE_MINUTES", "4"))
 _nn_scan_thread_lock = threading.Lock()
+
+class ScanCancelled(Exception):
+    """Raised when the user cancels an active comprehensive scan."""
+    pass
 
 class SwingDeskNet(nn.Module):
     """
@@ -2079,6 +2088,59 @@ def finish_scan_event(event_id, status="success", tickers_updated=0, picks_count
     database.commit()
     database.close()
 
+def release_any_comprehensive_scan_db_lock(reason="watchdog"):
+    """Force-release the durable scan lock after the scan event is terminal."""
+    database = get_database()
+    try:
+        database.execute("DELETE FROM app_state WHERE key=?", [COMPREHENSIVE_SCAN_LOCK_KEY])
+        database.commit()
+        log.warning(f"Released comprehensive scan DB lock ({reason})")
+    except Exception as error:
+        database.rollback()
+        log.warning(f"Could not force-release comprehensive scan DB lock: {error}")
+    finally:
+        database.close()
+
+def get_scan_control_settings():
+    """Return scheduler scan controls stored in app_state."""
+    defaults = {"scheduled_scans_paused": False, "scan_frequency_minutes": 30}
+    payload = get_app_state_json(SCAN_CONTROL_KEY, {}) or {}
+    settings = {**defaults, **payload}
+    try:
+        settings["scan_frequency_minutes"] = int(settings.get("scan_frequency_minutes") or 30)
+    except Exception:
+        settings["scan_frequency_minutes"] = 30
+    if settings["scan_frequency_minutes"] not in {30, 60, 120}:
+        settings["scan_frequency_minutes"] = 30
+    settings["scheduled_scans_paused"] = bool(settings.get("scheduled_scans_paused"))
+    return settings
+
+def update_scan_control_settings(updates):
+    """Persist scheduler scan controls with a small, explicit surface area."""
+    settings = get_scan_control_settings()
+    if "scheduled_scans_paused" in updates:
+        settings["scheduled_scans_paused"] = bool(updates.get("scheduled_scans_paused"))
+    if "scan_frequency_minutes" in updates:
+        value = int(updates.get("scan_frequency_minutes") or settings["scan_frequency_minutes"])
+        if value not in {30, 60, 120}:
+            raise ValueError("scan_frequency_minutes must be one of 30, 60, 120")
+        settings["scan_frequency_minutes"] = value
+    settings["updated_at"] = current_time_cst().isoformat()
+    set_app_state(SCAN_CONTROL_KEY, json.dumps(settings))
+    return settings
+
+def scan_status_age_minutes(status):
+    updated_at = _parse_iso((status or {}).get("updated_at"))
+    if not updated_at:
+        return None
+    return (current_time_cst() - updated_at).total_seconds() / 60
+
+def is_live_scan_heartbeat_fresh(status):
+    if (status or {}).get("status") != "running":
+        return False
+    age = scan_status_age_minutes(status)
+    return age is not None and age <= SCAN_HEARTBEAT_STALE_MINUTES
+
 def mark_stalled_scan_events(max_age_minutes=45, zero_progress_minutes=20):
     """Mark old running scan/monitor rows as stalled so freshness is never ambiguous."""
     cutoff = (current_time_cst() - timedelta(minutes=max_age_minutes)).isoformat()
@@ -2091,14 +2153,28 @@ def mark_stalled_scan_events(max_age_minutes=45, zero_progress_minutes=20):
             live_status = json.loads(status_row["value"] or "{}")
         except Exception:
             live_status = {}
-    live_scan_has_progress = (
-        live_status.get("status") == "running" and
-        (
-            int(live_status.get("total_scanned") or 0) > 0 or
-            live_status.get("phase") in {"fetching_prices", "scoring"}
-        ) and
-        str(live_status.get("updated_at") or "") >= zero_cutoff
-    )
+    live_scan_has_progress = is_live_scan_heartbeat_fresh(live_status)
+    if live_status.get("status") == "running" and not live_scan_has_progress:
+        database.execute("""
+            UPDATE scan_events
+            SET status='stalled',
+                finished_at=COALESCE(finished_at, ?),
+                error=COALESCE(error, 'heartbeat stale; watchdog marked event stalled')
+            WHERE status='running'
+              AND job_type='comprehensive'
+              AND id=?
+        """, [current_time_cst().isoformat(), live_status.get("scan_event_id")])
+        try:
+            live_status.update(
+                status="stalled",
+                started=False,
+                already_running=False,
+                finished_at=current_time_cst().isoformat(),
+                error=live_status.get("error") or "Scan heartbeat went stale.",
+            )
+            database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)", [NN_SCAN_STATUS_KEY, json.dumps(live_status)])
+        except Exception:
+            pass
     if not live_scan_has_progress:
         database.execute("""
             UPDATE scan_events
@@ -2120,6 +2196,8 @@ def mark_stalled_scan_events(max_age_minutes=45, zero_progress_minutes=20):
     changed = database.total_changes
     database.commit()
     database.close()
+    if changed:
+        release_any_comprehensive_scan_db_lock("stalled scan watchdog")
     return changed
 
 def mark_running_events_error(job_type, started_after, error):
@@ -2132,6 +2210,21 @@ def mark_running_events_error(job_type, started_after, error):
             error=?
         WHERE status='running' AND job_type=? AND started_at >= ?
     """, [current_time_cst().isoformat(), str(error)[:500], job_type, started_after])
+    changed = database.total_changes
+    database.commit()
+    database.close()
+    return changed
+
+def mark_running_events_cancelled(job_type, started_after, reason):
+    """Mark running events from the current job as cancelled."""
+    database = get_database()
+    database.execute("""
+        UPDATE scan_events
+        SET status='cancelled',
+            finished_at=COALESCE(finished_at, ?),
+            error=?
+        WHERE status='running' AND job_type=? AND started_at >= ?
+    """, [current_time_cst().isoformat(), str(reason)[:500], job_type, started_after])
     changed = database.total_changes
     database.commit()
     database.close()
@@ -2151,7 +2244,8 @@ def get_running_comprehensive_scan():
 
 def acquire_comprehensive_scan_db_lock(scan_type):
     """Cross-process scan lock so Railway workers cannot overlap full scans."""
-    key = "comprehensive_scan_lock"
+    key = COMPREHENSIVE_SCAN_LOCK_KEY
+    mark_stalled_scan_events(max_age_minutes=12, zero_progress_minutes=8)
     now = current_time_cst()
     max_age_minutes = int(os.getenv("COMPREHENSIVE_SCAN_LOCK_MAX_AGE_MINUTES", "75"))
     token = f"{now.isoformat()}:{os.getpid()}:{threading.get_ident()}:{scan_type}"
@@ -2211,7 +2305,7 @@ def release_comprehensive_scan_db_lock(token):
     """Release the cross-process comprehensive scan lock if still owned by token."""
     if not token:
         return
-    key = "comprehensive_scan_lock"
+    key = COMPREHENSIVE_SCAN_LOCK_KEY
     database = get_database()
     try:
         database.execute("BEGIN IMMEDIATE")
@@ -2486,6 +2580,96 @@ def record_nn_scan_status(**updates):
     current["updated_at"] = current_time_cst().isoformat()
     set_app_state(NN_SCAN_STATUS_KEY, json.dumps(current))
     return current
+
+def request_scan_cancel(reason="user_requested"):
+    """Request cooperative cancellation for the active comprehensive scan."""
+    running = get_running_comprehensive_scan()
+    if not running:
+        status = get_nn_scan_status_payload()
+        if status.get("status") == "running" and not is_live_scan_heartbeat_fresh(status):
+            mark_stalled_scan_events(max_age_minutes=0, zero_progress_minutes=0)
+        return {"success": True, "cancelled": False, "reason": "no_active_scan"}
+    payload = {
+        "scan_event_id": running.get("id"),
+        "requested_at": current_time_cst().isoformat(),
+        "reason": reason,
+    }
+    set_app_state(SCAN_CANCEL_KEY, json.dumps(payload))
+    status = record_nn_scan_status(
+        status="cancelling",
+        started=False,
+        already_running=True,
+        scan_event_id=running.get("id"),
+        phase="cancelling",
+        current_ticker=None,
+        error="Cancel requested; scan is stopping at the next checkpoint.",
+    )
+    return {"success": True, "cancelled": True, "scan_event_id": running.get("id"), "status": status}
+
+def clear_scan_cancel_request(scan_event_id=None):
+    payload = get_app_state_json(SCAN_CANCEL_KEY, {}) or {}
+    if scan_event_id and payload.get("scan_event_id") and int(payload.get("scan_event_id") or 0) != int(scan_event_id):
+        return
+    database = get_database()
+    database.execute("DELETE FROM app_state WHERE key=?", [SCAN_CANCEL_KEY])
+    database.commit()
+    database.close()
+
+def scan_cancel_requested(scan_event_id):
+    if not scan_event_id:
+        return False
+    payload = get_app_state_json(SCAN_CANCEL_KEY, {}) or {}
+    try:
+        return int(payload.get("scan_event_id") or 0) == int(scan_event_id)
+    except Exception:
+        return False
+
+def raise_if_scan_cancelled(scan_event_id):
+    if scan_cancel_requested(scan_event_id):
+        raise ScanCancelled("scan_cancelled_by_user")
+
+def latest_comprehensive_scan(statuses=None):
+    statuses = statuses or ("success", "degraded")
+    placeholders = ",".join(["?"] * len(statuses))
+    database = get_database()
+    row = database.execute(f"""
+        SELECT * FROM scan_events
+        WHERE job_type='comprehensive' AND status IN ({placeholders})
+        ORDER BY finished_at DESC, started_at DESC LIMIT 1
+    """, list(statuses)).fetchone()
+    database.close()
+    return dict(row) if row else None
+
+def should_run_scheduled_comprehensive_scan(scan_type):
+    """Apply pause/frequency controls before scheduled scan jobs enter the hot path."""
+    settings = get_scan_control_settings()
+    if settings.get("scheduled_scans_paused"):
+        return False, "scheduled_scans_paused"
+    running = get_running_comprehensive_scan()
+    if running:
+        return False, "scan_already_running"
+    latest = latest_comprehensive_scan(("success", "degraded"))
+    if latest:
+        finished_at = _parse_iso(latest.get("finished_at") or latest.get("started_at"))
+        if finished_at:
+            age_minutes = (current_time_cst() - finished_at).total_seconds() / 60
+            frequency = int(settings.get("scan_frequency_minutes") or 30)
+            if age_minutes < frequency:
+                return False, f"frequency_wait_{round(frequency - age_minutes, 1)}m"
+    return True, None
+
+def run_scheduled_comprehensive_scan(scan_type):
+    """Scheduler-facing wrapper: respects pause/frequency and never overlaps scans."""
+    allowed, reason = should_run_scheduled_comprehensive_scan(scan_type)
+    if not allowed:
+        log.info(f"Scheduled scan skipped ({scan_type}): {reason}")
+        return {
+            "skipped": True,
+            "reason": reason,
+            "scan_type": scan_type,
+            "nn_picks": {"picks": 0, "qualified_count": 0, "source": "shared_comprehensive_scan"},
+        }
+    return run_comprehensive_scan(scan_type=scan_type)
 
 def confidence_evidence_level(sample_size):
     """Human label for how much resolved history supports a confidence bucket."""
@@ -2940,12 +3124,12 @@ def log_nova_signal_observations(scan_event_id, scan_type, scored_rows, price_da
 def get_nn_scan_status_payload():
     """Return shared Nova scan status with stale running states marked clearly."""
     status = get_app_state_json(NN_SCAN_STATUS_KEY, {}) or {}
-    if status.get("status") == "running":
+    if status.get("status") in {"running", "cancelling"}:
         running_scan = get_running_comprehensive_scan()
         if not running_scan:
             next_status = dict(status)
             next_status.update(
-                status="stalled",
+                status="cancelled" if status.get("status") == "cancelling" else "stalled",
                 started=False,
                 already_running=False,
                 finished_at=current_time_cst().isoformat(),
@@ -2966,7 +3150,7 @@ def start_shared_scan_background(scan_type="manual_shared"):
     """
     with _nn_scan_thread_lock:
         current = get_nn_scan_status_payload()
-        if current.get("status") == "running":
+        if current.get("status") in {"running", "cancelling"}:
             return {**current, "started": False, "already_running": True}
         running_scan = get_running_comprehensive_scan()
         if running_scan:
@@ -3006,8 +3190,9 @@ def start_shared_scan_background(scan_type="manual_shared"):
             try:
                 result = run_comprehensive_scan(scan_type=scan_type)
                 if result.get("skipped"):
+                    cancelled = bool(result.get("cancelled"))
                     record_nn_scan_status(
-                        status="stalled",
+                        status="cancelled" if cancelled else "stalled",
                         scan_type=scan_type,
                         source="shared_comprehensive_scan",
                         started=False,
@@ -5775,6 +5960,7 @@ def enrich_matched_volume_context(tickers, price_data, now_central=None, scan_ev
     started = time.time()
     max_seconds = float(os.getenv("SCAN_MATCHED_VOLUME_MAX_SECONDS", "45"))
     for idx, ticker in enumerate(candidates, start=1):
+        raise_if_scan_cancelled(scan_event_id)
         if time.time() - started > max_seconds:
             log.warning(f"Matched-volume refresh budget exhausted after {time.time() - started:.1f}s")
             break
@@ -5980,6 +6166,7 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
         cycle = ProviderCycle("comprehensive_quote")
         refreshed_tickers = []
         for idx, ticker in enumerate(to_refresh, start=1):
+            raise_if_scan_cancelled(scan_event_id)
             elapsed = time.time() - fetch_started
             if elapsed > max_fetch_seconds:
                 log.warning(f"Price refresh budget exhausted after {elapsed:.1f}s; continuing scan with {len(results)}/{len(tickers)} tickers")
@@ -6508,6 +6695,7 @@ def enrich_price_data_with_history(tickers, price_data, scan_event_id=None, scan
     started = time.time()
     max_seconds = float(os.getenv("SCAN_HISTORY_REFRESH_MAX_SECONDS", "45"))
     for idx, ticker in enumerate(selected, start=1):
+        raise_if_scan_cancelled(scan_event_id)
         if time.time() - started > max_seconds:
             log.warning(f"History refresh budget exhausted after {time.time() - started:.1f}s")
             break
@@ -8576,6 +8764,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
     # Ensure SPY is always fetched — needed for relative strength calculations
     universe_with_spy = list(dict.fromkeys(universe + ["SPY"]))
     price_data = fetch_price_data(universe_with_spy, scan_event_id=scan_event_id, scan_type=scan_type)
+    raise_if_scan_cancelled(scan_event_id)
     record_nn_scan_status(
         status="running",
         scan_type=scan_type,
@@ -8595,7 +8784,9 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
 
     # During pre/post market hours, override stale daily closes with live prices
     enrich_with_live_prices(universe_with_spy, price_data)
+    raise_if_scan_cancelled(scan_event_id)
     enrich_price_data_with_history(universe_with_spy, price_data, scan_event_id=scan_event_id, scan_type=scan_type)
+    raise_if_scan_cancelled(scan_event_id)
     volume_context_updates = apply_volume_context_to_price_data(price_data)
     if volume_context_updates:
         log.info(f"Volume context updated from daily history for {volume_context_updates} scan rows")
@@ -8607,6 +8798,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
     )
     if matched_volume_updates:
         log.info(f"Matched volume context updated for {matched_volume_updates} scan rows")
+    raise_if_scan_cancelled(scan_event_id)
 
     # Filter out tickers where yfinance returned weekend/holiday stale data.
     # If the latest price date is more than 3 days old, the data is stale.
@@ -8629,6 +8821,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
     # Pre-compute S&R analysis for all tickers — stored on price_data["sr_analysis"]
     # so calculate_confidence_score can read it without recomputing per-ticker
     for ticker in list(price_data.keys()):
+        raise_if_scan_cancelled(scan_event_id)
         try:
             expected_move_pct = 5.0  # Rough default; refined per-pick after scoring
             price_data[ticker]["expected_move_pct"] = expected_move_pct
@@ -8654,6 +8847,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
     scored_stocks = []
     scanned_tickers = []
     for idx, ticker in enumerate(universe, start=1):
+        raise_if_scan_cancelled(scan_event_id)
         scanned_tickers.append(ticker)
         if idx == 1 or idx % 2 == 0 or idx == len(universe):
             record_nn_scan_status(
@@ -8822,6 +9016,7 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
     vector_executable_tickers = [s["ticker"] for s in recommended_longs]
 
     # Run Darvas silent collection on all scored stocks
+    raise_if_scan_cancelled(scan_event_id)
     run_darvas_silent_collection(price_data, scored_stocks)
     run_method_signal_logging(price_data, scored_stocks)
 
@@ -9038,10 +9233,33 @@ def run_comprehensive_scan(weights=None, scan_type="scheduled"):
                 "nn_picks": {"picks": 0, "qualified_count": 0, "source": "shared_comprehensive_scan"},
             }
         return _run_comprehensive_scan_impl(weights=weights, scan_type=scan_type)
+    except ScanCancelled as error:
+        mark_running_events_cancelled("comprehensive", started_after, error)
+        record_nn_scan_status(
+            status="cancelled",
+            scan_type=scan_type,
+            source="shared_comprehensive_scan",
+            started=False,
+            already_running=False,
+            finished_at=current_time_cst().isoformat(),
+            error=str(error),
+        )
+        clear_scan_cancel_request()
+        return {
+            "longs": [],
+            "shorts": [],
+            "total_scanned": 0,
+            "scan_type": scan_type,
+            "skipped": True,
+            "cancelled": True,
+            "reason": str(error),
+            "nn_picks": {"picks": 0, "qualified_count": 0, "source": "shared_comprehensive_scan"},
+        }
     except Exception as error:
         mark_running_events_error("comprehensive", started_after, error)
         raise
     finally:
+        clear_scan_cancel_request()
         release_comprehensive_scan_db_lock(db_lock_token)
         _comprehensive_scan_lock.release()
 
@@ -11618,7 +11836,7 @@ def run_scheduler():
         table.setdefault(slot, []).append((name, callback))
 
     def add_scan(table, slot, scan_type):
-        add_job(table, slot, f"scan:{scan_type}", lambda st=scan_type: run_comprehensive_scan(scan_type=st))
+        add_job(table, slot, f"scan:{scan_type}", lambda st=scan_type: run_scheduled_comprehensive_scan(st))
 
     def eod_variant_equity_snapshot():
         """Store one ledger point for every active variant at the end of each market day."""
@@ -14108,6 +14326,79 @@ def api_scan_history():
         })
     return jsonify(rows)
 
+@app.route("/api/scan-friction")
+def api_scan_friction():
+    """Operational scan diagnostics: why scans are degraded, stalled, or blocked."""
+    mark_stalled_scan_events(max_age_minutes=10)
+    status = get_nn_scan_status_payload()
+    database = get_database()
+    latest = database.execute("""
+        SELECT * FROM scan_events
+        WHERE job_type='comprehensive'
+        ORDER BY started_at DESC LIMIT 1
+    """).fetchone()
+    last_success = database.execute("""
+        SELECT * FROM scan_events
+        WHERE job_type='comprehensive' AND status IN ('success','degraded')
+        ORDER BY finished_at DESC, started_at DESC LIMIT 1
+    """).fetchone()
+    recent_problem_rows = [dict(r) for r in database.execute("""
+        SELECT id, scan_type, started_at, finished_at, status, tickers_attempted, tickers_updated, error
+        FROM scan_events
+        WHERE job_type='comprehensive' AND status IN ('degraded','error','stalled','cancelled')
+        ORDER BY started_at DESC LIMIT 8
+    """).fetchall()]
+    provider_rows = [dict(r) for r in database.execute(
+        "SELECT provider, status, success_count, failure_count, rate_limit_count, timeout_count, missing_count, last_success_at, last_failure_at, cooldown_until, last_error FROM provider_health ORDER BY provider"
+    ).fetchall()]
+    lock_row = database.execute("SELECT value FROM app_state WHERE key=?", [COMPREHENSIVE_SCAN_LOCK_KEY]).fetchone()
+    database.close()
+
+    lock_payload = None
+    if lock_row:
+        try:
+            lock_payload = json.loads(lock_row["value"] or "{}")
+        except Exception:
+            lock_payload = {"raw": lock_row["value"]}
+
+    latest_scan = dict(latest) if latest else None
+    last_success_scan = dict(last_success) if last_success else None
+    expected = int((latest_scan or {}).get("tickers_attempted") or status.get("scan_total_expected") or status.get("total_expected") or 0)
+    updated = int((latest_scan or {}).get("tickers_updated") or status.get("price_rows_loaded") or status.get("total_scanned") or 0)
+    degraded_reason = None
+    if latest_scan:
+        if latest_scan.get("status") == "degraded":
+            degraded_reason = latest_scan.get("error") or f"Only {updated}/{expected} price rows were usable."
+        elif latest_scan.get("status") in {"error", "stalled", "cancelled"}:
+            degraded_reason = latest_scan.get("error") or latest_scan.get("status")
+    if not degraded_reason and status.get("error"):
+        degraded_reason = status.get("error")
+
+    provider_summary = get_app_state_json("last_price_provider_summary", {}) or {}
+    provider_health_summary = {
+        "active": sum(1 for row in provider_rows if row.get("status") == "active"),
+        "degraded": sum(1 for row in provider_rows if row.get("status") == "degraded"),
+        "cooldown": sum(1 for row in provider_rows if row.get("status") == "cooldown"),
+        "benched": sum(1 for row in provider_rows if row.get("status") == "benched"),
+    }
+    return jsonify({
+        "success": True,
+        "now_cst": current_time_cst().isoformat(),
+        "status": status,
+        "control": get_scan_control_settings(),
+        "latest_scan": latest_scan,
+        "last_successful_full_scan": last_success_scan,
+        "degraded_reason": degraded_reason,
+        "current_phase": status.get("phase"),
+        "current_ticker": status.get("current_ticker"),
+        "heartbeat_age_minutes": round(scan_status_age_minutes(status), 2) if scan_status_age_minutes(status) is not None else None,
+        "lock": lock_payload,
+        "provider_health": provider_rows,
+        "provider_health_summary": provider_health_summary,
+        "provider_summary": provider_summary,
+        "recent_problem_scans": recent_problem_rows,
+    })
+
 @app.route("/api/freshness-status")
 def api_freshness_status():
     """Explain whether scans, monitor checks, and provider data are fresh enough to trust."""
@@ -15640,6 +15931,27 @@ def api_shared_scan_now():
         return jsonify(response), http_status
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/scan-cancel", methods=["POST"])
+def api_scan_cancel():
+    """Cancel the active comprehensive scan and release it from decision flow."""
+    try:
+        body = request.get_json(silent=True) or {}
+        result = request_scan_cancel(body.get("reason") or "user_requested")
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/scan-control", methods=["GET", "POST"])
+def api_scan_control():
+    """Read/update scheduled scan pause and frequency controls."""
+    try:
+        if request.method == "POST":
+            body = request.get_json(silent=True) or {}
+            return jsonify({"success": True, "control": update_scan_control_settings(body)})
+        return jsonify({"success": True, "control": get_scan_control_settings()})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 400
 
 @app.route("/api/nn-scan-status")
 def api_nn_scan_status():
