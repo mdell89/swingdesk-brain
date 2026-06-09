@@ -207,6 +207,49 @@ expected_move = model estimate from scoring engine
 
 Expected move is not the same as day percent or open P&L.
 
+## Locked Risk/Reward Contract
+
+Every opened SwingDesk trade must lock its entry-time estimated move and derive target/stop math from that locked value.
+
+Later dynamic estimates may inform monitoring context, but they may not retroactively widen the original stop.
+
+Default contract:
+
+```text
+entry_estimated_move_floor_pct = 5.0
+minimum_reward_risk_ratio = 2.0
+stop_loss_risk_fraction = 0.50
+min_stop_loss_pct = configurable
+max_stop_loss_pct = configurable
+
+target_profit_pct = locked_entry_estimated_move_pct
+
+raw_stop_loss_pct = locked_entry_estimated_move_pct * stop_loss_risk_fraction
+
+locked_stop_loss_pct = min(
+  clamp(raw_stop_loss_pct, min_stop_loss_pct, max_stop_loss_pct),
+  locked_entry_estimated_move_pct / minimum_reward_risk_ratio
+)
+```
+
+Opening invariant:
+
+```text
+locked_entry_estimated_move_pct >= entry_estimated_move_floor_pct
+locked_entry_estimated_move_pct / locked_stop_loss_pct >= minimum_reward_risk_ratio
+```
+
+Target-cashout exit variants close when open P&L reaches `target_profit_pct`.
+
+All exit variants must close when open P&L reaches `-locked_stop_loss_pct`, unless a stricter strategy-native stop is explicitly defined.
+
+Half-carry exit variants record one parent position with two exit legs, or equivalent linked child rows:
+
+```text
+leg A: 50% sold at first 2:45 PM cutoff when thesis persists
+leg B: remaining 50% sold on reversal or by the next 2:45 PM cutoff
+```
+
 ## Invariants
 
 These must always be true:
@@ -218,6 +261,8 @@ These must always be true:
 - Closed trades are never deduped in All view.
 - A card with unknown previous close must not display `0.0%` day change.
 - Legacy trades never affect active Vector/Nova truth.
+- No SwingDesk trade opens below the configured minimum reward/risk ratio.
+- Locked stop values may tighten but may not widen after entry.
 
 ## Tests Required
 

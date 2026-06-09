@@ -133,6 +133,25 @@ Expected move is the model estimate, not the day percent.
 
 Pick confidence must be actionable under the selected strategy floor unless the UI explicitly labels the pick as fallback/provisional.
 
+Card percent labels:
+
+```text
+DAY / %CHG
+  = current or scan price versus the prior completed regular-session close.
+  = never postmarket-only movement.
+  = unknown when previous close is missing, stale, suspect, or invalid.
+
+GAP
+  = session/premarket reference price versus the prior completed regular-session close.
+  = separate from DAY.
+
+POST
+  = optional explicit postmarket-only movement versus the current day's regular-session close.
+  = must never populate DAY / %CHG.
+```
+
+V2 watchlists should hide rows with expected move below 3.0% unless the UI is in an explicit diagnostic/debug mode.
+
 ## Open Cards
 
 Open cards show active simulated positions.

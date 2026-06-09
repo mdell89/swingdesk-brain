@@ -74,6 +74,19 @@ Lock:
 
 The lock prevents late scan churn from rewriting the committed premarket pick queue immediately before opening execution.
 
+Every scheduled entry slot must also have an entry-specific decision snapshot.
+
+```text
+04:55 lock -> 05:00 entry variants
+05:55 lock -> 06:00 entry variants
+06:55 lock -> 07:00 entry variants
+08:25 lock -> 08:45 entry variants
+```
+
+The lock stores the exact Vector, Nova, and Scoring V2 candidate payloads that may be opened by the corresponding entry job.
+
+Execution must use the locked snapshot for its entry slot. If the locked snapshot is missing, stale, incomplete, or pair-mismatched, execution must skip and write a visible refusal reason.
+
 ## Variant Entry Jobs
 
 Known entry jobs:
@@ -86,7 +99,7 @@ Known entry jobs:
 regular-session strategy variants where explicitly defined
 ```
 
-Variant execution should use the freshest completed eligible shared scan, not an in-progress or stalled scan.
+Variant execution should use the locked eligible shared scan for its entry slot, not an in-progress or stalled scan.
 
 If no fresh completed shared scan exists, the variant should skip or block with a visible reason.
 

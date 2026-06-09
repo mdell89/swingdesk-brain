@@ -86,8 +86,21 @@ Approved SwingDesk exit-rule variants to consider:
 
 - baseline: hold winners through existing session logic; target hit does not force exit
 - target cashout: close when estimated target is hit, otherwise follow normal time/loss rules
-- trailing winner: protect gains after target-level profit while allowing further upside
-- hold while score improves: extend only while confidence/context remains constructive
+- half carry: at the first 2:45 PM cutoff, sell 50% if the long thesis persists and carry the remaining 50% into the next regular session; sell the carried half early on meaningful reversal or by the next 2:45 PM cutoff.
+
+Initial SwingDesk exit-mode matrix:
+
+```text
+2 engines (SwingDesk, SwingDesk V2)
+x 2 brains (Vector, Nova)
+x 4 entry times (05:00, 06:00, 07:00, 08:45)
+x 3 exit modes (baseline, target_cashout, half_carry)
+= 48 variants
+```
+
+Exit modes are mutually exclusive controlled experiments until evidence justifies testing combined modes.
+
+Strategies with non-negotiable native exit rules may opt out of the generic SwingDesk exit-mode matrix, but the opt-out must be explicit in the strategy profile.
 
 ## Signal
 

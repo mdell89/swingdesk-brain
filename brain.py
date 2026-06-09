@@ -3618,7 +3618,56 @@ def cache_age_minutes(timestamp):
         return None
     return round((current_time_cst() - parsed).total_seconds() / 60, 1)
 
-def variant_cache_snapshot(database, require_fresh=True, max_age_minutes=180):
+def entry_snapshot_key(slot, suffix):
+    normalized = str(slot or "").strip()[:5].replace(":", "")
+    return f"entry_lock_{normalized}_{suffix}"
+
+def write_entry_snapshot(database, slot):
+    """Freeze the exact decision payloads allowed to execute for one entry slot."""
+    slot = str(slot or "").strip()[:5]
+    now_iso = current_time_cst().isoformat()
+    sources = [
+        ("cached_picks", "cached_picks_time", "vector"),
+        ("cached_nn_picks", "cached_nn_picks_time", "nova"),
+        (SCORING_V2_SCAN_CACHE_KEY, None, "v2"),
+    ]
+    copied = []
+    missing = []
+    for value_key, time_key, suffix in sources:
+        row = database.execute("SELECT value FROM app_state WHERE key=?", [value_key]).fetchone()
+        if not row:
+            missing.append(suffix)
+            continue
+        database.execute(
+            "INSERT OR REPLACE INTO app_state VALUES (?,?)",
+            [entry_snapshot_key(slot, suffix), row["value"]],
+        )
+        if time_key:
+            time_row = database.execute("SELECT value FROM app_state WHERE key=?", [time_key]).fetchone()
+            if time_row:
+                database.execute(
+                    "INSERT OR REPLACE INTO app_state VALUES (?,?)",
+                    [entry_snapshot_key(slot, f"{suffix}_time"), time_row["value"]],
+                )
+        copied.append(suffix)
+    database.execute(
+        "INSERT OR REPLACE INTO app_state VALUES (?,?)",
+        [entry_snapshot_key(slot, "locked_at"), now_iso],
+    )
+    return {"slot": slot, "locked_at": now_iso, "copied": copied, "missing": missing}
+
+def lock_variant_entry_snapshot(slot):
+    """Public scheduler helper for entry-slot decision locks."""
+    database = get_database()
+    try:
+        result = write_entry_snapshot(database, slot)
+        database.commit()
+        log.info(f"Entry snapshot locked for {slot}: copied={result['copied']} missing={result['missing']}")
+        return result
+    finally:
+        database.close()
+
+def variant_cache_snapshot(database, require_fresh=True, max_age_minutes=180, entry_slot=None, require_entry_lock=False):
     """Load the shared Vector/Nova cache pair and reject stale or incomplete manual runs."""
     status_row = database.execute("SELECT value FROM app_state WHERE key=?", [NN_SCAN_STATUS_KEY]).fetchone()
     scan_status = json.loads(status_row["value"]) if status_row and status_row["value"] else {}
@@ -3632,24 +3681,35 @@ def variant_cache_snapshot(database, require_fresh=True, max_age_minutes=180):
             "scan_status": scan_status,
         }
 
+    entry_locked = bool(entry_slot)
     locked = read_pick_queue_locked(database)
     vector_cached = database.execute(
         "SELECT value FROM app_state WHERE key=?",
-        ["locked_picks" if locked else "cached_picks"],
+        [entry_snapshot_key(entry_slot, "vector") if entry_locked else "locked_picks" if locked else "cached_picks"],
     ).fetchone()
     nova_cached = database.execute(
         "SELECT value FROM app_state WHERE key=?",
-        ["locked_nn_picks" if locked else "cached_nn_picks"],
+        [entry_snapshot_key(entry_slot, "nova") if entry_locked else "locked_nn_picks" if locked else "cached_nn_picks"],
     ).fetchone()
     vector_time_row = database.execute(
         "SELECT value FROM app_state WHERE key=?",
-        ["locked_picks_time" if locked else "cached_picks_time"],
+        [entry_snapshot_key(entry_slot, "vector_time") if entry_locked else "locked_picks_time" if locked else "cached_picks_time"],
     ).fetchone()
     nova_time_row = database.execute(
         "SELECT value FROM app_state WHERE key=?",
-        ["locked_nn_picks_time" if locked else "cached_nn_picks_time"],
+        [entry_snapshot_key(entry_slot, "nova_time") if entry_locked else "locked_nn_picks_time" if locked else "cached_nn_picks_time"],
     ).fetchone()
-    if locked and (not vector_cached or not nova_cached):
+    if require_entry_lock and entry_locked and (not vector_cached or not nova_cached):
+        return None, {
+            "success": False,
+            "refused": True,
+            "reason": "missing_entry_lock",
+            "message": f"Entry snapshot for {entry_slot} is missing; execution will not open from an unlocked cache.",
+            "entry_slot": entry_slot,
+            "vector_cached": bool(vector_cached),
+            "nova_cached": bool(nova_cached),
+        }
+    if (locked and not entry_locked) and (not vector_cached or not nova_cached):
         vector_cached = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
         nova_cached = database.execute("SELECT value FROM app_state WHERE key='cached_nn_picks'").fetchone()
         vector_time_row = database.execute("SELECT value FROM app_state WHERE key='cached_picks_time'").fetchone()
@@ -3907,10 +3967,13 @@ def normalize_v2_preview_row(row):
         row["v2_explanation"] = row.get("v2_explanation") or f"{row.get('ticker')} watchlist: {reason}"
     return row
 
-def load_scoring_v2_cache_rows(database):
+def load_scoring_v2_cache_rows(database, entry_slot=None, require_entry_lock=False):
     """Return the latest full-scan V2 cache with normalized Vector/Nova rows."""
-    cache_row = database.execute("SELECT value FROM app_state WHERE key=?", [SCORING_V2_SCAN_CACHE_KEY]).fetchone()
+    cache_key = entry_snapshot_key(entry_slot, "v2") if entry_slot else SCORING_V2_SCAN_CACHE_KEY
+    cache_row = database.execute("SELECT value FROM app_state WHERE key=?", [cache_key]).fetchone()
     if not cache_row:
+        if require_entry_lock:
+            return None, [], []
         return None, [], []
     cache = json.loads(cache_row["value"] or "{}")
     vector_rows = [normalize_v2_preview_row(row) for row in (cache.get("vector_rows") or [])]
@@ -7773,8 +7836,12 @@ def enrich_with_live_prices(tickers, price_data):
                 data["gap_percent"] = round(new_gap, 4)
                 data["premarket_change_percent"] = round(new_gap, 4)
             else:
-                new_change = (live_price - today_close) / max(today_close, 0.01) * 100
-                data["day_change_percent"] = round(new_change, 4)
+                post_change = (live_price - today_close) / max(today_close, 0.01) * 100
+                data["postmarket_change_percent"] = round(post_change, 4)
+                day_change = pct_from_baseline(live_price, prev_close)
+                if day_change is not None:
+                    data["day_change_percent"] = round(day_change, 4)
+                    data["day_change_pct"] = round(day_change, 4)
             data["live_price_source"] = quote.get("source", "provider")
             enriched += 1
             if not cached_quote:
@@ -8500,7 +8567,7 @@ def sanitize_cached_pick_payload(payload, confidence_floor=CONFIDENCE_FLOOR):
     return sanitized
 
 # ── NEURAL NETWORK SCAN ──────────────────────────────────────────────────────
-def run_variant_universes_from_cache(trigger="manual", buy_time=None, require_fresh=True):
+def run_variant_universes_from_cache(trigger="manual", buy_time=None, require_fresh=True, require_entry_lock=False):
     """Open simulated trades for every active strategy universe from cached shared scan outputs."""
     status = {
         "success": True,
@@ -8528,7 +8595,12 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None, require_fr
     )
     database = get_database()
     try:
-        snapshot, refusal = variant_cache_snapshot(database, require_fresh=require_fresh)
+        snapshot, refusal = variant_cache_snapshot(
+            database,
+            require_fresh=require_fresh,
+            entry_slot=target_execution_time if require_entry_lock else None,
+            require_entry_lock=require_entry_lock,
+        )
         if refusal:
             status.update(refusal)
             database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_variant_run', ?)", [json.dumps(status)])
@@ -8714,7 +8786,7 @@ def run_variant_universes_from_cache(trigger="manual", buy_time=None, require_fr
     finally:
         database.close()
 
-def run_v2_variant_universes_from_cache(trigger="manual_v2", buy_time=None, require_fresh=True, max_age_minutes=180):
+def run_v2_variant_universes_from_cache(trigger="manual_v2", buy_time=None, require_fresh=True, max_age_minutes=180, require_entry_lock=False):
     """Open V2-only paper trades from the latest Scoring V2 full-scan cache."""
     today = current_time_cst().strftime("%Y-%m-%d")
     buy_time = buy_time or current_time_cst().strftime("%H:%M:%S")
@@ -8745,13 +8817,21 @@ def run_v2_variant_universes_from_cache(trigger="manual_v2", buy_time=None, requ
     )
     database = get_database()
     try:
-        v2_cache, vector_rows, nova_rows = load_scoring_v2_cache_rows(database)
+        v2_cache, vector_rows, nova_rows = load_scoring_v2_cache_rows(
+            database,
+            entry_slot=target_execution_time if require_entry_lock else None,
+            require_entry_lock=require_entry_lock,
+        )
         if not v2_cache:
             status.update({
                 "success": False,
                 "refused": True,
-                "reason": "missing_v2_cache",
-                "message": "No Scoring V2 full-scan cache exists yet.",
+                "reason": "missing_v2_entry_lock" if require_entry_lock else "missing_v2_cache",
+                "message": (
+                    f"No locked Scoring V2 snapshot exists for {target_execution_time}."
+                    if require_entry_lock else
+                    "No Scoring V2 full-scan cache exists yet."
+                ),
             })
             database.execute("INSERT OR REPLACE INTO app_state VALUES ('last_v2_variant_run', ?)", [json.dumps(status)])
             database.commit()
@@ -9442,6 +9522,7 @@ def lock_pick_queue():
             database.execute("INSERT OR REPLACE INTO app_state VALUES ('locked_nn_picks', ?)", [cached_nn_picks["value"]])
         if cached_nn_picks_time:
             database.execute("INSERT OR REPLACE INTO app_state VALUES ('locked_nn_picks_time', ?)", [cached_nn_picks_time["value"]])
+        write_entry_snapshot(database, "08:45")
         database.commit()
         database.close()
         log.info("Pick queue locked at 8:25 AM CST — no new picks until next session")
@@ -11070,12 +11151,15 @@ def run_scheduler():
         add_scan(dispatch, slot, f"pre_market_{label}")
 
     add_job(dispatch, "04:00", "unlock_pick_queue", unlock_pick_queue)
-    add_job(dispatch, "05:00", "variant_0500", lambda: run_variant_universes_from_cache(trigger="scheduled_0500", buy_time="05:00:00"))
-    add_job(dispatch, "05:00", "v2_variant_0500", lambda: run_v2_variant_universes_from_cache(trigger="scheduled_v2_0500", buy_time="05:00:00"))
-    add_job(dispatch, "06:00", "variant_0600", lambda: run_variant_universes_from_cache(trigger="scheduled_0600", buy_time="06:00:00"))
-    add_job(dispatch, "06:00", "v2_variant_0600", lambda: run_v2_variant_universes_from_cache(trigger="scheduled_v2_0600", buy_time="06:00:00"))
-    add_job(dispatch, "07:00", "variant_0700", lambda: run_variant_universes_from_cache(trigger="scheduled_0700", buy_time="07:00:00"))
-    add_job(dispatch, "07:00", "v2_variant_0700", lambda: run_v2_variant_universes_from_cache(trigger="scheduled_v2_0700", buy_time="07:00:00"))
+    add_job(dispatch, "04:55", "lock_entry_0500", lambda: lock_variant_entry_snapshot("05:00"))
+    add_job(dispatch, "05:00", "variant_0500", lambda: run_variant_universes_from_cache(trigger="scheduled_0500", buy_time="05:00:00", require_entry_lock=True))
+    add_job(dispatch, "05:00", "v2_variant_0500", lambda: run_v2_variant_universes_from_cache(trigger="scheduled_v2_0500", buy_time="05:00:00", require_entry_lock=True))
+    add_job(dispatch, "05:55", "lock_entry_0600", lambda: lock_variant_entry_snapshot("06:00"))
+    add_job(dispatch, "06:00", "variant_0600", lambda: run_variant_universes_from_cache(trigger="scheduled_0600", buy_time="06:00:00", require_entry_lock=True))
+    add_job(dispatch, "06:00", "v2_variant_0600", lambda: run_v2_variant_universes_from_cache(trigger="scheduled_v2_0600", buy_time="06:00:00", require_entry_lock=True))
+    add_job(dispatch, "06:55", "lock_entry_0700", lambda: lock_variant_entry_snapshot("07:00"))
+    add_job(dispatch, "07:00", "variant_0700", lambda: run_variant_universes_from_cache(trigger="scheduled_0700", buy_time="07:00:00", require_entry_lock=True))
+    add_job(dispatch, "07:00", "v2_variant_0700", lambda: run_v2_variant_universes_from_cache(trigger="scheduled_v2_0700", buy_time="07:00:00", require_entry_lock=True))
     add_scan(dispatch, "08:15", "final_scan")
     add_job(dispatch, "08:25", "lock_pick_queue", lock_pick_queue)
     add_scan(dispatch, "08:30", "market_open")
@@ -11084,8 +11168,8 @@ def run_scheduler():
         add_job(dispatch, "08:45", "execute_nn_opening_positions", execute_nn_opening_positions)
     else:
         log.info("Legacy virtual_trades openers disabled; variant universe is authoritative")
-    add_job(dispatch, "08:45", "variant_0845", lambda: run_variant_universes_from_cache(trigger="scheduled_0845", buy_time="08:45:00"))
-    add_job(dispatch, "08:45", "v2_variant_0845", lambda: run_v2_variant_universes_from_cache(trigger="scheduled_v2_0845", buy_time="08:45:00"))
+    add_job(dispatch, "08:45", "variant_0845", lambda: run_variant_universes_from_cache(trigger="scheduled_0845", buy_time="08:45:00", require_entry_lock=True))
+    add_job(dispatch, "08:45", "v2_variant_0845", lambda: run_v2_variant_universes_from_cache(trigger="scheduled_v2_0845", buy_time="08:45:00", require_entry_lock=True))
 
     for slot, label in [
         ("09:00", "9:00am"), ("09:30", "9:30am"),
@@ -11364,10 +11448,15 @@ def api_scoring_v2_shadow():
                 })
             return output
 
-        def watchlist_rows(rows, limit=10):
+        def watchlist_rows(rows, limit=10, min_expected_move=3.0):
             candidates = [
                 row for row in rows
-                if not row.get("v2_actionable") and not row.get("v2_blocked") and row.get("v2_score") is not None
+                if (
+                    not row.get("v2_actionable")
+                    and not row.get("v2_blocked")
+                    and row.get("v2_score") is not None
+                    and float(row.get("v2_expected_move") or row.get("long_move") or 0) >= min_expected_move
+                )
             ]
             candidates.sort(key=lambda row: (float(row.get("v2_score") or 0), float(row.get("legacy_confidence") or 0)), reverse=True)
             return candidates[:limit]
