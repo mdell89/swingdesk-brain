@@ -1194,6 +1194,24 @@ def initialize_database():
             error TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS scan_ticker_friction (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_event_id INTEGER,
+            scan_type TEXT,
+            ticker TEXT NOT NULL,
+            phase TEXT,
+            provider TEXT,
+            failure_type TEXT,
+            reason TEXT,
+            elapsed_ms INTEGER,
+            occurred_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_scan_ticker_friction_scan
+            ON scan_ticker_friction(scan_event_id, ticker);
+        CREATE INDEX IF NOT EXISTS idx_scan_ticker_friction_ticker
+            ON scan_ticker_friction(ticker, occurred_at);
+
         CREATE TABLE IF NOT EXISTS strategy_variants (
             -- Historical table name. Each row is a simulation universe:
             -- strategy/method label + brain + entry time + selection mode + exit mode.
@@ -2670,6 +2688,83 @@ def run_scheduled_comprehensive_scan(scan_type):
             "nn_picks": {"picks": 0, "qualified_count": 0, "source": "shared_comprehensive_scan"},
         }
     return run_comprehensive_scan(scan_type=scan_type)
+
+def record_scan_ticker_friction(scan_event_id, scan_type, ticker, phase, failure_type, provider=None, reason=None, elapsed_ms=None):
+    """Persist per-ticker scan friction so repeated failures are evidence-based."""
+    if not scan_event_id or not ticker or not failure_type:
+        return False
+    try:
+        database = get_database()
+        database.execute("""
+            INSERT INTO scan_ticker_friction
+            (scan_event_id, scan_type, ticker, phase, provider, failure_type, reason, elapsed_ms, occurred_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            scan_event_id,
+            scan_type,
+            str(ticker).upper(),
+            phase,
+            provider,
+            failure_type,
+            str(reason or "")[:500],
+            int(elapsed_ms) if elapsed_ms is not None else None,
+            current_time_cst().isoformat(),
+        ])
+        database.commit()
+        database.close()
+        return True
+    except Exception as exc:
+        log.debug(f"scan ticker friction log skipped for {ticker}: {exc}")
+        return False
+
+def get_scan_ticker_friction_summary(limit=12, days=7):
+    """Return recent repeat ticker friction, ordered by frequency and recency."""
+    cutoff = (current_time_cst() - timedelta(days=days)).isoformat()
+    database = get_database()
+    rows = [dict(r) for r in database.execute("""
+        SELECT ticker,
+               COUNT(*) AS event_count,
+               COUNT(DISTINCT scan_event_id) AS scan_count,
+               MAX(occurred_at) AS latest_at,
+               MAX(COALESCE(elapsed_ms, 0)) AS max_elapsed_ms,
+               (
+                   SELECT phase FROM scan_ticker_friction inner_f
+                   WHERE inner_f.ticker = outer_f.ticker
+                   ORDER BY occurred_at DESC LIMIT 1
+               ) AS latest_phase,
+               (
+                   SELECT failure_type FROM scan_ticker_friction inner_f
+                   WHERE inner_f.ticker = outer_f.ticker
+                   ORDER BY occurred_at DESC LIMIT 1
+               ) AS latest_failure_type,
+               (
+                   SELECT provider FROM scan_ticker_friction inner_f
+                   WHERE inner_f.ticker = outer_f.ticker
+                   ORDER BY occurred_at DESC LIMIT 1
+               ) AS latest_provider,
+               (
+                   SELECT reason FROM scan_ticker_friction inner_f
+                   WHERE inner_f.ticker = outer_f.ticker
+                   ORDER BY occurred_at DESC LIMIT 1
+               ) AS latest_reason
+        FROM scan_ticker_friction outer_f
+        WHERE occurred_at >= ?
+        GROUP BY ticker
+        ORDER BY event_count DESC, latest_at DESC
+        LIMIT ?
+    """, [cutoff, int(limit or 12)]).fetchall()]
+    recent = [dict(r) for r in database.execute("""
+        SELECT scan_event_id, scan_type, ticker, phase, provider, failure_type, reason, elapsed_ms, occurred_at
+        FROM scan_ticker_friction
+        ORDER BY occurred_at DESC
+        LIMIT 20
+    """).fetchall()]
+    database.close()
+    return {
+        "window_days": days,
+        "repeat_offenders": rows,
+        "recent_events": recent,
+    }
 
 def confidence_evidence_level(sample_size):
     """Human label for how much resolved history supports a confidence bucket."""
@@ -5961,8 +6056,17 @@ def enrich_matched_volume_context(tickers, price_data, now_central=None, scan_ev
     max_seconds = float(os.getenv("SCAN_MATCHED_VOLUME_MAX_SECONDS", "45"))
     for idx, ticker in enumerate(candidates, start=1):
         raise_if_scan_cancelled(scan_event_id)
+        ticker_started = time.time()
         if time.time() - started > max_seconds:
             log.warning(f"Matched-volume refresh budget exhausted after {time.time() - started:.1f}s")
+            record_scan_ticker_friction(
+                scan_event_id,
+                scan_type,
+                ticker,
+                "fetching_matched_volume",
+                "matched_volume_budget_exhausted",
+                reason=f"matched-volume budget exhausted after {time.time() - started:.1f}s",
+            )
             break
         if idx == 1 or idx % 10 == 0 or idx == len(candidates):
             record_nn_scan_status(
@@ -5978,6 +6082,16 @@ def enrich_matched_volume_context(tickers, price_data, now_central=None, scan_ev
             )
         bars = fetch_intraday_volume_bars(ticker, now_central=now_central)
         if not bars:
+            record_scan_ticker_friction(
+                scan_event_id,
+                scan_type,
+                ticker,
+                "fetching_matched_volume",
+                "intraday_volume_bars_missing",
+                provider="massive,yfinance" if os.getenv("SCAN_ENABLE_YFINANCE_VOLUME_FALLBACK", "0").lower() in {"1", "true", "yes", "on"} else "massive",
+                reason="no intraday bars available for matched-volume comparison",
+                elapsed_ms=(time.time() - ticker_started) * 1000,
+            )
             continue
         updates = []
         if premarket_window:
@@ -5992,6 +6106,16 @@ def enrich_matched_volume_context(tickers, price_data, now_central=None, scan_ev
             applied = True
         if applied:
             updated += 1
+        else:
+            record_scan_ticker_friction(
+                scan_event_id,
+                scan_type,
+                ticker,
+                "fetching_matched_volume",
+                "matched_volume_unusable",
+                reason="intraday bars existed but did not produce a usable same-window baseline",
+                elapsed_ms=(time.time() - ticker_started) * 1000,
+            )
         time.sleep(float(os.getenv("SCAN_MATCHED_VOLUME_DELAY_SECONDS", "0.05")))
     return updated
 
@@ -6167,9 +6291,18 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
         refreshed_tickers = []
         for idx, ticker in enumerate(to_refresh, start=1):
             raise_if_scan_cancelled(scan_event_id)
+            ticker_started = time.time()
             elapsed = time.time() - fetch_started
             if elapsed > max_fetch_seconds:
                 log.warning(f"Price refresh budget exhausted after {elapsed:.1f}s; continuing scan with {len(results)}/{len(tickers)} tickers")
+                record_scan_ticker_friction(
+                    scan_event_id,
+                    scan_type,
+                    ticker,
+                    "fetching_prices",
+                    "price_refresh_budget_exhausted",
+                    reason=f"price refresh budget exhausted after {elapsed:.1f}s",
+                )
                 record_nn_scan_status(
                     status="running",
                     scan_type=scan_type,
@@ -6202,6 +6335,17 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
                 quote = validate_quote_baselines(quote, quote.get("daily_history"))
                 results[ticker] = quote
                 refreshed_tickers.append(ticker)
+                if quote.get("price_baseline_suspect"):
+                    record_scan_ticker_friction(
+                        scan_event_id,
+                        scan_type,
+                        ticker,
+                        "fetching_prices",
+                        "price_baseline_suspect",
+                        provider=quote.get("source"),
+                        reason=quote.get("price_baseline_suspect_reason"),
+                        elapsed_ms=(time.time() - ticker_started) * 1000,
+                    )
                 # Cache it
                 try:
                     cache_data = dict(results[ticker])
@@ -6226,6 +6370,18 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
                     database.close()
                 except:
                     pass
+            else:
+                provider_errors = cycle.summary().get("errors", {}) if hasattr(cycle, "summary") else {}
+                record_scan_ticker_friction(
+                    scan_event_id,
+                    scan_type,
+                    ticker,
+                    "fetching_prices",
+                    "quote_missing",
+                    provider=",".join(sorted(provider_errors.keys()))[:80] if provider_errors else None,
+                    reason=json.dumps(provider_errors)[:300] if provider_errors else "all quote providers returned no usable price",
+                    elapsed_ms=(time.time() - ticker_started) * 1000,
+                )
             if scan_event_id and (idx == 1 or idx % 5 == 0 or idx == len(to_refresh)):
                 record_nn_scan_status(
                     status="running",
@@ -6696,8 +6852,17 @@ def enrich_price_data_with_history(tickers, price_data, scan_event_id=None, scan
     max_seconds = float(os.getenv("SCAN_HISTORY_REFRESH_MAX_SECONDS", "45"))
     for idx, ticker in enumerate(selected, start=1):
         raise_if_scan_cancelled(scan_event_id)
+        ticker_started = time.time()
         if time.time() - started > max_seconds:
             log.warning(f"History refresh budget exhausted after {time.time() - started:.1f}s")
+            record_scan_ticker_friction(
+                scan_event_id,
+                scan_type,
+                ticker,
+                "fetching_history",
+                "history_refresh_budget_exhausted",
+                reason=f"history refresh budget exhausted after {time.time() - started:.1f}s",
+            )
             break
         if scan_event_id and (idx == 1 or idx == len(selected) or idx % 5 == 0):
             record_nn_scan_status(
@@ -6716,6 +6881,17 @@ def enrich_price_data_with_history(tickers, price_data, scan_event_id=None, scan
             price_data[ticker]["daily_history"] = history
             repair_quote_baselines_from_history(price_data[ticker], history)
             apply_volume_context_from_history(price_data[ticker], history)
+        else:
+            record_scan_ticker_friction(
+                scan_event_id,
+                scan_type,
+                ticker,
+                "fetching_history",
+                "daily_history_missing",
+                provider=",".join(HISTORY_PROVIDER_CHAIN),
+                reason="all daily-history providers returned no usable candles",
+                elapsed_ms=(time.time() - ticker_started) * 1000,
+            )
     if scan_event_id:
         record_nn_scan_status(
             status="running",
@@ -14381,6 +14557,7 @@ def api_scan_friction():
         "cooldown": sum(1 for row in provider_rows if row.get("status") == "cooldown"),
         "benched": sum(1 for row in provider_rows if row.get("status") == "benched"),
     }
+    ticker_friction = get_scan_ticker_friction_summary(limit=12, days=7)
     return jsonify({
         "success": True,
         "now_cst": current_time_cst().isoformat(),
@@ -14397,6 +14574,7 @@ def api_scan_friction():
         "provider_health_summary": provider_health_summary,
         "provider_summary": provider_summary,
         "recent_problem_scans": recent_problem_rows,
+        "ticker_friction": ticker_friction,
     })
 
 @app.route("/api/freshness-status")

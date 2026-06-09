@@ -2603,6 +2603,29 @@ function ScanPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED }) {
                 </div>
               ))}
             </div>
+            <div style={{ borderTop: `1px solid ${BORDER}`, paddingTop: 8 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
+                <div style={{ fontSize: 8, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .6 }}>Ticker friction</div>
+                <div style={{ fontSize: 8, color: BLUE, fontFamily: "'DM Mono',monospace" }}>
+                  {(friction?.ticker_friction?.repeat_offenders || []).length}/12
+                </div>
+              </div>
+              {(friction?.ticker_friction?.repeat_offenders || []).length === 0 ? (
+                <div style={{ fontSize: 8, color: T3 }}>No repeated ticker failures recorded yet.</div>
+              ) : (
+                <div style={{ display: "grid", gap: 4 }}>
+                  {(friction?.ticker_friction?.repeat_offenders || []).slice(0, 8).map(row => (
+                    <div key={row.ticker} style={{ display: "grid", gridTemplateColumns: "auto 1fr auto", gap: 7, alignItems: "center", background: "#050506", border: `1px solid ${BORDER}`, borderRadius: 7, padding: "6px 7px" }}>
+                      <span style={{ fontSize: 10, color: T1, fontFamily: "'DM Mono',monospace", fontWeight: 800 }}>{row.ticker}</span>
+                      <span style={{ minWidth: 0, fontSize: 8, color: T3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {row.latest_phase || "scan"} / {row.latest_failure_type || "friction"}{row.latest_provider ? ` / ${row.latest_provider}` : ""}
+                      </span>
+                      <span style={{ fontSize: 9, color: AMBER, fontFamily: "'DM Mono',monospace", fontWeight: 800 }}>{row.event_count}x</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         )}
       </div>

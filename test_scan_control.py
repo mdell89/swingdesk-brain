@@ -39,6 +39,8 @@ from brain import (
     SCAN_CONTROL_KEY,
     get_database,
     get_scan_control_settings,
+    get_scan_ticker_friction_summary,
+    record_scan_ticker_friction,
     should_run_scheduled_comprehensive_scan,
     update_scan_control_settings,
 )
@@ -71,6 +73,19 @@ class ScanControlTest(unittest.TestCase):
 
         self.assertFalse(allowed)
         self.assertEqual(reason, "scheduled_scans_paused")
+
+    def test_ticker_friction_summary_counts_repeat_offenders(self):
+        record_scan_ticker_friction(101, "manual_shared", "ALB", "fetching_prices", "quote_missing", provider="massive", reason="no quote")
+        record_scan_ticker_friction(102, "manual_shared", "ALB", "fetching_history", "daily_history_missing", provider="massive,twelve_data", reason="no candles")
+        record_scan_ticker_friction(102, "manual_shared", "MRVL", "fetching_prices", "price_baseline_suspect", reason="bad baseline")
+
+        summary = get_scan_ticker_friction_summary(limit=5, days=7)
+        offenders = summary["repeat_offenders"]
+
+        self.assertEqual(offenders[0]["ticker"], "ALB")
+        self.assertEqual(offenders[0]["event_count"], 2)
+        self.assertEqual(offenders[0]["scan_count"], 2)
+        self.assertEqual(offenders[0]["latest_failure_type"], "daily_history_missing")
 
 
 if __name__ == "__main__":
