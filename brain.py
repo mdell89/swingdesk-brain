@@ -5683,16 +5683,19 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
             stale_cache_fallback_count=stale_cache_count,
         )
 
-    # Fetch fresh quotes for missing or stale tickers — max 60 per cycle
+    # Fetch fresh quotes for missing or stale tickers. Default is full refresh.
+    # Set SCAN_PRICE_REFRESH_LIMIT to a positive number only for explicit frugal mode.
     stale = [t for t in tickers if t in results and results[t].get("stale_cache_fallback")]
     missing = [t for t in tickers if t not in results]
-    refresh_limit = int(os.getenv("SCAN_PRICE_REFRESH_LIMIT", "40"))
-    to_refresh = list(dict.fromkeys(missing + stale))[:refresh_limit]
+    refresh_limit = int(os.getenv("SCAN_PRICE_REFRESH_LIMIT", "0"))
+    refresh_candidates = list(dict.fromkeys(missing + stale))
+    to_refresh = refresh_candidates[:refresh_limit] if refresh_limit > 0 else refresh_candidates
 
     if to_refresh:
-        log.info(f"Refreshing {len(to_refresh)} bounded stale/missing tickers from price providers ({len(missing)} missing, {len(stale)} stale)...")
-        RATE_DELAY = float(os.getenv("SCAN_PRICE_REFRESH_DELAY_SECONDS", "0.25"))
-        max_fetch_seconds = float(os.getenv("SCAN_PRICE_FETCH_MAX_SECONDS", "180"))
+        mode = "bounded" if refresh_limit > 0 else "full"
+        log.info(f"Refreshing {len(to_refresh)} {mode} stale/missing tickers from price providers ({len(missing)} missing, {len(stale)} stale)...")
+        RATE_DELAY = float(os.getenv("SCAN_PRICE_REFRESH_DELAY_SECONDS", "1.05"))
+        max_fetch_seconds = float(os.getenv("SCAN_PRICE_FETCH_MAX_SECONDS", "900"))
         fetch_started = time.time()
         cycle = ProviderCycle("comprehensive_quote")
         refreshed_tickers = []
@@ -8001,7 +8004,7 @@ def enrich_with_live_prices(tickers, price_data):
 
     log.info(f"Extended hours active — enriching {len(tickers)} tickers with live prices ({'pre' if in_premarket else 'post'}-market)")
 
-    max_external = int(os.getenv("SCAN_LIVE_REFRESH_LIMIT", "80"))
+    max_external = int(os.getenv("SCAN_LIVE_REFRESH_LIMIT", "0"))
     external_used = 0
     enriched = 0
     cycle = ProviderCycle("extended_hours_enrich")
@@ -8009,7 +8012,7 @@ def enrich_with_live_prices(tickers, price_data):
         if ticker not in price_data:
             continue
         cached_quote = _read_quote_cache(ticker)
-        if not cached_quote and external_used >= max_external:
+        if not cached_quote and max_external > 0 and external_used >= max_external:
             continue
         try:
             quote = cached_quote or fetch_quote_with_fallback(ticker, cycle=cycle, use_cache=False)
