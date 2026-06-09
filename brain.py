@@ -6827,6 +6827,21 @@ def derive_intraday_range_pct_from_scan(stock_data):
     return ((high - low) / price) * 100
 
 
+def derive_atr_percent_from_scan(stock_data, period=14):
+    explicit = _first_scan_number(stock_data, "atr_percent", "atr_pct")
+    if explicit is not None:
+        return explicit
+
+    history = (stock_data or {}).get("daily_history") or []
+    price = _first_scan_number(stock_data, "price", "current_price", "last_price", "close")
+    if not history or price is None or price <= 0:
+        return None
+    atr = calculate_atr(history, period=period)
+    if atr is None:
+        return None
+    return (atr / price) * 100
+
+
 def _legacy_signal_score_to_delta(score):
     """Conservative fallback when legacy scored RS but raw 5-day deltas are absent."""
     number = _first_scan_number({"score": score}, "score")
@@ -6935,7 +6950,7 @@ def build_scoring_v2_shadow_input(ticker, stock_data, rsi, earnings_soon, conflu
         "vwap_delta_pct": vwap_delta_pct,
         "hv_ratio": hv_ratio,
         "days_to_earnings": days_to_earnings,
-        "atr_percent": stock_data.get("atr_percent"),
+        "atr_percent": stock_data.get("atr_percent") or derive_atr_percent_from_scan(stock_data),
         "intraday_range_pct": stock_data.get("intraday_range_pct") or derive_intraday_range_pct_from_scan(stock_data),
         "confluence": confluence_methods,
     }
@@ -7065,6 +7080,8 @@ def scoring_v2_card_row(pick, brain="Vector", variant=None, source_scan_time=Non
     legacy_expected_move = pick.get("long_move") or pick.get("expected_move")
     v2_score = shadow.get("score")
     v2_expected_move = shadow.get("expected_move")
+    expected_move_detail = shadow.get("expected_move_detail") or {}
+    expected_move_components = expected_move_detail.get("components") if isinstance(expected_move_detail, dict) else {}
 
     return {
         "ticker": pick.get("ticker"),
@@ -7085,6 +7102,9 @@ def scoring_v2_card_row(pick, brain="Vector", variant=None, source_scan_time=Non
         "vol_ratio": pick.get("vol_ratio") or pick.get("volume_ratio"),
         "average_volume": pick.get("average_volume") or pick.get("avg_volume"),
         "average_daily_dollar_volume": pick.get("average_daily_dollar_volume") or pick.get("avg_daily_dollar_volume"),
+        "atr_percent": pick.get("atr_percent"),
+        "intraday_range_pct": pick.get("intraday_range_pct"),
+        "similar_setup_median_move": pick.get("similar_setup_median_move"),
         "volume_source": pick.get("volume_source"),
         "volume_baseline_sessions": pick.get("volume_baseline_sessions"),
         "time_matched_relative_volume": pick.get("time_matched_relative_volume"),
@@ -7140,6 +7160,8 @@ def scoring_v2_card_row(pick, brain="Vector", variant=None, source_scan_time=Non
         "v2_block_reasons": shadow.get("block_reasons", []),
         "v2_caps": [format_v2_cap_label(cap) for cap in shadow.get("caps_applied", [])],
         "v2_expected_move": v2_expected_move,
+        "v2_expected_move_detail": expected_move_detail,
+        "v2_expected_move_components": expected_move_components or {},
         "v2_explanation": shadow.get("explanation"),
     }
 
@@ -8202,6 +8224,8 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         long_confidence = calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, "long")
         short_confidence = calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, "short")
         stock_data["similar_setup_median_move"] = derive_similar_setup_median_move("SwingDesk", long_confidence)
+        stock_data["atr_percent"] = stock_data.get("atr_percent") or derive_atr_percent_from_scan(stock_data)
+        stock_data["intraday_range_pct"] = stock_data.get("intraday_range_pct") or derive_intraday_range_pct_from_scan(stock_data)
         long_move = estimate_overnight_move(stock_data, long_confidence, has_earnings)
         short_move = estimate_overnight_move(stock_data, short_confidence, has_earnings)
 
@@ -8234,7 +8258,8 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         )
         average_volume = derive_average_volume_from_scan(stock_data)
         average_daily_dollar_volume = derive_average_daily_dollar_volume_from_scan(stock_data)
-        intraday_range_pct = stock_data.get("intraday_range_pct") or derive_intraday_range_pct_from_scan(stock_data)
+        intraday_range_pct = stock_data.get("intraday_range_pct")
+        atr_percent = stock_data.get("atr_percent")
 
         display_change_pct = _first_number(
             pct_from_baseline(stock_data["price"], stock_data.get("previous_close")),
@@ -8268,6 +8293,8 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
             "sector_spy_5d_return": stock_data.get("sector_spy_5d_return"),
             "average_volume": average_volume,
             "average_daily_dollar_volume": average_daily_dollar_volume,
+            "atr_percent": atr_percent,
+            "similar_setup_median_move": stock_data.get("similar_setup_median_move"),
             "overnight_gap_pct": round(stock_data.get("gap_percent", 0), 2),
             "day_change_pct": round(display_change_pct, 2),
             "day_change_percent": round(display_change_pct, 2),
@@ -9269,6 +9296,8 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
 
             nn_conf = nn_score_ticker(synthetic, "long")
             stock_data["similar_setup_median_move"] = derive_similar_setup_median_move("SwingDesk", nn_conf)
+            stock_data["atr_percent"] = stock_data.get("atr_percent") or derive_atr_percent_from_scan(stock_data)
+            stock_data["intraday_range_pct"] = stock_data.get("intraday_range_pct") or derive_intraday_range_pct_from_scan(stock_data)
             scoring_v2_shadow = build_scoring_v2_shadow(
                 ticker,
                 stock_data,
@@ -11442,6 +11471,11 @@ def api_scoring_v2_shadow():
                     "v2_block_reasons": row.get("v2_block_reasons", []),
                     "v2_caps": row.get("v2_caps", []),
                     "v2_expected_move": row.get("v2_expected_move"),
+                    "v2_expected_move_detail": row.get("v2_expected_move_detail"),
+                    "v2_expected_move_components": row.get("v2_expected_move_components"),
+                    "atr_percent": row.get("atr_percent"),
+                    "intraday_range_pct": row.get("intraday_range_pct"),
+                    "similar_setup_median_move": row.get("similar_setup_median_move"),
                     "long_move": row.get("long_move"),
                     "decision_authority": row.get("decision_authority", "legacy_scoring"),
                     "candidate_source": row.get("candidate_source"),
@@ -11521,6 +11555,8 @@ def api_scoring_v2_shadow():
                     "v2_block_reasons": shadow.get("block_reasons", []),
                     "v2_caps": [format_v2_cap_label(cap) for cap in shadow.get("caps_applied", [])],
                     "v2_expected_move": shadow.get("expected_move"),
+                    "v2_expected_move_detail": shadow.get("expected_move_detail"),
+                    "v2_expected_move_components": (shadow.get("expected_move_detail") or {}).get("components", {}),
                     "decision_authority": shadow.get("decision_authority", "legacy_scoring"),
                 })
             return output
@@ -11553,6 +11589,8 @@ def api_scoring_v2_shadow():
                 "v2_block_reasons": shadow.get("block_reasons", []),
                 "v2_caps": [format_v2_cap_label(cap) for cap in shadow.get("caps_applied", [])],
                 "v2_expected_move": shadow.get("expected_move"),
+                "v2_expected_move_detail": shadow.get("expected_move_detail"),
+                "v2_expected_move_components": (shadow.get("expected_move_detail") or {}).get("components", {}),
                 "v2_explanation": shadow.get("explanation"),
                 "decision_authority": shadow.get("decision_authority", "legacy_scoring"),
             }
