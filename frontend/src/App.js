@@ -2556,6 +2556,9 @@ function WhyNotPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED })
   };
 
   const verdictLabel = verdict => ({
+    active_pick: ["Active pick", GREEN],
+    demoted: ["Demoted", AMBER],
+    not_observed: ["Not observed", T3],
     selected: ["Selected", GREEN],
     already_open: ["Already open", AMBER],
     not_executable: ["Not executable", RED],
@@ -2593,6 +2596,8 @@ function WhyNotPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED })
               const gate = item.gate || {};
               const values = item.values || {};
               const day = values.overnight_gap_probability ?? values.overnight_gap ?? values.day_change_pct ?? null;
+              const currentState = item.current_state || {};
+              const latestScan = item.latest_scan || {};
               return (
                 <div key={item.brain} style={{ borderTop: `1px solid ${BORDER}`, paddingTop: 8 }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 5 }}>
@@ -2611,12 +2616,21 @@ function WhyNotPanel({ API, T1, T2, T3, BORDER, CARD, GREEN, BLUE, AMBER, RED })
                     <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                       {gate.reasons.map(reason => <div key={reason} style={{ fontSize: 10, color: RED, lineHeight: 1.35 }}>- {reason}</div>)}
                     </div>
+                  ) : item.verdict === "demoted" ? (
+                    <div style={{ fontSize: 10, color: AMBER }}>Was active today, then demoted: {currentState.demotion_reason || "demoted"}.</div>
+                  ) : item.verdict === "not_observed" ? (
+                    <div style={{ fontSize: 10, color: T3 }}>Not observed in the latest scan state. The older row below is historical context only.</div>
                   ) : (
-                    <div style={{ fontSize: 10, color: GREEN }}>It passed the shared gate; if absent, it was ranked below selected picks or filtered by the chosen strategy.</div>
+                    <div style={{ fontSize: 10, color: GREEN }}>Current state says this is active or gate-eligible.</div>
                   )}
                   <div style={{ fontSize: 9, color: T3, marginTop: 6, lineHeight: 1.4 }}>
                     Brain saw price ${Number(gate.price || 0).toFixed(2)}, gap/day signal {day == null ? "unknown" : `${Number(day).toFixed(1)}%`}, fired {(gate.fired_signals || []).join(", ") || "no strong indicators"}.
                   </div>
+                  {latestScan.id && (
+                    <div style={{ fontSize: 8, color: latestScan.degraded ? AMBER : T3, marginTop: 4, lineHeight: 1.35, fontFamily: "'DM Mono',monospace" }}>
+                      Latest scan {latestScan.status || "unknown"} {latestScan.tickers_updated != null ? `${latestScan.tickers_updated}/${latestScan.tickers_attempted || "?"}` : ""}{latestScan.finished_at ? ` · ${formatShortDateTime(latestScan.finished_at)}` : ""}
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -3784,6 +3798,9 @@ export default function App() {
         ? selectedVariantPreview.picks
         : allBuyPicks
   ).filter(pick => !activeOpenTickers.has(pick.ticker));
+  const vectorDemotedPicks = (picks.demoted_picks || [])
+    .map(mapPickFields)
+    .filter(pick => !activeOpenTickers.has(pick.ticker));
   const buyVisible = buyListExpanded ? activeBuyPicks : activeBuyPicks.slice(0, 20);
   const sellVisible = sellListExpanded ? sortedOpenFilteredPositions : sortedOpenFilteredPositions.slice(0, 20);
   // Open P&L from currently held positions
@@ -3890,6 +3907,9 @@ export default function App() {
     : selectedNovaVariantPreview.hasPreview && activeVariantBrain === "Nova"
       ? selectedNovaVariantPreview.picks
       : (nnPicks.recommended_longs || []).filter(pick => !novaOpenTickersForPicks.has(pick.ticker));
+  const novaDemotedPicks = (nnPicks.demoted_picks || [])
+    .map(mapPickFields)
+    .filter(pick => !novaOpenTickersForPicks.has(pick.ticker));
   const vectorPickTickers = new Set(activeBuyPicks.map(row => String(row?.ticker || "").toUpperCase()).filter(Boolean));
   const novaPickTickers = new Set(activeNovaBuyPicks.map(row => String(row?.ticker || "").toUpperCase()).filter(Boolean));
   const vectorOpenTickers = new Set(openLongPositions.map(row => String(row?.ticker || "").toUpperCase()).filter(Boolean));
@@ -4207,7 +4227,7 @@ export default function App() {
           {/* SUB TOGGLE — Picks/Open + Sort */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 42px", margin: `0 16px ${HOME_ROW_GAP}px`, gap: HOME_ROW_GAP, alignItems: "stretch" }}>
             {[
-              ["buy", `Picks (${activeBuyPicks.length})`, BLUE, "#0f1e35", `1px solid ${BLUE}44`],
+              ["buy", `Active (${activeBuyPicks.length})`, BLUE, "#0f1e35", `1px solid ${BLUE}44`],
               ["sell", `Open (${openLongPositions.length})`, GREEN, "#091a0d", `1px solid ${GREEN}44`],
               ["closed", `Closed (${todayClosedVisible.length})`, AMBER, "#1a1500", `1px solid ${AMBER}55`]
             ].map(([id, label, color, activeBg, border]) => (
@@ -4277,6 +4297,31 @@ export default function App() {
                       <ExpandButton isExpanded={buyListExpanded} onToggle={() => setBuyListExpanded(e => !e)} totalCount={activeBuyPicks.length} label="picks" />
                     </div>
                   </>
+                )}
+                {vectorDemotedPicks.length > 0 && (
+                  <div style={{ marginTop: 14 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                      <div style={{ fontSize: 10, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .7 }}>Demoted Picks</div>
+                      <div style={{ fontSize: 9, color: T3, fontFamily: "'DM Mono',monospace" }}>{vectorDemotedPicks.length}</div>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      {vectorDemotedPicks.slice(0, 20).map(pick => (
+                        <div key={pick.ticker + "_demoted_vector"} style={{ position: "relative", opacity: 0.72 }}>
+                          <div style={{ position: "absolute", right: 8, top: 6, zIndex: 2, fontSize: 7, color: T3, border: `1px solid ${BORDER}`, borderRadius: 4, padding: "1px 5px", background: "#050506", fontFamily: "'DM Mono',monospace" }}>
+                            {pick.demotion_reason || "demoted"}
+                          </div>
+                          <PickCard pick={pick} isLong={true}
+                            expanded={expandedCards[pick.ticker + "_demoted_vector"]}
+                            cardKeyOverride={pick.ticker + "_demoted_vector"}
+                            brainTags={brainTagsForTicker(pick.ticker, "Vector", "pick")}
+                            themeKey={themeKey}
+                            strategyName={selectedStrategy}
+                            strategyTotal={strategyTotal}
+                            onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))} />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
                 )}
               </>
             )}
@@ -4552,7 +4597,7 @@ export default function App() {
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 42px", margin: `0 0 ${HOME_ROW_GAP}px`, gap: HOME_ROW_GAP, alignItems: "stretch" }}>
                 {[
-                  ["buy", `Picks (${activeNovaBuyPicks.length || 0})`, BLUE, "#0f1e35", `1px solid ${BLUE}44`],
+                  ["buy", `Active (${activeNovaBuyPicks.length || 0})`, BLUE, "#0f1e35", `1px solid ${BLUE}44`],
                   ["sell", `Open (${novaOpenPositions.length})`, GREEN, "#091a0d", `1px solid ${GREEN}44`],
                   ["closed", `Closed (${novaUniverseClosed.length})`, AMBER, "#1a1500", `1px solid ${AMBER}55`]
                 ].map(([id, label, color, activeBg, border]) => (
@@ -4624,27 +4669,54 @@ export default function App() {
               )}
 
               {/* NN Picks */}
-              {longSub === "buy" && activeNovaBuyPicks.length > 0 ? (
+              {longSub === "buy" && (activeNovaBuyPicks.length > 0 || novaDemotedPicks.length > 0) ? (
                 <div>
-                  <CardMetricGrid style={{ padding: `${HOME_ROW_GAP}px ${CARD_PAD_R} ${HOME_ROW_GAP}px ${CARD_PAD_L}` }}>
-                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
-                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center" }}>% Chg</div>
-                    <SpineCell><div style={{ width: SPINE_VALUE_W, fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center", whiteSpace: "nowrap" }}>Move</div></SpineCell>
-                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}></div>
-                    <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right" }}>Conf</div>
-                  </CardMetricGrid>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                    {activeNovaBuyPicks.map(pick => (
-                      <PickCard key={pick.ticker + "_nn"} pick={mapPickFields(pick)} isLong={true}
-                        themeKey={themeKey}
-                        strategyName={selectedStrategy}
-                        strategyTotal={strategyTotal}
-                        brainTags={brainTagsForTicker(pick.ticker, "Nova", "pick")}
-                        expanded={expandedCards[pick.ticker + "_nn"]}
-                        cardKeyOverride={pick.ticker + "_nn"}
-                        onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))} />
-                    ))}
-                  </div>
+                  {activeNovaBuyPicks.length > 0 && (<>
+                    <CardMetricGrid style={{ padding: `${HOME_ROW_GAP}px ${CARD_PAD_R} ${HOME_ROW_GAP}px ${CARD_PAD_L}` }}>
+                      <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>Ticker</div>
+                      <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center" }}>% Chg</div>
+                      <SpineCell><div style={{ width: SPINE_VALUE_W, fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "center", whiteSpace: "nowrap" }}>Move</div></SpineCell>
+                      <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}></div>
+                      <div style={{ fontSize: 9, color: T3, fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, textAlign: "right" }}>Conf</div>
+                    </CardMetricGrid>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      {activeNovaBuyPicks.map(pick => (
+                        <PickCard key={pick.ticker + "_nn"} pick={mapPickFields(pick)} isLong={true}
+                          themeKey={themeKey}
+                          strategyName={selectedStrategy}
+                          strategyTotal={strategyTotal}
+                          brainTags={brainTagsForTicker(pick.ticker, "Nova", "pick")}
+                          expanded={expandedCards[pick.ticker + "_nn"]}
+                          cardKeyOverride={pick.ticker + "_nn"}
+                          onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))} />
+                      ))}
+                    </div>
+                  </>)}
+                  {novaDemotedPicks.length > 0 && (
+                    <div style={{ marginTop: 14 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                        <div style={{ fontSize: 10, color: T3, fontWeight: 800, textTransform: "uppercase", letterSpacing: .7 }}>Demoted Picks</div>
+                        <div style={{ fontSize: 9, color: T3, fontFamily: "'DM Mono',monospace" }}>{novaDemotedPicks.length}</div>
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                        {novaDemotedPicks.slice(0, 20).map(pick => (
+                          <div key={pick.ticker + "_demoted_nova"} style={{ position: "relative", opacity: 0.72 }}>
+                            <div style={{ position: "absolute", right: 8, top: 6, zIndex: 2, fontSize: 7, color: T3, border: `1px solid ${BORDER}`, borderRadius: 4, padding: "1px 5px", background: "#050506", fontFamily: "'DM Mono',monospace" }}>
+                              {pick.demotion_reason || "demoted"}
+                            </div>
+                            <PickCard pick={pick} isLong={true}
+                              themeKey={themeKey}
+                              strategyName={selectedStrategy}
+                              strategyTotal={strategyTotal}
+                              brainTags={brainTagsForTicker(pick.ticker, "Nova", "pick")}
+                              expanded={expandedCards[pick.ticker + "_demoted_nova"]}
+                              cardKeyOverride={pick.ticker + "_demoted_nova"}
+                              onToggle={key => setExpandedCards(prev => ({ ...prev, [key]: !prev[key] }))} />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               ) : longSub === "buy" ? (
                 <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 20, textAlign: "center", fontSize: 12, color: T3 }}>

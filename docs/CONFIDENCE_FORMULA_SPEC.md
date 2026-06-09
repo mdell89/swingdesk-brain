@@ -710,8 +710,13 @@ Constructive:
 
 - breakout over resistance
 - support held
-- open air above
 - Darvas/channel breakout
+
+Context only:
+
+- open air above
+
+Open air means there is structural room before obvious resistance. It is not, by itself, proof that buyers are stepping in. Broad bullish long picks may use open air as a small context bonus, but open air alone must not satisfy bullish confirmation or create an S&R confluence tag.
 
 Negative:
 
@@ -780,6 +785,7 @@ Rules:
 - duplicate/near-identical confluence should be deduped
 - every displayed confluence must faithfully reflect a real condition or outside strategy agreement
 - confluence cannot make a blocked setup actionable
+- S&R confluence requires confirmed support/bounce/breakout structure; plain open air is context, not confluence.
 
 Confluence counters:
 

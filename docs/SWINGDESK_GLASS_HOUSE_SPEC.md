@@ -186,9 +186,10 @@ Today tab:
 - Brain: Vector / Nova, later Aegis aggregate when real.
 - Strategy dropdown: SwingDesk, Darvas, Gap & Go, VWAP Reclaim, etc., plus All.
 - Variant dropdown: strategy-specific variants, plus All.
-- Cards grouped into Picks, Open, Closed.
+- Cards grouped into Active Picks, Demoted Picks, Open, Closed.
 - Cards compact by default and expandable.
 - Context tray explains confidence.
+- Demoted Picks persist for the trading day and show why the pick left the active set.
 
 Analytics tab:
 
@@ -205,7 +206,7 @@ Brain tab:
 - Variant health.
 - Variant play counter.
 - Full scan monitor.
-- Why Not.
+- Why Not, resolved from latest scan/day pick state first and historical observations second.
 - Transparency/pseudocode docs.
 - Provider failures and data freshness.
 

@@ -244,7 +244,7 @@ Signal Read
 
 Confluence
   Darvas agrees
-  Open Air present
+  Support Bounce present
   Nova agrees
 
 Decision
@@ -297,6 +297,8 @@ Confluence can include:
 - strategy agreement
 - setup context
 - brain agreement
+
+Open Air is structural context only. It may appear in explanation rows, but it is not a confluence tag and cannot make a setup actionable without separate bullish price-action confirmation such as a held gap, green day, VWAP reclaim, support bounce, breakout, or relative-strength lead.
 
 Compact cards should show counters and highest-value tags only:
 

@@ -157,11 +157,12 @@ Examples:
 Darvas
 VWAP Reclaim
 Bull Flag
-Open Air
 Support Bounce
 Sector Leader
 Unusual Volume
 ```
+
+Open Air is not a confluence tag by itself. It is setup context meaning resistance is not nearby; it does not prove demand, a bounce, or a breakout.
 
 Compact cards should show counters, not named confluence tags:
 

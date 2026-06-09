@@ -362,7 +362,7 @@ def support_resistance_signal(data: dict[str, Any]) -> dict[str, Any]:
         return signal_row("support_resistance", "active", None, None, "missing", "support/resistance structure missing")
     if score is None:
         quality_map = {
-            "open_air": 0.7,
+            "open_air": 0.2,
             "breakout": 0.7,
             "support_bounce": 0.5,
             "near_support": 0.3,

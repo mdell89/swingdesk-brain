@@ -119,6 +119,18 @@ When All is selected:
 
 Pick cards show candidates, not open trades.
 
+Pick-list grouping:
+
+- Active Picks: selected by the latest usable scan/day state.
+- Demoted Picks: selected earlier today but no longer selected now.
+
+Demoted pick cards remain visible for the trading day and show a small reason chip:
+
+- `ranked out`
+- `failed gate`
+- `not observed`
+- `missed entry`
+
 Required fields:
 
 - ticker

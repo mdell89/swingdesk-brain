@@ -171,6 +171,13 @@ Cache entries must include:
 
 No stale cache row should silently pass as fresh data.
 
+Quote baseline rules:
+
+- Provider `previous_close` is authoritative when present and mathematically coherent with provider price/day-change fields.
+- Daily-history repair may only replace `previous_close` when the provider baseline is missing or already marked suspect and the history repair improves the math.
+- Every baseline repair must stamp source and date/provenance.
+- Mixed-baseline rows are suspect and may not become legacy picks, Nova picks, V2 picks, watchlist rows, or entry snapshots.
+
 ## Stall Handling
 
 A comprehensive scan is stalled when it remains active beyond its expected time window without progress.
@@ -184,6 +191,47 @@ Stalled scan requirements:
 - records failed/pending tickers if available
 
 The UI should never show an empty pick list merely because an in-progress scan temporarily cleared state.
+
+Terminal scan state requirements:
+
+- `complete` means the full active universe was scanned closely enough to be a decision source.
+- `degraded` means the scan ended but missed enough tickers or data fields that downstream UI must label the result.
+- `stalled` means the scan stopped making progress and may not overwrite a completed decision source.
+- `error` means the scan failed before producing a usable snapshot.
+
+Manual or scheduled scans may not overlap. If a scan is already running, later scheduled scans must skip with an explicit `already_running` reason rather than starting a second scan.
+
+The scan status counter must never use the total universe size as fake progress. Progress may only increase when rows are actually loaded, refreshed, scored, or otherwise observed.
+
+## Daily Pick State
+
+SwingDesk pick lists are not pure latest-scan snapshots. They are an intraday state board.
+
+Labels:
+
+- Active Picks: selected by the latest usable scan/day state for that brain.
+- Demoted Picks: selected earlier today but no longer selected now.
+
+Demotion reasons:
+
+- `ranked out`: still eligible, but no longer inside the selected/top-N set.
+- `failed gate`: later scan saw the ticker and it failed a hard pick rule.
+- `not observed`: latest scan was incomplete/degraded or did not observe the ticker.
+- `missed entry`: the pick existed but its entry window passed without execution.
+
+New scans must update the daily pick state instead of erasing earlier picks from the day.
+
+## Why Not Current-State Contract
+
+Why Not must explain the current ticker state from:
+
+1. latest scan/day pick state
+2. current open positions
+3. latest observation for the ticker as historical context only
+
+Why Not may not show `selected` as the primary verdict when that selected row came from an older scan and the current day state is active/demoted/not-observed.
+
+If the latest full scan was degraded, Why Not must say so and include scored/attempted counts when available.
 
 ## Scan Log Retention
 

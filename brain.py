@@ -1231,6 +1231,25 @@ def initialize_database():
             resolved_at TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS daily_pick_states (
+            id TEXT PRIMARY KEY,
+            trade_date TEXT NOT NULL,
+            brain TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            status TEXT NOT NULL,
+            demotion_reason TEXT,
+            first_seen_at TEXT,
+            last_seen_at TEXT,
+            last_scan_event_id INTEGER,
+            last_scan_time TEXT,
+            first_pick_json TEXT DEFAULT '{}',
+            latest_pick_json TEXT DEFAULT '{}',
+            latest_confidence INTEGER,
+            latest_expected_move REAL,
+            latest_rank INTEGER,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS scoring_divergence_log (
             id TEXT PRIMARY KEY,
             scan_id INTEGER,
@@ -1609,6 +1628,8 @@ def initialize_database():
         CREATE INDEX IF NOT EXISTS idx_signal_observations_variant ON signal_observations(strategy, variant_id, scan_time);
         CREATE INDEX IF NOT EXISTS idx_signal_observations_ticker ON signal_observations(ticker, scan_time);
         CREATE INDEX IF NOT EXISTS idx_signal_observations_confidence ON signal_observations(confidence_bin, outcome);
+        CREATE INDEX IF NOT EXISTS idx_daily_pick_states_day ON daily_pick_states(trade_date, brain, status);
+        CREATE INDEX IF NOT EXISTS idx_daily_pick_states_ticker ON daily_pick_states(ticker, trade_date);
         CREATE INDEX IF NOT EXISTS idx_scoring_divergence_scan ON scoring_divergence_log(scan_id, brain);
         CREATE INDEX IF NOT EXISTS idx_scoring_divergence_category ON scoring_divergence_log(agreement_category, scan_timestamp);
         CREATE INDEX IF NOT EXISTS idx_scoring_divergence_ticker ON scoring_divergence_log(ticker, scan_timestamp);
@@ -2617,6 +2638,163 @@ def build_observation_context(stock_data=None, queue_locked=False):
         "weather_context": None,
     }
 
+def pick_state_trade_date():
+    return current_time_cst().strftime("%Y-%m-%d")
+
+def pick_json_for_state(pick):
+    """Keep the day pick board lightweight and JSON-safe."""
+    keep = [
+        "ticker", "name", "company_name", "company_description", "sector", "industry",
+        "price", "open_price", "prev_close", "previous_close", "rsi", "vol_ratio",
+        "volume_ratio", "volume_source", "overnight_gap_pct", "gap_percent",
+        "day_change_pct", "day_change_percent", "pct_change_prev_close",
+        "pct_change_premarket", "pct_change_regular_open", "long_conf", "long_move",
+        "long_reasoning", "nn_score", "nn_executable", "crude_conf", "sell_time",
+        "confluence_count", "confluence_methods", "signal_scores",
+        "signal_scores_for_observation", "signal_values_for_observation",
+        "fired_signals_for_observation", "price_source_freshness",
+        "freshness_status", "price_baseline_suspect", "price_baseline_suspect_reason",
+        "stale_cache_fallback", "source_scan_time", "scan_time", "source_rank",
+        "rank", "data_source", "primary_metric_label", "move_metric_label",
+        "confidence_metric_label",
+    ]
+    result = {key: pick.get(key) for key in keep if key in (pick or {})}
+    result.setdefault("ticker", (pick or {}).get("ticker"))
+    return result
+
+def _pick_state_confidence(pick):
+    try:
+        return int(round(float((pick or {}).get("long_conf") or (pick or {}).get("nn_score") or 0)))
+    except Exception:
+        return 0
+
+def _pick_state_move(pick):
+    try:
+        return float((pick or {}).get("long_move") or (pick or {}).get("expected_move") or 0)
+    except Exception:
+        return 0.0
+
+def get_daily_pick_states(brain=None, trade_date=None):
+    trade_date = trade_date or pick_state_trade_date()
+    params = [trade_date]
+    where = "trade_date=?"
+    if brain:
+        where += " AND brain=?"
+        params.append(brain)
+    database = get_database()
+    rows = [dict(r) for r in database.execute(
+        f"SELECT * FROM daily_pick_states WHERE {where} ORDER BY status ASC, latest_confidence DESC, first_seen_at ASC",
+        params,
+    ).fetchall()]
+    database.close()
+    for row in rows:
+        try:
+            row["latest_pick"] = json.loads(row.get("latest_pick_json") or "{}")
+        except Exception:
+            row["latest_pick"] = {}
+        try:
+            row["first_pick"] = json.loads(row.get("first_pick_json") or "{}")
+        except Exception:
+            row["first_pick"] = {}
+    return rows
+
+def daily_pick_payload(brain):
+    rows = get_daily_pick_states(brain)
+    return {
+        "active_picks": [row["latest_pick"] for row in rows if row.get("status") == "active"],
+        "demoted_picks": [
+            {**row["latest_pick"], "demotion_reason": row.get("demotion_reason"), "demoted_at": row.get("updated_at")}
+            for row in rows if row.get("status") == "demoted"
+        ],
+    }
+
+def demotion_reason_for_pick(pick, selected_tickers, observed_tickers, eligible_tickers):
+    ticker = (pick or {}).get("ticker")
+    if not ticker or ticker in selected_tickers:
+        return None
+    if ticker not in observed_tickers:
+        return "not observed"
+    if ticker in eligible_tickers:
+        return "ranked out"
+    return "failed gate"
+
+def update_daily_pick_states(brain, selected_picks, scored_rows, scan_event_id=None, scan_time=None):
+    """Persist today's Active/Demoted pick board for one brain."""
+    brain = str(brain or "Unknown")
+    trade_date = pick_state_trade_date()
+    now_iso = current_time_cst().isoformat()
+    scan_time = scan_time or now_iso
+    selected_picks = [p for p in (selected_picks or []) if p.get("ticker")]
+    scored_rows = [p for p in (scored_rows or []) if p.get("ticker")]
+    selected_by_ticker = {str(p.get("ticker")).upper(): p for p in selected_picks}
+    scored_by_ticker = {str(p.get("ticker")).upper(): p for p in scored_rows}
+    selected_tickers = set(selected_by_ticker)
+    observed_tickers = set(scored_by_ticker)
+    eligible_tickers = {
+        ticker for ticker, row in scored_by_ticker.items()
+        if bool(row.get("nn_executable")) or is_long_pick_eligible(row, confidence_floor=NN_CONFIDENCE_FLOOR if brain == "Nova" else CONFIDENCE_FLOOR)
+    }
+    database = get_database()
+    try:
+        existing = [dict(r) for r in database.execute(
+            "SELECT * FROM daily_pick_states WHERE trade_date=? AND brain=?",
+            [trade_date, brain],
+        ).fetchall()]
+        existing_by_ticker = {r["ticker"]: r for r in existing}
+        for ticker, pick in selected_by_ticker.items():
+            state_id = f"{trade_date}:{brain}:{ticker}"
+            payload = pick_json_for_state({**pick, "rank": pick.get("rank") or pick.get("source_rank")})
+            first_pick_json = existing_by_ticker.get(ticker, {}).get("first_pick_json") or json.dumps(payload)
+            first_seen_at = existing_by_ticker.get(ticker, {}).get("first_seen_at") or now_iso
+            database.execute("""
+                INSERT OR REPLACE INTO daily_pick_states
+                (id, trade_date, brain, ticker, status, demotion_reason, first_seen_at, last_seen_at,
+                 last_scan_event_id, last_scan_time, first_pick_json, latest_pick_json,
+                 latest_confidence, latest_expected_move, latest_rank, updated_at)
+                VALUES (?, ?, ?, ?, 'active', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                state_id, trade_date, brain, ticker, first_seen_at, now_iso, scan_event_id, scan_time,
+                first_pick_json, json.dumps(payload), _pick_state_confidence(pick), _pick_state_move(pick),
+                pick.get("rank") or pick.get("source_rank"), now_iso,
+            ])
+        for ticker, row in existing_by_ticker.items():
+            if row.get("status") != "active" or ticker in selected_tickers:
+                continue
+            latest = scored_by_ticker.get(ticker)
+            reason = demotion_reason_for_pick(latest or {"ticker": ticker}, selected_tickers, observed_tickers, eligible_tickers)
+            latest_payload = pick_json_for_state(latest) if latest else json.loads(row.get("latest_pick_json") or "{}")
+            database.execute("""
+                UPDATE daily_pick_states
+                SET status='demoted',
+                    demotion_reason=?,
+                    last_seen_at=CASE WHEN ? THEN ? ELSE last_seen_at END,
+                    last_scan_event_id=?,
+                    last_scan_time=?,
+                    latest_pick_json=?,
+                    latest_confidence=?,
+                    latest_expected_move=?,
+                    latest_rank=NULL,
+                    updated_at=?
+                WHERE id=?
+            """, [
+                reason or "not observed",
+                1 if latest else 0,
+                now_iso,
+                scan_event_id,
+                scan_time,
+                json.dumps(latest_payload),
+                _pick_state_confidence(latest_payload),
+                _pick_state_move(latest_payload),
+                now_iso,
+                row["id"],
+            ])
+        database.commit()
+    except Exception as exc:
+        database.rollback()
+        log.warning(f"Daily pick state update failed for {brain}: {exc}")
+    finally:
+        database.close()
+
 def insert_signal_observations(rows):
     """Bulk insert signal observation rows without changing scoring behavior."""
     if not rows:
@@ -2722,7 +2900,7 @@ def log_nova_signal_observations(scan_event_id, scan_type, scored_rows, price_da
         return 0
     scan_time = current_time_cst().isoformat()
     regime = build_regime_context(scan_type)
-    selected = scored_rows[:MAX_LONG_PICKS] if scored_rows else []
+    selected = [row for row in (scored_rows or []) if row.get("nn_executable")][:MAX_LONG_PICKS]
     selected_tickers = {row.get("ticker") for row in selected}
     executable_tickers = {row.get("ticker") for row in scored_rows or [] if row.get("nn_executable")}
     ranked = {row.get("ticker"): i + 1 for i, row in enumerate(scored_rows or [])}
@@ -2792,6 +2970,7 @@ def start_shared_scan_background(scan_type="manual_shared"):
             return {**current, "started": False, "already_running": True}
         running_scan = get_running_comprehensive_scan()
         if running_scan:
+            current_scanned = int((current or {}).get("total_scanned") or 0)
             return record_nn_scan_status(
                 status="running",
                 scan_type=running_scan.get("scan_type", scan_type),
@@ -2800,7 +2979,9 @@ def start_shared_scan_background(scan_type="manual_shared"):
                 already_running=True,
                 started_at=running_scan.get("started_at"),
                 finished_at=None,
-                total_scanned=running_scan.get("tickers_attempted", 0),
+                total_scanned=current_scanned,
+                total_expected=running_scan.get("tickers_attempted", 0),
+                scan_total_expected=running_scan.get("tickers_attempted", 0),
                 qualified=0,
                 picks=0,
                 error=None,
@@ -2839,17 +3020,27 @@ def start_shared_scan_background(scan_type="manual_shared"):
                     )
                     return
                 nn_result = result.get("nn_picks", {}) or {}
+                terminal_status = "degraded" if result.get("partial_price_universe") else "complete"
+                terminal_error = None
+                if terminal_status == "degraded":
+                    terminal_error = (
+                        f"Degraded full scan: {result.get('price_rows_loaded', result.get('total_scanned', 0))}/"
+                        f"{result.get('price_rows_expected', result.get('ticker_universe_count', 0))} price rows loaded"
+                    )
                 record_nn_scan_status(
-                    status="complete",
+                    status=terminal_status,
                     scan_type=scan_type,
                     source="shared_comprehensive_scan",
                     started=False,
                     already_running=False,
                     finished_at=current_time_cst().isoformat(),
                     total_scanned=result.get("total_scanned", 0),
+                    price_rows_loaded=result.get("price_rows_loaded"),
+                    price_rows_expected=result.get("price_rows_expected"),
+                    partial_price_universe=bool(result.get("partial_price_universe")),
                     qualified=nn_result.get("qualified_count", 0),
                     picks=nn_result.get("picks", 0),
-                    error=None,
+                    error=terminal_error,
                 )
             except Exception as exc:
                 log.error(f"Background shared Nova scan failed: {exc}")
@@ -3091,16 +3282,55 @@ def repair_quote_baselines_from_history(quote, history):
     try:
         price = float(quote.get("price") or 0)
         completed_prev = previous_completed_close_from_history(history)
+        current_prev = float(quote.get("previous_close") or 0)
+        supplied_day = _first_float_allow_zero(quote.get("day_change_percent"), quote.get("day_change_pct"))
+        current_day = pct_from_baseline(price, current_prev)
+        provider_baseline_present = (
+            current_prev > 0
+            and not quote.get("previous_close_missing")
+            and not quote.get("price_baseline_suspect")
+        )
+        provider_math_coherent = (
+            provider_baseline_present
+            and supplied_day is not None
+            and current_day is not None
+            and abs(float(supplied_day) - float(current_day)) <= float(os.getenv("QUOTE_COHERENCE_TOLERANCE_PCT", "0.35"))
+        )
+        if provider_math_coherent:
+            append_quote_provenance(
+                quote,
+                "history_repair_skipped",
+                reason="provider previous_close already coherent",
+                provider_previous_close=current_prev,
+                completed_history_previous_close=completed_prev,
+            )
+            return quote
         if completed_prev:
             before = quote_math_snapshot(quote)
-            quote["previous_close"] = completed_prev
-            quote["day_change_percent"] = pct_from_baseline(price, completed_prev) or 0
-            quote["day_change_pct"] = quote["day_change_percent"]
-            quote["gap_percent"] = pct_from_baseline(quote.get("open", price), completed_prev) or 0
-            quote["baseline_repaired_from_history"] = True
-            append_quote_provenance(quote, "history_repair_applied", before=before, repaired_previous_close=completed_prev)
-            return quote
-        current_prev = float(quote.get("previous_close") or 0)
+            current_change = abs(pct_from_baseline(price, current_prev) or 0)
+            repaired_change = abs(pct_from_baseline(price, completed_prev) or 0)
+            may_repair_missing = bool(quote.get("previous_close_missing") or not current_prev)
+            may_repair_suspect = bool(quote.get("price_baseline_suspect")) and repaired_change + 2 < current_change
+            if may_repair_missing or may_repair_suspect:
+                quote["previous_close"] = completed_prev
+                quote["day_change_percent"] = pct_from_baseline(price, completed_prev) or 0
+                quote["day_change_pct"] = quote["day_change_percent"]
+                quote["gap_percent"] = pct_from_baseline(quote.get("open", price), completed_prev) or 0
+                quote["baseline_repaired_from_history"] = True
+                quote["baseline_repair_source"] = "daily_history_completed_session"
+                quote["baseline_repair_previous_close_date"] = next(
+                    (row.get("date") for row in reversed(history) if row.get("close") == completed_prev),
+                    None,
+                )
+                append_quote_provenance(quote, "history_repair_applied", before=before, repaired_previous_close=completed_prev)
+                return quote
+            append_quote_provenance(
+                quote,
+                "history_repair_skipped",
+                reason="provider previous_close retained; history repair not allowed without missing/suspect baseline",
+                provider_previous_close=current_prev,
+                completed_history_previous_close=completed_prev,
+            )
         current_change = abs(pct_from_baseline(price, current_prev) or 0)
         close_candidates = [
             float(row.get("close"))
@@ -3123,6 +3353,7 @@ def repair_quote_baselines_from_history(quote, history):
             quote["day_change_pct"] = quote["day_change_percent"]
             quote["gap_percent"] = pct_from_baseline(quote.get("open", price), repaired_prev) or 0
             quote["baseline_repaired_from_history"] = True
+            quote["baseline_repair_source"] = "daily_history_plausible_close"
             append_quote_provenance(quote, "history_repair_applied", before=before, repaired_previous_close=repaired_prev)
     except Exception:
         pass
@@ -3738,6 +3969,48 @@ def bullish_price_action_block_reasons(pick):
         reasons.append(f"RSI {rsi:.1f} is below the broad long momentum floor of 35.0")
     return reasons
 
+def bullish_confirmation_reasons(pick):
+    """Real long confirmations. Context like RSI health or open-air alone is not enough."""
+    pick = pick or {}
+    reasons = []
+    gap = numeric_pick_value(pick, "overnight_gap_pct", "gap_percent", "gap_pct")
+    day_change = numeric_pick_value(pick, "pct_change_prev_close", "day_change_pct", "day_change_percent")
+    regular_open = numeric_pick_value(pick, "pct_change_regular_open")
+    rs_delta = numeric_pick_value(pick, "relative_strength_delta")
+    sector_delta = numeric_pick_value(pick, "sector_relative_strength_delta")
+    if day_change is not None and day_change >= 3.0:
+        reasons.append(f"day change {day_change:+.1f}% confirms bullish demand")
+    if gap is not None and gap >= 2.0 and (day_change is None or day_change >= 0):
+        reasons.append(f"gap {gap:+.1f}% is holding above the prior close")
+    if regular_open is not None and regular_open >= 0.75:
+        reasons.append(f"price is {regular_open:+.1f}% above the regular-session open/VWAP proxy")
+    if rs_delta is not None and rs_delta >= 1.0:
+        reasons.append(f"relative strength leads benchmark by {rs_delta:+.1f}%")
+    if sector_delta is not None and sector_delta >= 1.0:
+        reasons.append(f"sector relative strength leads benchmark by {sector_delta:+.1f}%")
+    if pick.get("broke_52w_high_days_ago") is not None:
+        try:
+            if int(pick.get("broke_52w_high_days_ago")) <= 7:
+                reasons.append("recent 52-week-high breakout confirms price strength")
+        except Exception:
+            pass
+    signal_scores = pick.get("signal_scores") or {}
+    signal_values = {}
+    if isinstance(signal_scores, dict):
+        signal_values = signal_scores.get("values") if isinstance(signal_scores.get("values"), dict) else {}
+    if not signal_values:
+        signal_values = pick.get("signal_values_for_observation") or {}
+    vwap = signal_values.get("vwap_reclaim") if isinstance(signal_values, dict) else {}
+    if isinstance(vwap, dict):
+        vwap_dist = numeric_pick_value(vwap, "dist")
+        if vwap_dist is not None and vwap_dist >= 0.75:
+            reasons.append(f"VWAP/open reclaim proxy is positive at {vwap_dist:+.1f}%")
+    sr = signal_values.get("support_resistance") if isinstance(signal_values, dict) else {}
+    sr_signal = str(sr.get("signal") or pick.get("support_resistance_signal") or "").lower() if isinstance(sr, dict) else ""
+    if ("support_floor" in sr_signal or "support_bounce" in sr_signal or "breakout" in sr_signal) and (day_change is None or day_change >= 0.5):
+        reasons.append("support/breakout structure is confirmed by positive price action")
+    return reasons
+
 def cache_age_minutes(timestamp):
     parsed = _parse_iso(timestamp)
     if not parsed:
@@ -4226,6 +4499,8 @@ def is_long_pick_eligible(pick, open_tickers=None, confidence_floor=CONFIDENCE_F
     confidence, expected_move = pick_confidence_and_move(pick)
     volume = float(pick.get("vol_ratio") or pick.get("volume_ratio") or 1)
     price = float(pick.get("open_price") or pick.get("price") or pick.get("buy_price") or 0)
+    if not bullish_confirmation_reasons(pick):
+        return False
     return (
         price > 0
         and confidence >= confidence_floor
@@ -4280,6 +4555,11 @@ def explain_long_pick_gate(row, open_tickers=None, confidence_floor=CONFIDENCE_F
         reasons.extend(price_action_reasons)
     else:
         passes.append("Bullish price-action floor passed.")
+    confirmation_reasons = bullish_confirmation_reasons(row)
+    if confirmation_reasons:
+        passes.append("Bullish confirmation: " + "; ".join(confirmation_reasons[:2]) + ".")
+    else:
+        reasons.append("No real bullish price-action confirmation; RSI health and S&R/open-air context are not enough.")
     if volume >= MIN_VOLUME_RATIO:
         passes.append(f"Volume ratio {volume:.2f}x clears the minimum.")
     else:
@@ -6064,13 +6344,13 @@ def calculate_support_resistance(ticker, price_data):
             signal = "resistance_in_range"
             rationale = f"resistance ${nearest_resistance:.2f} within expected move — may cap gains"
         elif dist_to_resistance > expected_move_pct * 1.5:
-            # Resistance well beyond expected move — open air
-            score = 0.75
+            # Open air is structural room, not standalone bullish confirmation.
+            score = 0.60
             signal = "open_air"
             rationale = f"open air to ${nearest_resistance:.2f} — no overhead supply in range"
     else:
-        # No resistance detected above — truly open air
-        score = 0.80
+        # No resistance detected above. Context only until price confirms.
+        score = 0.60
         signal = "open_air"
         rationale = "no resistance detected above current price"
 
@@ -6180,7 +6460,8 @@ def calculate_method_confluence(ticker, price_data, scored_stocks=None):
 
     # 7. Support & Resistance — ATR-adaptive zone analysis
     sr = data.get("sr_analysis") or calculate_support_resistance(ticker, price_data)
-    if sr["signal"] in ("open_air", "open_air+support_floor") or        ("support_floor" in sr["signal"] and sr["score"] >= 0.65):
+    sr_signal = str(sr.get("signal") or "")
+    if ("support_floor" in sr_signal and sr.get("score", 0) >= 0.65) or "support_bounce" in sr_signal or "breakout" in sr_signal:
         methods_agree.append("S&R")
 
     # 8. VWAP Reclaim — price closing above VWAP shows institutional buy-side
@@ -8533,6 +8814,9 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         [s for s in scored_stocks if is_long_pick_eligible(s, open_short_tickers)],
         key=lambda x: x["long_conf"], reverse=True
     )
+    for rank, pick in enumerate(recommended_longs, start=1):
+        pick["rank"] = rank
+        pick["source_rank"] = rank
     recommended_shorts = []  # Disabled until short-specific signals are implemented
     vector_selected_tickers = [s["ticker"] for s in recommended_longs[:MAX_LONG_PICKS]]
     vector_executable_tickers = [s["ticker"] for s in recommended_longs]
@@ -8594,6 +8878,32 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
         "nova": nn_scan_result.get("observations_logged", 0),
     }
     scoring_v2_scan_time = current_time_cst().isoformat()
+    update_daily_pick_states(
+        "Vector",
+        recommended_longs[:MAX_LONG_PICKS],
+        scored_stocks,
+        scan_event_id=scan_event_id,
+        scan_time=scoring_v2_scan_time,
+    )
+    update_daily_pick_states(
+        "Nova",
+        nn_scan_result.get("recommended_longs") or [],
+        nn_scan_result.get("scored_rows_for_divergence") or [],
+        scan_event_id=scan_event_id,
+        scan_time=nn_scan_result.get("scan_time") or scoring_v2_scan_time,
+    )
+    vector_states = get_daily_pick_states("Vector")
+    nova_states = get_daily_pick_states("Nova")
+    scan_result["active_picks"] = [row["latest_pick"] for row in vector_states if row.get("status") == "active"]
+    scan_result["demoted_picks"] = [
+        {**row["latest_pick"], "demotion_reason": row.get("demotion_reason"), "demoted_at": row.get("updated_at")}
+        for row in vector_states if row.get("status") == "demoted"
+    ]
+    nn_scan_result["active_picks"] = [row["latest_pick"] for row in nova_states if row.get("status") == "active"]
+    nn_scan_result["demoted_picks"] = [
+        {**row["latest_pick"], "demotion_reason": row.get("demotion_reason"), "demoted_at": row.get("updated_at")}
+        for row in nova_states if row.get("status") == "demoted"
+    ]
     nova_divergence_rows = nn_scan_result.get("scored_rows_for_divergence") or []
     nova_selected_tickers = [row.get("ticker") for row in (nn_scan_result.get("recommended_longs") or []) if row.get("ticker")]
     nova_executable_tickers = [row.get("ticker") for row in nova_divergence_rows if row.get("ticker") and row.get("nn_executable")]
@@ -8635,6 +8945,11 @@ def _run_comprehensive_scan_impl(weights=None, scan_type="scheduled"):
     database = get_database()
     database.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_picks',?)", [json.dumps(scan_result)])
     database.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_picks_time',?)", [current_time_cst().isoformat()])
+    cached_nn_result = dict(nn_scan_result)
+    cached_nn_result.pop("scoring_v2_rows", None)
+    cached_nn_result.pop("scored_rows_for_divergence", None)
+    database.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_nn_picks',?)", [json.dumps(cached_nn_result)])
+    database.execute("INSERT OR REPLACE INTO app_state VALUES ('cached_nn_picks_time',?)", [current_time_cst().isoformat()])
     database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)", [SCORING_V2_SCAN_CACHE_KEY, json.dumps(scoring_v2_scan_cache)])
     database.execute(
         "INSERT INTO scan_cache (scan_time, scan_type, ticker_count, picks_json) VALUES (?,?,?,?)",
@@ -8745,6 +9060,7 @@ def get_cached_picks():
     database.close()
     if cached:
         result = sanitize_cached_pick_payload(json.loads(cached["value"]))
+        result.update(daily_pick_payload("Vector"))
         result["cached"] = True
         result["queue_locked_snapshot"] = bool(locked)
         result["cache_time"] = cache_time["value"] if cache_time else None
@@ -9518,8 +9834,14 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
             })
 
         scored.sort(key=lambda x: x["long_conf"], reverse=True)
+        for rank, row in enumerate(scored, start=1):
+            row["rank"] = rank
+            row["source_rank"] = rank
         qualified = [s for s in scored if s.get("nn_executable")]
         top_picks = qualified[:MAX_LONG_PICKS]
+        for rank, row in enumerate(top_picks, start=1):
+            row["rank"] = rank
+            row["source_rank"] = rank
         attach_confidence_evidence(top_picks, "long_conf")
         observations_logged = log_nova_signal_observations(scan_event_id, scan_type, scored, price_data, queue_locked)
         result = {
@@ -9548,9 +9870,10 @@ def build_nn_picks_from_scan(price_data, scored_stocks, rsi_values, earnings_soo
         db.commit()
         db.close()
         record_nn_scan_status(
-            status="complete",
+            status="running",
             scan_type=f"shared_{scan_type}",
-            finished_at=current_time_cst().isoformat(),
+            phase="nova_scored",
+            updated_at=current_time_cst().isoformat(),
             total_scanned=len(scored_stocks),
             qualified=len(qualified),
             picks=len(top_picks),
@@ -13522,6 +13845,20 @@ def api_why_not():
             ORDER BY scan_time DESC, brain DESC, confidence DESC
             LIMIT 20
         """, [ticker]).fetchall()]
+        latest_scan = db.execute("""
+            SELECT *
+            FROM scan_events
+            WHERE job_type='comprehensive' AND status IN ('success','degraded','stalled','error')
+            ORDER BY COALESCE(finished_at, started_at) DESC
+            LIMIT 1
+        """).fetchone()
+        latest_scan = dict(latest_scan) if latest_scan else None
+        state_rows = [dict(r) for r in db.execute("""
+            SELECT *
+            FROM daily_pick_states
+            WHERE trade_date=? AND ticker=?
+            ORDER BY updated_at DESC
+        """, [pick_state_trade_date(), ticker]).fetchall()]
         db.close()
 
         for row in obs_rows:
@@ -13531,6 +13868,7 @@ def api_why_not():
                 except Exception:
                     row[key] = [] if key in ("fired_signals", "confluence_methods") else {}
 
+        state_by_brain = {row.get("brain"): row for row in state_rows}
         latest_by_brain = {}
         for row in obs_rows:
             brain = row.get("brain") or "Unknown"
@@ -13538,7 +13876,17 @@ def api_why_not():
                 gate = explain_long_pick_gate(row, open_tickers, NN_CONFIDENCE_FLOOR if brain == "Nova" else CONFIDENCE_FLOOR)
                 selected = bool(row.get("selected"))
                 executable = bool(row.get("executable"))
-                if selected:
+                state = state_by_brain.get(brain)
+                if state and state.get("status") == "active":
+                    verdict = "active_pick"
+                    selected = True
+                elif state and state.get("status") == "demoted":
+                    verdict = "demoted"
+                    selected = False
+                elif latest_scan and row.get("scan_event_id") != latest_scan.get("id"):
+                    verdict = "not_observed"
+                    selected = False
+                elif selected:
                     verdict = "selected"
                 elif ticker in open_tickers:
                     verdict = "already_open"
@@ -13564,7 +13912,59 @@ def api_why_not():
                     "methods": row.get("confluence_methods") or [],
                     "context": row.get("context_json") or {},
                     "regime": row.get("regime_context") or {},
+                    "current_state": {
+                        "status": state.get("status") if state else "not_observed",
+                        "demotion_reason": state.get("demotion_reason") if state else None,
+                        "updated_at": state.get("updated_at") if state else None,
+                        "last_scan_event_id": state.get("last_scan_event_id") if state else None,
+                    },
+                    "latest_scan": {
+                        "id": latest_scan.get("id") if latest_scan else None,
+                        "status": latest_scan.get("status") if latest_scan else None,
+                        "finished_at": latest_scan.get("finished_at") if latest_scan else None,
+                        "tickers_updated": latest_scan.get("tickers_updated") if latest_scan else None,
+                        "tickers_attempted": latest_scan.get("tickers_attempted") if latest_scan else None,
+                        "degraded": bool(latest_scan and latest_scan.get("status") in ("degraded", "stalled", "error")),
+                    },
                 }
+        for brain, state in state_by_brain.items():
+            if brain in latest_by_brain:
+                continue
+            try:
+                latest_pick = json.loads(state.get("latest_pick_json") or "{}")
+            except Exception:
+                latest_pick = {}
+            latest_by_brain[brain] = {
+                "brain": brain,
+                "verdict": "active_pick" if state.get("status") == "active" else "demoted",
+                "selected": state.get("status") == "active",
+                "executable": state.get("status") == "active",
+                "scan_time": state.get("last_scan_time"),
+                "scan_type": latest_pick.get("scan_type"),
+                "rank": state.get("latest_rank"),
+                "sector": latest_pick.get("sector"),
+                "confidence_bin": None,
+                "gate": explain_long_pick_gate(latest_pick, open_tickers, NN_CONFIDENCE_FLOOR if brain == "Nova" else CONFIDENCE_FLOOR),
+                "scores": (latest_pick.get("signal_scores") or {}).get("scores", latest_pick.get("signal_scores_for_observation") or {}),
+                "values": (latest_pick.get("signal_scores") or {}).get("values", latest_pick.get("signal_values_for_observation") or {}),
+                "methods": latest_pick.get("confluence_methods") or [],
+                "context": {},
+                "regime": {},
+                "current_state": {
+                    "status": state.get("status"),
+                    "demotion_reason": state.get("demotion_reason"),
+                    "updated_at": state.get("updated_at"),
+                    "last_scan_event_id": state.get("last_scan_event_id"),
+                },
+                "latest_scan": {
+                    "id": latest_scan.get("id") if latest_scan else None,
+                    "status": latest_scan.get("status") if latest_scan else None,
+                    "finished_at": latest_scan.get("finished_at") if latest_scan else None,
+                    "tickers_updated": latest_scan.get("tickers_updated") if latest_scan else None,
+                    "tickers_attempted": latest_scan.get("tickers_attempted") if latest_scan else None,
+                    "degraded": bool(latest_scan and latest_scan.get("status") in ("degraded", "stalled", "error")),
+                },
+            }
 
         return jsonify({
             "success": True,
@@ -13572,8 +13972,9 @@ def api_why_not():
             "open_positions": open_rows,
             "observed": bool(obs_rows),
             "latest": list(latest_by_brain.values()),
+            "current_state_source": "daily_pick_states_first",
             "observation_count": len(obs_rows),
-            "note": "This explains the latest stored scan observations. If the market move shown here disagrees with your broker/watchlist, the data feed or freshness layer needs investigation.",
+            "note": "Current state comes from today's Active/Demoted pick board first; older observations are historical context only.",
         })
     except Exception as e:
         log.error(f"why-not error for {ticker}: {e}")
@@ -15512,6 +15913,7 @@ def api_nn_picks():
         db.close()
         if row:
             result = json.loads(row["value"])
+            result.update(daily_pick_payload("Nova"))
             result["cache_time"] = cache_time["value"] if cache_time else result.get("scan_time")
             result["status"] = "ok"
             if not result.get("recommended_longs"):
