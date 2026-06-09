@@ -2939,6 +2939,7 @@ def _read_quote_cache(ticker, max_age_seconds=QUOTE_CACHE_SECONDS):
         data = cached.get("data") or {}
         data["source"] = f"{data.get('source', 'cache')}_cache"
         data["cached_at"] = cached.get("fetched_at")
+        append_quote_provenance(data, "quote_cache_read", cache_key=f"quote_cache_{ticker}", fetched_at=cached.get("fetched_at"))
         return data
     except Exception:
         return None
@@ -2946,6 +2947,20 @@ def _read_quote_cache(ticker, max_age_seconds=QUOTE_CACHE_SECONDS):
 def _write_quote_cache(ticker, data):
     try:
         data = validate_quote_baselines(dict(data), data.get("daily_history") if isinstance(data, dict) else None)
+        if data.get("price_baseline_suspect"):
+            database = get_database()
+            database.execute(
+                "INSERT OR REPLACE INTO app_state VALUES (?,?)",
+                [f"quote_rejected_{ticker}", json.dumps({
+                    "rejected_at": current_time_cst().isoformat(),
+                    "reason": data.get("price_baseline_suspect_reason"),
+                    "data": data,
+                })],
+            )
+            database.commit()
+            database.close()
+            return
+        append_quote_provenance(data, "quote_cache_write", cache_key=f"quote_cache_{ticker}")
         database = get_database()
         database.execute(
             "INSERT OR REPLACE INTO app_state VALUES (?,?)",
@@ -2979,6 +2994,42 @@ def _normalize_quote(price, previous_close=None, open_price=None, high=None, low
         "previous_close_missing": bool(previous_close_missing),
     }
 
+def quote_math_snapshot(quote):
+    if not isinstance(quote, dict):
+        return {}
+    return {
+        "price": quote.get("price"),
+        "previous_close": quote.get("previous_close"),
+        "open": quote.get("open"),
+        "high": quote.get("high"),
+        "low": quote.get("low"),
+        "gap_percent": quote.get("gap_percent"),
+        "day_change_percent": quote.get("day_change_percent"),
+        "day_change_pct": quote.get("day_change_pct"),
+        "premarket_change_percent": quote.get("premarket_change_percent"),
+        "postmarket_change_percent": quote.get("postmarket_change_percent"),
+        "source": quote.get("source"),
+        "cached_at": quote.get("cached_at"),
+        "price_source_freshness": quote.get("price_source_freshness"),
+        "baseline_repaired_from_history": quote.get("baseline_repaired_from_history"),
+        "previous_close_missing": quote.get("previous_close_missing"),
+    }
+
+def append_quote_provenance(quote, stage, **details):
+    if not isinstance(quote, dict):
+        return quote
+    trail = quote.get("quote_provenance")
+    if not isinstance(trail, list):
+        trail = []
+    trail.append({
+        "stage": stage,
+        "at": current_time_cst().isoformat(),
+        "quote": quote_math_snapshot(quote),
+        "details": details,
+    })
+    quote["quote_provenance"] = trail[-12:]
+    return quote
+
 def _first_number(*values):
     """Return the first value that can be safely interpreted as a non-zero float."""
     for value in values:
@@ -2988,6 +3039,16 @@ def _first_number(*values):
             number = float(value)
             if number != 0:
                 return number
+        except Exception:
+            continue
+    return None
+
+def _first_float_allow_zero(*values):
+    for value in values:
+        try:
+            if value in (None, ""):
+                continue
+            return float(value)
         except Exception:
             continue
     return None
@@ -3022,15 +3083,22 @@ def repair_quote_baselines_from_history(quote, history):
     """Use completed candles to repair stale previous-close/open baselines."""
     if not quote or not history:
         return quote
+    append_quote_provenance(
+        quote,
+        "history_repair_start",
+        history_tail=[{k: row.get(k) for k in ("date", "open", "close", "high", "low")} for row in history[-3:] if isinstance(row, dict)],
+    )
     try:
         price = float(quote.get("price") or 0)
         completed_prev = previous_completed_close_from_history(history)
         if completed_prev:
+            before = quote_math_snapshot(quote)
             quote["previous_close"] = completed_prev
             quote["day_change_percent"] = pct_from_baseline(price, completed_prev) or 0
             quote["day_change_pct"] = quote["day_change_percent"]
             quote["gap_percent"] = pct_from_baseline(quote.get("open", price), completed_prev) or 0
             quote["baseline_repaired_from_history"] = True
+            append_quote_provenance(quote, "history_repair_applied", before=before, repaired_previous_close=completed_prev)
             return quote
         current_prev = float(quote.get("previous_close") or 0)
         current_change = abs(pct_from_baseline(price, current_prev) or 0)
@@ -3048,12 +3116,14 @@ def repair_quote_baselines_from_history(quote, history):
             if abs(pct_from_baseline(price, close) or 0) <= 8
         ]
         if current_change >= 8 and plausible:
+            before = quote_math_snapshot(quote)
             repaired_prev = min(plausible, key=lambda close: abs(price - close))
             quote["previous_close"] = repaired_prev
             quote["day_change_percent"] = pct_from_baseline(price, repaired_prev) or 0
             quote["day_change_pct"] = quote["day_change_percent"]
             quote["gap_percent"] = pct_from_baseline(quote.get("open", price), repaired_prev) or 0
             quote["baseline_repaired_from_history"] = True
+            append_quote_provenance(quote, "history_repair_applied", before=before, repaired_previous_close=repaired_prev)
     except Exception:
         pass
     return quote
@@ -3068,12 +3138,15 @@ def mark_suspicious_price_baseline(quote, reason, day_change=None, gap_change=No
         quote["suspect_day_change_percent"] = round(float(day_change), 4)
     if gap_change is not None:
         quote["suspect_gap_percent"] = round(float(gap_change), 4)
+    append_quote_provenance(quote, "validate_failed", reason=reason, day_change=day_change, gap_change=gap_change)
     return quote
 
 def validate_quote_baselines(quote, history=None):
     """Repair or quarantine quote baselines before scoring/display uses them."""
     if not quote:
         return quote
+    append_quote_provenance(quote, "validate_start")
+    supplied = quote_math_snapshot(quote)
     if history:
         repair_quote_baselines_from_history(quote, history)
     try:
@@ -3082,11 +3155,47 @@ def validate_quote_baselines(quote, history=None):
         open_price = float(quote.get("open") or price or 0)
         day_change = pct_from_baseline(price, previous_close)
         gap_change = pct_from_baseline(open_price, previous_close)
+        tolerance = float(os.getenv("QUOTE_COHERENCE_TOLERANCE_PCT", "0.35"))
+
+        supplied_day = _first_float_allow_zero(supplied.get("day_change_percent"), supplied.get("day_change_pct"))
+        repaired_from_history = bool(quote.get("baseline_repaired_from_history"))
+        if not repaired_from_history and supplied_day is not None and day_change is not None and abs(float(supplied_day) - day_change) > tolerance:
+            return mark_suspicious_price_baseline(
+                quote,
+                f"supplied day change {float(supplied_day):+.2f}% disagrees with price/previous-close math {day_change:+.2f}%",
+                day_change=day_change,
+                gap_change=gap_change,
+            )
+        supplied_premarket = _first_float_allow_zero(supplied.get("premarket_change_percent"))
+        if supplied_premarket is not None and day_change is not None and abs(float(supplied_premarket) - day_change) > tolerance:
+            return mark_suspicious_price_baseline(
+                quote,
+                f"premarket change {float(supplied_premarket):+.2f}% disagrees with price/previous-close math {day_change:+.2f}%",
+                day_change=day_change,
+                gap_change=gap_change,
+            )
+        supplied_gap = _first_float_allow_zero(supplied.get("gap_percent"))
+        if supplied_gap is not None and supplied_premarket is not None and abs(float(supplied_gap) - float(supplied_premarket)) > tolerance:
+            return mark_suspicious_price_baseline(
+                quote,
+                f"gap {float(supplied_gap):+.2f}% disagrees with premarket change {float(supplied_premarket):+.2f}%",
+                day_change=day_change,
+                gap_change=gap_change,
+            )
+        if not repaired_from_history and supplied_gap is not None and supplied_premarket is None and gap_change is not None and abs(float(supplied_gap) - gap_change) > tolerance:
+            return mark_suspicious_price_baseline(
+                quote,
+                f"supplied gap {float(supplied_gap):+.2f}% disagrees with open/previous-close math {gap_change:+.2f}%",
+                day_change=day_change,
+                gap_change=gap_change,
+            )
+
         if day_change is not None:
             quote["day_change_percent"] = day_change
             quote["day_change_pct"] = day_change
-        if gap_change is not None:
-            quote["gap_percent"] = gap_change
+        final_gap = supplied_premarket if supplied_premarket is not None else gap_change
+        if final_gap is not None:
+            quote["gap_percent"] = final_gap
         if quote.get("previous_close_missing") and not quote.get("baseline_repaired_from_history"):
             return mark_suspicious_price_baseline(quote, "missing verified previous close baseline")
         if (
@@ -3101,6 +3210,7 @@ def validate_quote_baselines(quote, history=None):
             )
     except Exception:
         return mark_suspicious_price_baseline(quote, "quote baseline validation failed")
+    append_quote_provenance(quote, "validate_passed")
     return quote
 
 def canonical_signal_weights():
@@ -3601,15 +3711,31 @@ def is_stale_price_context(row):
         or freshness in {"stale", "stale_cache", "stale_cache_fallback", "suspect", "suspect_baseline"}
     )
 
+def legacy_long_rsi_score(rsi):
+    """Broad SwingDesk long momentum wants constructive RSI, not falling-knife oversold."""
+    rsi = rsi if rsi == rsi else 50.0
+    if 50 <= rsi <= 60:
+        return 1.0
+    if 45 <= rsi < 50 or 60 < rsi <= 65:
+        return 0.75
+    if 40 <= rsi < 45:
+        return 0.45
+    if 35 <= rsi < 40:
+        return 0.20
+    return 0.0
+
 def bullish_price_action_block_reasons(pick):
     """Hard long-side price-action blocks for broad bullish SwingDesk picks."""
     gap = numeric_pick_value(pick, "overnight_gap_pct", "gap_percent", "gap_pct")
     day_change = numeric_pick_value(pick, "pct_change_prev_close", "day_change_pct", "day_change_percent")
+    rsi = numeric_pick_value(pick, "rsi")
     reasons = implausible_price_change_reasons(pick)
     if gap is not None and gap <= MAX_LONG_GAP_DOWN_PCT:
         reasons.append(f"gap {gap:.1f}% is below the bullish floor of {MAX_LONG_GAP_DOWN_PCT:.1f}%")
     if day_change is not None and day_change <= MAX_LONG_RED_DAY_PCT:
         reasons.append(f"day change {day_change:.1f}% is below the bullish floor of {MAX_LONG_RED_DAY_PCT:.1f}%")
+    if rsi is not None and rsi < 35:
+        reasons.append(f"RSI {rsi:.1f} is below the broad long momentum floor of 35.0")
     return reasons
 
 def cache_age_minutes(timestamp):
@@ -4400,6 +4526,12 @@ def _provider_quote(provider, ticker):
                 high = _first_number(session.get("high"), day.get("h"), day.get("high"), price)
                 low = _first_number(session.get("low"), day.get("l"), day.get("low"), price)
                 quote = _normalize_quote(price, previous_close, open_price, high, low, "massive")
+                append_quote_provenance(
+                    quote,
+                    "provider_quote",
+                    provider="massive",
+                    raw={"price": price, "previous_close": previous_close, "open": open_price, "high": high, "low": low},
+                )
                 volume = _first_number(session.get("volume"), day.get("v"), day.get("volume"), minute.get("v"))
                 if volume is not None:
                     quote["volume"] = volume
@@ -4421,14 +4553,21 @@ def _provider_quote(provider, ticker):
             price = data.get("c", 0)
             if not price:
                 return None, "missing", "no current price", False
-            return _normalize_quote(
+            quote = _normalize_quote(
                 price,
                 previous_close=data.get("pc", price),
                 open_price=data.get("o", price),
                 high=data.get("h", price),
                 low=data.get("l", price),
                 source="finnhub",
-            ), None, None, False
+            )
+            append_quote_provenance(
+                quote,
+                "provider_quote",
+                provider="finnhub",
+                raw={"c": data.get("c"), "pc": data.get("pc"), "o": data.get("o"), "h": data.get("h"), "l": data.get("l")},
+            )
+            return quote, None, None, False
 
         if provider == "alpha_vantage":
             if not ALPHA_VANTAGE_KEY:
@@ -4452,7 +4591,14 @@ def _provider_quote(provider, ticker):
             open_value = quote.get("02. open") or price
             high = quote.get("03. high") or price
             low = quote.get("04. low") or price
-            return _normalize_quote(price, prev, open_value, high, low, "alpha_vantage"), None, None, False
+            quote = _normalize_quote(price, prev, open_value, high, low, "alpha_vantage")
+            append_quote_provenance(
+                quote,
+                "provider_quote",
+                provider="alpha_vantage",
+                raw={"price": price, "previous_close": prev, "open": open_value, "high": high, "low": low},
+            )
+            return quote, None, None, False
 
         if provider == "twelve_data":
             if not TWELVE_DATA_KEY:
@@ -4467,14 +4613,28 @@ def _provider_quote(provider, ticker):
             price = data.get("close") or data.get("price")
             if not price:
                 return None, "missing", "no quote price", False
-            return _normalize_quote(
+            quote = _normalize_quote(
                 price,
                 previous_close=data.get("previous_close") or data.get("close"),
                 open_price=data.get("open") or price,
                 high=data.get("high") or price,
                 low=data.get("low") or price,
                 source="twelve_data",
-            ), None, None, False
+            )
+            append_quote_provenance(
+                quote,
+                "provider_quote",
+                provider="twelve_data",
+                raw={
+                    "price": data.get("price"),
+                    "close": data.get("close"),
+                    "previous_close": data.get("previous_close"),
+                    "open": data.get("open"),
+                    "high": data.get("high"),
+                    "low": data.get("low"),
+                },
+            )
+            return quote, None, None, False
     except TimeoutError as exc:
         return None, "timeout", str(exc), True
     except Exception as exc:
@@ -5574,13 +5734,24 @@ def fetch_price_data(tickers, scan_event_id=None, scan_type=None):
                 refreshed_tickers.append(ticker)
                 # Cache it
                 try:
-                    database = get_database()
                     cache_data = dict(results[ticker])
-                    database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
-                                     [f"cache_{ticker}", json.dumps({
-                                         "fetched_at": current_time_cst().isoformat(),
-                                         "data": cache_data,
-                                     })])
+                    database = get_database()
+                    if cache_data.get("price_baseline_suspect"):
+                        database.execute(
+                            "INSERT OR REPLACE INTO app_state VALUES (?,?)",
+                            [f"quote_rejected_{ticker}", json.dumps({
+                                "rejected_at": current_time_cst().isoformat(),
+                                "reason": cache_data.get("price_baseline_suspect_reason"),
+                                "data": cache_data,
+                            })],
+                        )
+                    else:
+                        append_quote_provenance(cache_data, "scan_price_cache_write", cache_key=f"cache_{ticker}")
+                        database.execute("INSERT OR REPLACE INTO app_state VALUES (?,?)",
+                                         [f"cache_{ticker}", json.dumps({
+                                             "fetched_at": current_time_cst().isoformat(),
+                                             "data": cache_data,
+                                         })])
                     database.commit()
                     database.close()
                 except:
@@ -6595,7 +6766,7 @@ def compute_signal_scores(ticker, price_data, rsi, earnings_soon, weights, direc
 
     # RSI
     if direction == "long":
-        rsi_score = 1.0 if 40 <= rsi <= 65 else (0.9 if rsi < 40 else 0.5)
+        rsi_score = legacy_long_rsi_score(rsi)
     else:
         rsi_score = 1.0 if rsi > 65 else (0.7 if rsi > 55 else 0.4)
 
@@ -7857,6 +8028,8 @@ def enrich_with_live_prices(tickers, price_data):
                 new_gap = (live_price - prev_close) / max(prev_close, 0.01) * 100
                 data["gap_percent"] = round(new_gap, 4)
                 data["premarket_change_percent"] = round(new_gap, 4)
+                data["day_change_percent"] = round(new_gap, 4)
+                data["day_change_pct"] = round(new_gap, 4)
             else:
                 post_change = (live_price - today_close) / max(today_close, 0.01) * 100
                 data["postmarket_change_percent"] = round(post_change, 4)
@@ -7865,6 +8038,8 @@ def enrich_with_live_prices(tickers, price_data):
                     data["day_change_percent"] = round(day_change, 4)
                     data["day_change_pct"] = round(day_change, 4)
             data["live_price_source"] = quote.get("source", "provider")
+            append_quote_provenance(data, "extended_hours_enrich", mode="premarket" if in_premarket else "postmarket", live_quote=quote_math_snapshot(quote))
+            validate_quote_baselines(data, data.get("daily_history"))
             enriched += 1
             if not cached_quote:
                 time.sleep(1.1)
@@ -7900,7 +8075,7 @@ def calculate_confidence_score(ticker, price_data, rsi, earnings_soon, weights, 
 
     # 1. RSI Momentum
     if direction == "long":
-        rsi_score = 1.0 if 40 <= rsi <= 65 else (0.9 if rsi < 40 else 0.5)
+        rsi_score = legacy_long_rsi_score(rsi)
     else:
         rsi_score = 1.0 if rsi > 65 else (0.7 if rsi > 55 else 0.4)
 
@@ -11622,6 +11797,61 @@ def api_scoring_v2_shadow():
         })
     except Exception as error:
         return jsonify({"success": False, "error": str(error)}), 500
+
+@app.route("/api/quote-provenance")
+def api_quote_provenance():
+    """Show the latest quote birth/repair/cache trail for one ticker."""
+    ticker = (request.args.get("ticker") or "").strip().upper()
+    if not ticker:
+        return jsonify({"success": False, "error": "ticker is required"}), 400
+    try:
+        database = get_database()
+        state = {}
+        for key in (f"quote_cache_{ticker}", f"cache_{ticker}", f"quote_rejected_{ticker}"):
+            row = database.execute("SELECT value FROM app_state WHERE key=?", [key]).fetchone()
+            if row:
+                try:
+                    state[key] = json.loads(row["value"])
+                except Exception:
+                    state[key] = row["value"]
+
+        cached_picks = database.execute("SELECT value FROM app_state WHERE key='cached_picks'").fetchone()
+        cached_nn = database.execute("SELECT value FROM app_state WHERE key='cached_nn_picks'").fetchone()
+        v2_cache = database.execute("SELECT value FROM app_state WHERE key=?", [SCORING_V2_SCAN_CACHE_KEY]).fetchone()
+        database.close()
+
+        def matching_rows(payload, labels):
+            matches = []
+            if not isinstance(payload, dict):
+                return matches
+            for label in labels:
+                rows = payload.get(label) or []
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if isinstance(row, dict) and str(row.get("ticker") or "").upper() == ticker:
+                        matches.append({"section": label, "row": row})
+            return matches
+
+        pick_rows = []
+        if cached_picks:
+            pick_rows.extend(matching_rows(json.loads(cached_picks["value"] or "{}"), ["longs", "recommended_longs", "shorts", "recommended_shorts"]))
+        if cached_nn:
+            pick_rows.extend(matching_rows(json.loads(cached_nn["value"] or "{}"), ["recommended_longs", "longs"]))
+
+        v2_rows = []
+        if v2_cache:
+            v2_rows.extend(matching_rows(json.loads(v2_cache["value"] or "{}"), ["vector_rows", "nova_rows"]))
+
+        return jsonify({
+            "success": True,
+            "ticker": ticker,
+            "app_state": state,
+            "pick_rows": pick_rows,
+            "v2_rows": v2_rows,
+        })
+    except Exception as error:
+        return jsonify({"success": False, "ticker": ticker, "error": str(error)}), 500
 
 @app.route("/api/monitor-open-now", methods=["POST"])
 def api_monitor_open_now():

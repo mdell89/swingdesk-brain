@@ -39,6 +39,7 @@ from brain import (
     calculate_confidence_score,
     estimate_overnight_move,
     is_long_pick_eligible,
+    legacy_long_rsi_score,
     validate_quote_baselines,
 )
 
@@ -169,6 +170,45 @@ class BullishLongGateTest(unittest.TestCase):
             "day_change_pct": 0.0,
             "gap_percent": 0.0,
         }))
+
+    def test_mixed_premarket_baselines_are_quarantined(self):
+        quote = validate_quote_baselines({
+            "ticker": "ALB",
+            "price": 149.84,
+            "previous_close": 149.84,
+            "open": 158.02,
+            "gap_percent": 5.46,
+            "premarket_change_percent": -3.6,
+            "day_change_percent": 0.0,
+        })
+
+        self.assertTrue(quote["price_baseline_suspect"])
+        self.assertIn("premarket", quote["price_baseline_suspect_reason"])
+        self.assertFalse(is_long_pick_eligible({
+            "ticker": "ALB",
+            "price": quote["price"],
+            "long_conf": 91,
+            "long_move": 6.1,
+            "rsi": 27.9,
+            "price_baseline_suspect": quote["price_baseline_suspect"],
+            "freshness_status": quote["freshness_status"],
+        }))
+
+    def test_severe_low_rsi_does_not_clear_broad_long_gate(self):
+        self.assertFalse(is_long_pick_eligible({
+            "ticker": "ALB",
+            "price": 149.84,
+            "long_conf": 91,
+            "long_move": 6.1,
+            "gap_percent": 1.0,
+            "day_change_pct": 0.5,
+            "rsi": 27.9,
+        }))
+
+    def test_legacy_long_rsi_sweet_spot_beats_oversold(self):
+        self.assertEqual(legacy_long_rsi_score(55), 1.0)
+        self.assertLess(legacy_long_rsi_score(42), legacy_long_rsi_score(55))
+        self.assertEqual(legacy_long_rsi_score(28), 0.0)
 
 
 if __name__ == "__main__":
